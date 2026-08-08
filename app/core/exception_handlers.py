@@ -38,8 +38,9 @@ def register_exception_handlers(app: FastAPI) -> None:
 
 def _make_handler(
     status_code: int,
-) -> Callable[[Request, AppError], Awaitable[JSONResponse]]:
-    async def _handler(request: Request, exc: AppError) -> JSONResponse:
+) -> Callable[[Request, Exception], Awaitable[JSONResponse]]:
+    async def _handler(request: Request, exc: Exception) -> JSONResponse:
+        # exc may be a subclass of Exception (AppError); coerce to str for the response
         return JSONResponse(status_code=status_code, content={"detail": str(exc)})
 
     return _handler
