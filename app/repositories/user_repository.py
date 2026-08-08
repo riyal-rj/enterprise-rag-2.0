@@ -51,7 +51,10 @@ class PostgresUserRepository:
                         "VALUES (%s, %s) RETURNING id, is_admin",
                         (username, password_hash),
                     )
-                    user_id, is_admin = cur.fetchone()
+                    row = cur.fetchone()
+                    if row is None:
+                        raise RuntimeError("Failed to retrieve inserted user")
+                    user_id, is_admin = row
                 conn.commit()
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()

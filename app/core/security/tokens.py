@@ -26,14 +26,21 @@ class TokenVerifier(Protocol):
 class JWTTokenIssuer:
     """HS256 JWT :class:`TokenIssuer` backed by PyJWT."""
 
-    def __init__(self, secret: str, algorithm: str, expires_minutes: int) -> None:
+    def __init__(self, 
+                 secret: str, 
+                 algorithm: str, 
+                 expires_minutes: int) -> None:
         if not secret:
             raise ValueError("JWT secret must not be empty")
         self._secret = secret
         self._algorithm = algorithm
         self._expires_minutes = expires_minutes
 
-    def issue(self, username: str, *, is_admin: bool = False) -> str:
+    def issue(self, 
+              username: str,
+               *, 
+               is_admin: bool = False) -> str:
+        
         now = int(time.time())
         payload = {
             "sub": username,
@@ -47,7 +54,9 @@ class JWTTokenIssuer:
 class JWTTokenVerifier:
     """HS256 JWT :class:`TokenVerifier` backed by PyJWT."""
 
-    def __init__(self, secret: str, algorithm: str) -> None:
+    def __init__(self, 
+                 secret: str, 
+                 algorithm: str) -> None:
         if not secret:
             raise ValueError("JWT secret must not be empty")
         self._secret = secret
@@ -55,11 +64,14 @@ class JWTTokenVerifier:
 
     def verify(self, token: str) -> AuthenticatedUser:
         try:
-            payload = jwt.decode(token, self._secret, algorithms=[self._algorithm])
+            payload = jwt.decode(token, 
+                                 self._secret, 
+                                 algorithms=[self._algorithm])
         except jwt.PyJWTError as exc:
             raise InvalidTokenError() from exc
 
         username = payload.get("sub")
         if not username:
             raise InvalidTokenError()
-        return AuthenticatedUser(username=username, is_admin=bool(payload.get("is_admin", False)))
+        return AuthenticatedUser(username=username, 
+                                 is_admin=bool(payload.get("is_admin", False)))

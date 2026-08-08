@@ -22,8 +22,12 @@ class BcryptPasswordHasher:
     def __init__(self) -> None:
         self._context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-    def hash(self, password: str) -> str:
+    def hash(self, 
+             password: str) -> str:
         return self._context.hash(password)
 
-    def verify(self, password: str, password_hash: str) -> bool:
-        return self._context.verify(password, password_hash)
+    def verify(self, 
+               password: str, 
+               password_hash: str) -> bool:
+        return self._context.verify(password, 
+                                    password_hash)
