@@ -11,6 +11,7 @@ class AuthSettings(EnvBaseSettings):
     """JWT issuance and validation configuration."""
 
     jwt_secret: SecretStr = Field(default=SecretStr(""))
+    jwt_algorithm: str = Field(default="HS256")
     jwt_expiration_minutes: int = Field(default=60, gt=0)
 
 

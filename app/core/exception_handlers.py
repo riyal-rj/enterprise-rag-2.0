@@ -1,0 +1,45 @@
+"""Central mapping from domain exceptions to HTTP responses.
+
+Registered once in :func:`app.main.create_app`, so controllers can raise
+plain domain exceptions (see :mod:`app.core.exceptions`) without importing
+FastAPI or repeating try/except blocks per endpoint.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+
+from app.core.exceptions import (
+    AppError,
+    InvalidCredentialsError,
+    InvalidTokenError,
+    PermissionDeniedError,
+    RateLimitExceededError,
+    UserAlreadyExistsError,
+)
+
+_STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
+    UserAlreadyExistsError: status.HTTP_409_CONFLICT,
+    InvalidCredentialsError: status.HTTP_401_UNAUTHORIZED,
+    InvalidTokenError: status.HTTP_401_UNAUTHORIZED,
+    PermissionDeniedError: status.HTTP_403_FORBIDDEN,
+    RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
+}
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    """Attach one HTTP-mapping handler per known domain exception type."""
+    for exc_type, status_code in _STATUS_BY_EXCEPTION.items():
+        app.add_exception_handler(exc_type, _make_handler(status_code))
+
+
+def _make_handler(
+    status_code: int,
+) -> Callable[[Request, AppError], Awaitable[JSONResponse]]:
+    async def _handler(request: Request, exc: AppError) -> JSONResponse:
+        return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+
+    return _handler
