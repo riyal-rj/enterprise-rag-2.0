@@ -57,4 +57,4 @@ docker-compose.override.yml
 Thumbs.db
 
 uv.lock
-app
+
