@@ -12,7 +12,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 from app.core.config.cache import CacheSettings
 
@@ -60,6 +60,13 @@ class UpstashCacheBackend:
         return len(keys)
 
 
+class TierStatsDict(TypedDict):
+    hits: int
+    misses: int
+    sets: int
+    hit_rate: float
+
+
 @dataclass
 class _TierCounters:
     hits: int = 0
@@ -71,7 +78,7 @@ class _TierCounters:
         total = self.hits + self.misses
         return (self.hits / total) if total else 0.0
 
-    def as_dict(self) -> dict[str, float | int]:
+    def as_dict(self) -> TierStatsDict:
         return {
             "hits": self.hits,
             "misses": self.misses,
@@ -114,7 +121,7 @@ class QueryCacheService:
         with self._lock:
             self._counters[tier].sets += 1
 
-    def stats(self) -> dict[str, dict[str, float | int]]:
+    def stats(self) -> dict[str, TierStatsDict]:
         with self._lock:
             return {tier.value: counters.as_dict() for tier, counters in self._counters.items()}
 

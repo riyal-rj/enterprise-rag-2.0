@@ -28,7 +28,11 @@ class RateLimiter(Protocol):
     """
 
     def is_allowed(
-        self, key: str, route: str, limit: int, window_seconds: int
+        self, 
+        key: str, 
+        route: str, 
+        limit: int, 
+        window_seconds: int
     ) -> tuple[bool, int, float]: ...
 
 
@@ -40,7 +44,11 @@ class InMemorySlidingWindowRateLimiter:
         self._lock = threading.Lock()
 
     def is_allowed(
-        self, key: str, route: str, limit: int, window_seconds: int
+        self, 
+        key: str, 
+        route: str, 
+        limit: int, 
+        window_seconds: int
     ) -> tuple[bool, int, float]:
         now = time.monotonic()
         bucket_key = (key, route)

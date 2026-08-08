@@ -20,5 +20,7 @@ def search_web(query: str, max_results: int = 5) -> list[dict[str, Any]]:
         raise ValueError("Tavily API key is not configured")
 
     client = TavilyClient(api_key=api_key)
-    response = client.search(query, max_results=max_results)
+    response = client.search(query, 
+                             max_results=max_results,
+                             search_depth="basic")
     return response.get("results", [])

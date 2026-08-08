@@ -15,8 +15,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 @router.get("/health", response_model=HealthCheckResponse)
-async def health_check(
-controller: AdminController = Depends(get_admin_controller),
+async def health_check(controller: AdminController = Depends(get_admin_controller),
 ) -> HealthCheckResponse:
     return await controller.health()
 

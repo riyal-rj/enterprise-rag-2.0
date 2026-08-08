@@ -64,7 +64,8 @@ class QdrantHealthCheck:
         try:
             from qdrant_client import QdrantClient
 
-            QdrantClient(url=self._url, timeout=self._timeout_seconds).get_collections()
+            # QdrantClient.__init__ expects an int|None for timeout; cast to int
+            QdrantClient(url=self._url, timeout=int(self._timeout_seconds)).get_collections()
             return True
         except Exception as exc:  # best-effort probe: never propagate
             logger.debug("Qdrant health check failed: %s", exc)
