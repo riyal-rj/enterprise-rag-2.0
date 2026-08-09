@@ -134,7 +134,9 @@ class QueryCacheService:
                 self._counters[tier] = _TierCounters()
         return cleared
 
-    def _namespaced_key(self, tier: CacheTier, key: str) -> str:
+    def _namespaced_key(self, 
+                        tier: CacheTier, 
+                        key: str) -> str:
         return f"{tier.value}:{key}"
 
     def _ttl_for(self, tier: CacheTier) -> int:
