@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from passlib.context import CryptContext
+import bcrypt
+
+_DEFAULT_ROUNDS = 12
 
 
 class PasswordHasher(Protocol):
@@ -17,17 +19,14 @@ class PasswordHasher(Protocol):
 
 
 class BcryptPasswordHasher:
-    """Bcrypt-backed :class:`PasswordHasher` (via passlib)."""
+    """Bcrypt :class:`PasswordHasher` backed directly by the ``bcrypt`` library."""
 
-    def __init__(self) -> None:
-        self._context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    def __init__(self, rounds: int = _DEFAULT_ROUNDS) -> None:
+        self._rounds = rounds
 
-    def hash(self, 
-             password: str) -> str:
-        return self._context.hash(password)
+    def hash(self, password: str) -> str:
+        salt = bcrypt.gensalt(rounds=self._rounds)
+        return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
 
-    def verify(self, 
-               password: str, 
-               password_hash: str) -> bool:
-        return self._context.verify(password, 
-                                    password_hash)
+    def verify(self, password: str, password_hash: str) -> bool:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))

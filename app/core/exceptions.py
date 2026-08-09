@@ -39,8 +39,20 @@ class RateLimitExceededError(AppError):
 class InvalidTokenError(AppError):
     """Raised when a bearer token is missing, malformed, or fails verification."""
 
+    def __init__(self, message: str = "Invalid or missing access token") -> None:
+        super().__init__(message)
+
+
+class TokenExpiredError(InvalidTokenError):
+    """Raised when a bearer token is well-formed but past its expiry.
+
+    Subclasses ``InvalidTokenError`` so it's covered by the same 401 handler
+    (Starlette resolves exception handlers via the exception's MRO) while
+    still producing a more specific message.
+    """
+
     def __init__(self) -> None:
-        super().__init__("Invalid or missing access token")
+        super().__init__("Token has expired")
 
 
 class PermissionDeniedError(AppError):
