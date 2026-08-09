@@ -35,6 +35,5 @@ def login(request: Request,
           payload: LoginRequest,
           controller: AuthController = Depends(get_auth_controller),
           ) -> TokenResponse:
-    
     return controller.login(_client_ip(request), 
                             payload)

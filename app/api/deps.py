@@ -131,7 +131,8 @@ def get_health_check_service(
 def get_query_cache_service() -> QueryCacheService:
     """Process-wide query cache singleton (lazily created, cached)."""
     backend = UpstashCacheBackend(get_redis_client())
-    return QueryCacheService(backend, get_settings().cache)
+    return QueryCacheService(backend, 
+                             get_settings().cache)
 
 
 def get_admin_controller(

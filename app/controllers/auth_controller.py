@@ -21,9 +21,15 @@ class AuthController:
     def register(self, 
                  client_ip: str, 
                  payload: RegisterRequest) -> TokenResponse:
-        token = self._auth_service.register(client_ip, payload.username, payload.password)
+        token = self._auth_service.register(client_ip, 
+                                            payload.username, 
+                                            payload.password)
         return TokenResponse(token=token)
 
-    def login(self, client_ip: str, payload: LoginRequest) -> TokenResponse:
-        token = self._auth_service.login(client_ip, payload.username, payload.password)
+    def login(self, 
+              client_ip: str, 
+              payload: LoginRequest) -> TokenResponse:
+        token = self._auth_service.login(client_ip, 
+                                         payload.username, 
+                                         payload.password)
         return TokenResponse(token=token)
