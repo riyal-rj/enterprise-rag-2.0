@@ -1,36 +1,55 @@
 """CLI: diff two eval report JSON files.
 
     python -m app.eval.diff eval/results/..._naive.json eval/results/..._all.json
+
+No reference implementation was given for this one (unlike run_ragas.py) —
+rebuilt to match the new row/aggregate payload shape, since the old
+GradeResult-based version no longer applies.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from typing import Any
 
-from app.eval.runner import EvalReport
-
-
-def _load_report(path: Path) -> EvalReport:
-    return EvalReport.model_validate_json(path.read_text(encoding="utf-8"))
+from app.eval.ragas_adapter import METRIC_NAMES as RAGAS_METRIC_NAMES
 
 
-def diff_reports(before: EvalReport, after: EvalReport) -> None:
-    before_by_id = {result.case_id: result for result in before.results}
-    after_by_id = {result.case_id: result for result in after.results}
+def _load_payload(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    print(f"{before.profile}: {before.passed}/{before.total} ({before.pass_rate:.0%})")
-    print(f"{after.profile}: {after.passed}/{after.total} ({after.pass_rate:.0%})")
+
+def _row_ok(row: dict[str, Any]) -> bool:
+    return bool(row["forbidden_check"]["passed"]) and bool(row["source_overlap"]["passed"])
+
+
+def diff_reports(before: dict[str, Any], after: dict[str, Any]) -> None:
+    before_agg, after_agg = before["aggregate"], after["aggregate"]
+    print(f"{before['profile']}: forbidden_violations={before_agg.get('forbidden_violations', 0)}")
+    print(f"{after['profile']}: forbidden_violations={after_agg.get('forbidden_violations', 0)}")
+
+    print("\nRAGAS metric deltas (after - before):")
+    for name in RAGAS_METRIC_NAMES:
+        b, a = before_agg.get(name), after_agg.get(name)
+        if b is None or a is None:
+            continue
+        print(f"  {name:<20} {b:.3f} -> {a:.3f}  ({a - b:+.3f})")
+
+    before_by_id = {row["id"]: row for row in before.get("rows", [])}
+    after_by_id = {row["id"]: row for row in after.get("rows", [])}
 
     improved: list[str] = []
     regressed: list[str] = []
-    for case_id, after_result in after_by_id.items():
-        before_result = before_by_id.get(case_id)
-        if before_result is None:
+    for case_id, after_row in after_by_id.items():
+        before_row = before_by_id.get(case_id)
+        if before_row is None:
             continue
-        if not before_result.passed and after_result.passed:
+        before_ok, after_ok = _row_ok(before_row), _row_ok(after_row)
+        if not before_ok and after_ok:
             improved.append(case_id)
-        elif before_result.passed and not after_result.passed:
+        elif before_ok and not after_ok:
             regressed.append(case_id)
 
     print(f"\nImproved ({len(improved)}): {', '.join(sorted(improved)) or 'none'}")
@@ -46,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    diff_reports(_load_report(args.before), _load_report(args.after))
+    diff_reports(_load_payload(args.before), _load_payload(args.after))
 
 
 if __name__ == "__main__":

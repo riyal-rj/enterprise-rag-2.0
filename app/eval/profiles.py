@@ -1,13 +1,19 @@
 """Pipeline profiles: named combinations of RAG feature toggles.
 
-Mirrors ``app.core.config.rag_features.RAGFeatureSettings`` — a profile is
-just a named preset of those flags, selected via the eval CLI's
-``--profile`` flag (see the Makefile's ``eval-*`` targets).
+Loosely mirrors ``app.core.config.rag_features.RAGFeatureSettings`` — a
+profile is a named preset of retrieval/reasoning flags, selected via the
+eval CLI's ``--profile`` flag (see the Makefile's ``eval-*`` targets).
+Not a 1:1 mapping: ``search_mode`` (dense/sparse/hybrid) and ``top_k``
+aren't modeled as settings there yet.
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
+
+SearchMode = Literal["dense", "sparse", "hybrid"]
 
 
 class PipelineProfile(BaseModel):
@@ -16,38 +22,40 @@ class PipelineProfile(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
-    hybrid_search_enabled: bool = False
-    reranking_enabled: bool = False
-    hyde_enabled: bool = False
-    crag_enabled: bool = False
-    self_reflective_enabled: bool = False
+    search_mode: SearchMode
+    enable_hyde: bool = False
+    enable_rerank: bool = False
+    enable_crag: bool = False
+    enable_self_reflective: bool = False
+    top_k: int = 5
 
 
 PROFILES: dict[str, PipelineProfile] = {
-    "naive": PipelineProfile(name="naive"),
-    "hybrid": PipelineProfile(name="hybrid", hybrid_search_enabled=True),
+    "naive": PipelineProfile(name="naive", search_mode="dense"),
+    "sparse_only": PipelineProfile(name="sparse_only", search_mode="sparse"),
+    "hybrid": PipelineProfile(name="hybrid", search_mode="hybrid"),
     "hybrid+rerank": PipelineProfile(
-        name="hybrid+rerank", hybrid_search_enabled=True, reranking_enabled=True
+        name="hybrid+rerank", search_mode="hybrid", enable_rerank=True
     ),
     "hybrid+rerank+hyde": PipelineProfile(
         name="hybrid+rerank+hyde",
-        hybrid_search_enabled=True,
-        reranking_enabled=True,
-        hyde_enabled=True,
+        search_mode="hybrid",
+        enable_hyde=True,
+        enable_rerank=True,
     ),
     "hybrid+rerank+crag": PipelineProfile(
         name="hybrid+rerank+crag",
-        hybrid_search_enabled=True,
-        reranking_enabled=True,
-        crag_enabled=True,
+        search_mode="hybrid",
+        enable_rerank=True,
+        enable_crag=True,
     ),
     "all": PipelineProfile(
         name="all",
-        hybrid_search_enabled=True,
-        reranking_enabled=True,
-        hyde_enabled=True,
-        crag_enabled=True,
-        self_reflective_enabled=True,
+        search_mode="hybrid",
+        enable_hyde=True,
+        enable_rerank=True,
+        enable_crag=True,
+        enable_self_reflective=True,
     ),
 }
 
