@@ -1,10 +1,6 @@
 """CLI: diff two eval report JSON files.
 
-    python -m app.eval.diff eval/results/..._naive.json eval/results/..._all.json
-
-No reference implementation was given for this one (unlike run_ragas.py) —
-rebuilt to match the new row/aggregate payload shape, since the old
-GradeResult-based version no longer applies.
+python -m app.eval.diff eval/results/..._naive.json eval/results/..._all.json
 """
 
 from __future__ import annotations
@@ -12,20 +8,22 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 from app.eval.ragas_adapter import METRIC_NAMES as RAGAS_METRIC_NAMES
+from app.eval.types import EvalPayload, EvalRow
 
 
-def _load_payload(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _load_payload(path: Path) -> EvalPayload:
+    """Load a report JSON file, trusting it was produced by ``run_ragas``."""
+    return cast(EvalPayload, json.loads(path.read_text(encoding="utf-8")))
 
 
-def _row_ok(row: dict[str, Any]) -> bool:
+def _row_ok(row: EvalRow) -> bool:
     return bool(row["forbidden_check"]["passed"]) and bool(row["source_overlap"]["passed"])
 
 
-def diff_reports(before: dict[str, Any], after: dict[str, Any]) -> None:
+def diff_reports(before: EvalPayload, after: EvalPayload) -> None:
     before_agg, after_agg = before["aggregate"], after["aggregate"]
     print(f"{before['profile']}: forbidden_violations={before_agg.get('forbidden_violations', 0)}")
     print(f"{after['profile']}: forbidden_violations={after_agg.get('forbidden_violations', 0)}")

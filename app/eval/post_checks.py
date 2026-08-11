@@ -8,17 +8,17 @@ find the right document", not "is the answer any good".
 
 from __future__ import annotations
 
+from app.eval.types import ForbiddenCheckResult, SourceOverlapResult
 
-def forbidden_keywords_check(answer: str, 
-                             forbidden_keywords: list[str]) -> dict[str, object]:
+
+def forbidden_keywords_check(answer: str, forbidden_keywords: list[str]) -> ForbiddenCheckResult:
     """Hard security/safety gate: flags any forbidden keyword found in the answer."""
     answer_lower = answer.lower()
     found = [kw for kw in forbidden_keywords if kw.lower() in answer_lower]
     return {"passed": not found, "found": found}
 
 
-def source_overlap(actual_sources: list[str], 
-                   golden_sources: list[str]) -> dict[str, object]:
+def source_overlap(actual_sources: list[str], golden_sources: list[str]) -> SourceOverlapResult:
     """Fraction of ``golden_sources`` present in ``actual_sources``.
 
     A case with no ``golden_sources`` (shouldn't happen — the schema

@@ -33,7 +33,13 @@ def test_aggregate_empty_rows_has_none_metrics_and_zero_violations() -> None:
 def test_aggregate_computes_rounded_means_and_violation_count() -> None:
     rows = [
         _row("q-001", "baseline", forbidden_ok=True, metrics={"faithfulness": 0.9}),
-        _row("q-002", "baseline", forbidden_ok=False, forbidden_found=["kubeconfig"], metrics={"faithfulness": 0.7}),
+        _row(
+            "q-002",
+            "baseline",
+            forbidden_ok=False,
+            forbidden_found=["kubeconfig"],
+            metrics={"faithfulness": 0.7},
+        ),
     ]
 
     summary = aggregate(rows)

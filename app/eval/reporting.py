@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from statistics import mean
-from typing import Any
+from typing import cast
 
-from app.eval.ragas_adapter import METRIC_NAMES as RAGAS_METRIC_NAMES
+from app.eval.types import AggregateResult, EvalPayload, EvalRow, MetricName
 
 
-def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate(rows: list[EvalRow]) -> AggregateResult:
     """Mean of each RAGAS metric across ``rows``, plus a forbidden-keyword
     violation count.
 
@@ -17,22 +17,35 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     security gate, "1 violation" is the signal that matters, not "99%
     passed".
     """
-    out: dict[str, Any] = {}
-    for metric in RAGAS_METRIC_NAMES:
-        values = [
-            row["ragas_metrics"].get(metric)
-            for row in rows
-            if row.get("ragas_metrics") and row["ragas_metrics"].get(metric) is not None
-        ]
-        out[metric] = round(mean(values), 3) if values else None
-
-    out["forbidden_violations"] = sum(
-        1 for row in rows if not row.get("forbidden_check", {}).get("passed", True)
+    return AggregateResult(
+        faithfulness=_mean_metric(rows, "faithfulness"),
+        context_precision=_mean_metric(rows, "context_precision"),
+        context_recall=_mean_metric(rows, "context_recall"),
+        answer_relevancy=_mean_metric(rows, "answer_relevancy"),
+        forbidden_violations=sum(
+            1 for row in rows if not row.get("forbidden_check", {}).get("passed", True)
+        ),
     )
-    return out
 
 
-def print_table(payload: dict[str, Any]) -> None:
+def _mean_metric(rows: list[EvalRow], metric: MetricName) -> float | None:
+    values: list[float] = []
+    for row in rows:
+        metrics = row.get("ragas_metrics")
+        if not metrics:
+            continue
+        value = metrics.get(metric)
+        if value is not None:
+            values.append(value)
+    return round(mean(values), 3) if values else None
+
+
+def _fmt(value: float | None) -> str:
+    """Render a metric for display: ``N/A`` when unscored, never a bare ``0``."""
+    return f"{value:.2f}" if value is not None else "N/A"
+
+
+def print_table(payload: EvalPayload) -> None:
     """Print a markdown table of per-question results plus an aggregate row."""
     print(f"\n## Eval - profile={payload['profile']} mode={payload['mode']}")
     print(f"Skipped: {len(payload['skipped'])}")
@@ -42,17 +55,18 @@ def print_table(payload: dict[str, Any]) -> None:
 
     for row in payload["rows"]:
         metrics = row.get("ragas_metrics") or {}
+        forbidden_check = cast(dict[str, object], row.get("forbidden_check") or {})
         forbidden = (
             "OK"
-            if row["forbidden_check"]["passed"]
-            else f"FAIL: {row['forbidden_check']['found']}"
+            if forbidden_check.get("passed", True)
+            else f"FAIL: {forbidden_check.get('found', 'unknown')}"
         )
         print(
             f"| {row['id']} | {row['demonstrates_feature']} | "
-            f"{metrics.get('faithfulness', 0):.2f} | "
-            f"{metrics.get('context_precision', 0):.2f} | "
-            f"{metrics.get('context_recall', 0):.2f} | "
-            f"{metrics.get('answer_relevancy', 0):.2f} | {forbidden} |"
+            f"{_fmt(metrics.get('faithfulness'))} | "
+            f"{_fmt(metrics.get('context_precision'))} | "
+            f"{_fmt(metrics.get('context_recall'))} | "
+            f"{_fmt(metrics.get('answer_relevancy'))} | {forbidden} |"
         )
 
     if not payload["rows"]:
@@ -61,8 +75,8 @@ def print_table(payload: dict[str, Any]) -> None:
 
     agg = payload["aggregate"]
     print(
-        f"| **AGG** | — | **{agg['faithfulness']}** | "
-        f"**{agg['context_precision']}** | **{agg['context_recall']}** | "
-        f"**{agg['answer_relevancy']}** | "
+        f"| **AGG** | - | **{_fmt(agg['faithfulness'])}** | "
+        f"**{_fmt(agg['context_precision'])}** | **{_fmt(agg['context_recall'])}** | "
+        f"**{_fmt(agg['answer_relevancy'])}** | "
         f"violations={agg['forbidden_violations']} |"
     )

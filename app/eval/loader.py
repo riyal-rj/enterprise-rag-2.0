@@ -60,4 +60,6 @@ def _warn_on_missing_feature_coverage(cases: list[GoldenCase]) -> None:
     missing = set(EvalFeature) - present
     if missing:
         missing_values = sorted(feature.value for feature in missing)
-        warnings.warn(f"No golden entries for features: {missing_values} (OK if demo-only)", stacklevel=2)
+        warnings.warn(
+            f"No golden entries for features: {missing_values} (OK if demo-only)", stacklevel=2
+        )

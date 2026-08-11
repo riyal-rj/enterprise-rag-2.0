@@ -61,6 +61,12 @@ PROFILES: dict[str, PipelineProfile] = {
 
 
 def get_profile(name: str) -> PipelineProfile:
+    """Look up a profile by name.
+
+    Raises:
+        ValueError: if ``name`` isn't a known profile, listing the ones
+            that are (friendlier than the raw ``KeyError``).
+    """
     try:
         return PROFILES[name]
     except KeyError:

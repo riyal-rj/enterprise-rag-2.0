@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class Intent(str, Enum):
+class Intent(StrEnum):
     """What kind of query this case represents."""
 
     RAG = "rag"
@@ -17,7 +17,7 @@ class Intent(str, Enum):
     WEB_FALLBACK = "web_fallback"
 
 
-class EvalFeature(str, Enum):
+class EvalFeature(StrEnum):
     """Which pipeline feature this case is designed to exercise.
 
     Doubles as the ``--filter`` value for ``app.eval.run_ragas``. ``SPARSE``,
@@ -41,7 +41,9 @@ class EvalFeature(str, Enum):
     WILD = "wild"
 
 
-class ExpectedOutcome(str, Enum):
+class ExpectedOutcome(StrEnum):
+    """Whether a case is expected to pass or fail grading."""
+
     PASS = "pass"
     FAIL = "fail"
 

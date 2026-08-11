@@ -35,6 +35,8 @@ class RetrievedChunk:
 
 @dataclass(frozen=True)
 class InvokeResponse:
+    """The system under test's final answer for one question."""
+
     answer: str
     sources: list[str] = field(default_factory=list)
 
