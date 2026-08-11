@@ -41,22 +41,22 @@ streamlit:
 
 
 eval-baseline:
-	uv run python -m eval.run_ragas --profile naive
+	uv run python -m app.eval.run_ragas --profile naive
 
 eval-hybrid:
-	uv run python -m eval.run_ragas --profile hybrid
+	uv run python -m app.eval.run_ragas --profile hybrid
 
 eval-rerank:
-	uv run python -m eval.run_ragas --profile hybrid+rerank
+	uv run python -m app.eval.run_ragas --profile hybrid+rerank
 
 eval-hyde:
-	uv run python -m eval.run_ragas --profile hybrid+rerank+hyde --filter hyde
+	uv run python -m app.eval.run_ragas --profile hybrid+rerank+hyde --filter hyde
 
 eval-crag:
-	uv run python -m eval.run_ragas --profile hybrid+rerank+crag --filter crag
+	uv run python -m app.eval.run_ragas --profile hybrid+rerank+crag --filter crag
 
 eval-all:
-	uv run python -m eval.run_ragas --profile all
+	uv run python -m app.eval.run_ragas --profile all
 
 eval: eval-baseline eval-all
 	$(MAKE) eval-diff
@@ -65,7 +65,7 @@ eval-diff:
 	@latest_naive=$$(ls -t eval/results/*_naive.json 2>/dev/null | head -1); \
 	latest_all=$$(ls -t eval/results/*_all.json 2>/dev/null | head -1); \
 	test -n "$$latest_naive" && test -n "$$latest_all" && \
-	  uv run python -m eval.diff $$latest_naive $$latest_all || \
+	  uv run python -m app.eval.diff $$latest_naive $$latest_all || \
 	  echo "Need at least one _naive.json and one _all.json in eval/results/"
 
 validate:
