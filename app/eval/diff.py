@@ -20,7 +20,11 @@ def _load_payload(path: Path) -> EvalPayload:
 
 
 def _row_ok(row: EvalRow) -> bool:
-    return bool(row["forbidden_check"]["passed"]) and bool(row["source_overlap"]["passed"])
+    forbidden_check = row.get("forbidden_check")
+    source_overlap = row.get("source_overlap")
+    if not isinstance(forbidden_check, dict) or not isinstance(source_overlap, dict):
+        return False
+    return bool(forbidden_check.get("passed")) and bool(source_overlap.get("passed"))
 
 
 def diff_reports(before: EvalPayload, after: EvalPayload) -> None:
