@@ -18,6 +18,7 @@ from app.core.config.cache import CacheSettings
 from app.core.config.database import INSECURE_DEFAULT_DSN, DatabaseSettings
 from app.core.config.environment import Environment, EnvironmentSettings
 from app.core.config.external_apis import ExternalAPISettings
+from app.core.config.ingestion import IngestionSettings
 from app.core.config.llm import LLMSettings
 from app.core.config.log_settings import LoggingSettings
 from app.core.config.rag_features import RAGFeatureSettings
@@ -39,6 +40,7 @@ class Settings(BaseModel):
     )
 
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)

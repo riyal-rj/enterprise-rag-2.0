@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from docling.chunking import HybridChunker
 from fastapi import Depends
 from openai import OpenAI
 from upstash_redis import Redis
@@ -18,6 +19,11 @@ from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
+from app.core.ingestion.document_processor import (
+    DoclingDocumentProcessor,
+    DocumentProcessor,
+    build_docling_converter,
+)
 from app.core.llm.chat_client import LLMClient, OpenAILLMClient, build_openai_client
 from app.core.llm.embedding_client import EmbeddingClient, OpenAIEmbeddingClient
 from app.core.redis_client import build_redis_client
@@ -79,6 +85,15 @@ def get_embedding_client() -> EmbeddingClient:
         cache=get_query_cache_service(),
         default_model=get_settings().llm.embedding_model,
     )
+
+
+@lru_cache(maxsize=1)
+def get_document_processor() -> DocumentProcessor:
+    settings = get_settings().ingestion
+    converter = build_docling_converter(
+        settings.accelerator_device, settings.accelerator_num_threads
+    )
+    return DoclingDocumentProcessor(converter=converter, chunker=HybridChunker())
 
 
 @lru_cache(maxsize=1)
