@@ -9,6 +9,7 @@ limiting) never touches service/controller code.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from docling.chunking import HybridChunker
 from fastapi import Depends
@@ -50,7 +51,11 @@ from app.services.health_checks import (
     RedisHealthCheck,
     TavilyHealthCheck,
 )
+from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_POLICY_DIR = _REPO_ROOT / "policy"
 
 
 @lru_cache(maxsize=1)
@@ -133,6 +138,17 @@ def get_document_processor() -> DocumentProcessor:
         settings.accelerator_device, settings.accelerator_num_threads
     )
     return DoclingDocumentProcessor(converter=converter, chunker=HybridChunker())
+
+
+@lru_cache(maxsize=1)
+def get_policy_ingestion_service() -> PolicyIngestionService:
+    return PolicyIngestionService(
+        document_processor=get_document_processor(),
+        embedding_client=get_embedding_client(),
+        vector_repository=get_vector_repository(),
+        policy_dir=_POLICY_DIR,
+        max_upload_size_mb=get_settings().ingestion.max_upload_size_mb,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -226,5 +242,6 @@ def get_query_cache_service() -> QueryCacheService:
 def get_admin_controller(
     health_check_service: HealthCheckService = Depends(get_health_check_service),
     query_cache: QueryCacheService = Depends(get_query_cache_service),
+    policy_ingestion_service: PolicyIngestionService = Depends(get_policy_ingestion_service),
 ) -> AdminController:
-    return AdminController(health_check_service, query_cache)
+    return AdminController(health_check_service, query_cache, policy_ingestion_service)

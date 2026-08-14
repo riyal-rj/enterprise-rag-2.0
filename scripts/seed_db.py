@@ -18,13 +18,13 @@ import psycopg2
 
 from app.api.deps import get_document_processor, get_embedding_client, get_vector_repository
 from app.core.config import get_settings
+from app.core.ingestion.document_processor import SUPPORTED_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MIGRATIONS_DIR = _REPO_ROOT / "app" / "seed" / "migrations"
 _POLICY_DIR = _REPO_ROOT / "policy"
-_INGESTIBLE_SUFFIXES = {".pdf", ".docx"}
 
 
 def run_migrations() -> None:
@@ -62,7 +62,7 @@ def seed_docs(policy_dir: Path = _POLICY_DIR) -> None:
     embedder = get_embedding_client()
     repository = get_vector_repository()
 
-    files = sorted(p for p in policy_dir.iterdir() if p.suffix.lower() in _INGESTIBLE_SUFFIXES)
+    files = sorted(p for p in policy_dir.iterdir() if p.suffix.lower() in SUPPORTED_SUFFIXES)
     if not files:
         logger.warning("seed.no_documents_found | dir=%s", policy_dir)
         return

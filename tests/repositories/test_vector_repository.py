@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 from qdrant_client import QdrantClient
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from app.core.ingestion.document_processor import DocumentChunk
 from app.models.retrieved_chunk import RetrievedChunk
@@ -43,6 +44,7 @@ class _FakeQdrantClient:
         self._existing = list(existing_collections or [])
         self.created_collections: list[dict[str, object]] = []
         self.upsert_calls: list[dict[str, object]] = []
+        self.delete_calls: list[dict[str, object]] = []
         self.query_response: _FakeQueryResponse = _FakeQueryResponse(points=[])
         self.scroll_response: tuple[list[_FakeRecord], None] = ([], None)
 
@@ -63,6 +65,9 @@ class _FakeQdrantClient:
 
     def scroll(self, **kwargs: object) -> tuple[list[_FakeRecord], None]:
         return self.scroll_response
+
+    def delete(self, **kwargs: object) -> None:
+        self.delete_calls.append(kwargs)
 
 
 def _repo(
@@ -151,3 +156,25 @@ def test_scroll_all_chunks_returns_id_text_source_page_number_dicts() -> None:
     result = repo.scroll_all_chunks()
 
     assert result == [{"id": "abc", "text": "hi", "source": "a.pdf", "page_number": 2}]
+
+
+def test_delete_by_source_deletes_from_the_configured_collection() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake, collection_name="docs")
+
+    repo.delete_by_source("a.pdf")
+
+    assert len(fake.delete_calls) == 1
+    assert fake.delete_calls[0]["collection_name"] == "docs"
+
+
+def test_delete_by_source_filters_on_the_source_payload_field() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+
+    repo.delete_by_source("a.pdf")
+
+    points_filter = cast(Filter, fake.delete_calls[0]["points_selector"])
+    condition = cast(FieldCondition, points_filter.must[0])  # type: ignore[index]
+    assert condition.key == "source"
+    assert cast(MatchValue, condition.match).value == "a.pdf"

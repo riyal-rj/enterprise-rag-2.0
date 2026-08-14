@@ -14,7 +14,14 @@ import uuid
 from typing import Protocol
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from app.core.ingestion.document_processor import DocumentChunk
 from app.models.retrieved_chunk import RetrievedChunk
@@ -40,6 +47,8 @@ class VectorRepository(Protocol):
     def search(self, query_embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]: ...
 
     def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str | int | None]]: ...
+
+    def delete_by_source(self, source: str) -> None: ...
 
 
 class QdrantVectorRepository:
@@ -111,6 +120,18 @@ class QdrantVectorRepository:
             }
             for point in points
         ]
+
+    def delete_by_source(self, source: str) -> None:
+        """Delete every chunk previously ingested for ``source``.
+
+        Used to replace a policy document on re-upload: the caller deletes
+        the old chunks for that filename before upserting the new ones, so
+        a re-ingested document doesn't leave stale duplicates alongside it.
+        """
+        self._client.delete(
+            collection_name=self._collection_name,
+            points_selector=Filter(must=[FieldCondition(key="source", match=MatchValue(value=source))]),
+        )
 
     def _ensure_collection(self) -> None:
         existing = {collection.name for collection in self._client.get_collections().collections}

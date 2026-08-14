@@ -14,10 +14,12 @@ from fastapi.responses import JSONResponse
 
 from app.core.exceptions import (
     AppError,
+    FileTooLargeError,
     InvalidCredentialsError,
     InvalidTokenError,
     PermissionDeniedError,
     RateLimitExceededError,
+    UnsupportedFileTypeError,
     UserAlreadyExistsError,
 )
 
@@ -27,6 +29,8 @@ _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     InvalidTokenError: status.HTTP_401_UNAUTHORIZED,
     PermissionDeniedError: status.HTTP_403_FORBIDDEN,
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
+    UnsupportedFileTypeError: status.HTTP_400_BAD_REQUEST,
+    FileTooLargeError: status.HTTP_413_CONTENT_TOO_LARGE,
 }
 
 

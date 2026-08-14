@@ -35,6 +35,10 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# File types this pipeline knows how to convert - shared by the seed
+# script and the admin upload endpoint so both reject the same inputs.
+SUPPORTED_SUFFIXES = {".pdf", ".docx"}
+
 
 class DocumentChunk(BaseModel):
     """One chunk of a converted source document, ready for embedding."""

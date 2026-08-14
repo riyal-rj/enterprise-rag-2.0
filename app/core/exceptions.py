@@ -60,3 +60,20 @@ class PermissionDeniedError(AppError):
 
     def __init__(self) -> None:
         super().__init__("You do not have permission to perform this action")
+
+
+class UnsupportedFileTypeError(AppError):
+    """Raised when an uploaded policy document isn't a type the ingestion pipeline handles."""
+
+    def __init__(self, filename: str, supported_suffixes: set[str]) -> None:
+        suffixes = ", ".join(sorted(supported_suffixes))
+        super().__init__(f"'{filename}' is not a supported file type (expected one of: {suffixes})")
+        self.filename = filename
+
+
+class FileTooLargeError(AppError):
+    """Raised when an uploaded policy document exceeds the configured size limit."""
+
+    def __init__(self, filename: str, max_size_mb: int) -> None:
+        super().__init__(f"'{filename}' exceeds the maximum upload size of {max_size_mb}MB")
+        self.filename = filename
