@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.deps import get_db_pool
 from app.api.routes.admin_routes import router as admin_router
@@ -25,6 +26,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Advanced RAG API", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=get_settings().cors.allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     register_exception_handlers(app)
     app.include_router(auth_router)
     app.include_router(admin_router)

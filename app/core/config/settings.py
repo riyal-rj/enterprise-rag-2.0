@@ -15,6 +15,7 @@ from functools import lru_cache
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.config.cache import CacheSettings
+from app.core.config.cors import CorsSettings
 from app.core.config.database import INSECURE_DEFAULT_DSN, DatabaseSettings
 from app.core.config.environment import Environment, EnvironmentSettings
 from app.core.config.external_apis import ExternalAPISettings
@@ -44,6 +45,7 @@ class Settings(BaseModel):
     qdrant: QdrantSettings = Field(default_factory=QdrantSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    cors: CorsSettings = Field(default_factory=CorsSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     external_apis: ExternalAPISettings = Field(default_factory=ExternalAPISettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)

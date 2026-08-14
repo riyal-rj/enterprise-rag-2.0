@@ -10,8 +10,20 @@ the converter/chunker can be swapped for fakes in tests.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Protocol, cast
+
+# Docling's layout model runs through torch.compile by default, which on
+# Windows needs the MSVC C++ compiler (cl.exe) on PATH to JIT-compile CPU
+# kernels - most dev machines don't have Visual Studio Build Tools
+# installed. Disabling TorchDynamo falls back to plain eager-mode PyTorch:
+# identical output, just not JIT-compiled. For batch document ingestion
+# (not a hot inference loop), the compile step's own overhead often isn't
+# even worth paying back within a single run, so this is a reasonable
+# default regardless of platform - not just a Windows workaround. Must be
+# set before torch is imported (transitively, via docling below).
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 from docling.chunking import HybridChunker
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
