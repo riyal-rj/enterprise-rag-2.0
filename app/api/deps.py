@@ -42,6 +42,13 @@ from app.services.health_checks import (
     TavilyHealthCheck,
 )
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
+from  qdrant_client import QdrantClient
+from app.repositories.vector_repository import (
+    QdrantVectorRepository,
+    VectorRepository,
+    build_qdrant_client,
+)
+from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 
 
 @lru_cache(maxsize=1)
@@ -86,6 +93,24 @@ def get_embedding_client() -> EmbeddingClient:
         default_model=get_settings().llm.embedding_model,
     )
 
+@lru_cache(maxsize = 1)
+def get_qdrant_client() -> QdrantClient:
+    """Process-wide Qdrant SDK client (lazily created, cached)."""
+    settings = get_settings().qdrant
+    return build_qdrant_client(settings.qdrant_url, settings.qdrant_timeout_seconds)
+
+
+@lru_cache(maxsize=1)
+def get_vector_repository() -> VectorRepository:
+    settings = get_settings().qdrant
+    return QdrantVectorRepository(
+        client=get_qdrant_client(), collection_name=settings.qdrant_collection
+    )
+
+
+@lru_cache(maxsize=1)
+def get_hybrid_retrieval_service() -> HybridRetrievalService:
+    return HybridRetrievalService(vector_repository=get_vector_repository())
 
 @lru_cache(maxsize=1)
 def get_document_processor() -> DocumentProcessor:

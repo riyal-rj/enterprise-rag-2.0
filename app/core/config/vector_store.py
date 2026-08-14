@@ -12,3 +12,4 @@ class QdrantSettings(EnvBaseSettings):
 
     qdrant_url: str = Field(default="http://localhost:6333")
     qdrant_collection: str = Field(default="documents")
+    qdrant_timeout_seconds: float = Field(default=30.0, gt=0)
