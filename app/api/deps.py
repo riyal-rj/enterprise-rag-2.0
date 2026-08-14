@@ -13,6 +13,7 @@ from functools import lru_cache
 from docling.chunking import HybridChunker
 from fastapi import Depends
 from openai import OpenAI
+from qdrant_client import QdrantClient
 from upstash_redis import Redis
 
 from app.controllers.admin_controller import AdminController
@@ -30,7 +31,13 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
+from app.repositories.vector_repository import (
+    QdrantVectorRepository,
+    VectorRepository,
+    build_qdrant_client,
+)
 from app.services.auth_service import AuthService
 from app.services.health_checks import (
     HealthCheck,
@@ -42,13 +49,6 @@ from app.services.health_checks import (
     TavilyHealthCheck,
 )
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
-from  qdrant_client import QdrantClient
-from app.repositories.vector_repository import (
-    QdrantVectorRepository,
-    VectorRepository,
-    build_qdrant_client,
-)
-from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 
 
 @lru_cache(maxsize=1)
@@ -93,7 +93,8 @@ def get_embedding_client() -> EmbeddingClient:
         default_model=get_settings().llm.embedding_model,
     )
 
-@lru_cache(maxsize = 1)
+
+@lru_cache(maxsize=1)
 def get_qdrant_client() -> QdrantClient:
     """Process-wide Qdrant SDK client (lazily created, cached)."""
     settings = get_settings().qdrant
@@ -111,6 +112,7 @@ def get_vector_repository() -> VectorRepository:
 @lru_cache(maxsize=1)
 def get_hybrid_retrieval_service() -> HybridRetrievalService:
     return HybridRetrievalService(vector_repository=get_vector_repository())
+
 
 @lru_cache(maxsize=1)
 def get_document_processor() -> DocumentProcessor:
