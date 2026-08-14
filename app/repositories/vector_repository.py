@@ -39,7 +39,7 @@ class VectorRepository(Protocol):
 
     def search(self, query_embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]: ...
 
-    def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str]]: ...
+    def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str | int | None]]: ...
 
 
 class QdrantVectorRepository:
@@ -61,7 +61,11 @@ class QdrantVectorRepository:
             PointStruct(
                 id=str(uuid.uuid4()),
                 vector=embedding,
-                payload={"text": chunk.text, "source": chunk.source},
+                payload={
+                    "text": chunk.text,
+                    "source": chunk.source,
+                    "page_number": chunk.page_number,
+                },
             )
             for chunk, embedding in zip(chunks, embeddings, strict=True)
         ]
@@ -80,11 +84,12 @@ class QdrantVectorRepository:
                 text=str(point.payload.get("text", "")) if point.payload else "",
                 source=str(point.payload.get("source", "")) if point.payload else "",
                 score=float(point.score),
+                page_number=point.payload.get("page_number") if point.payload else None,
             )
             for point in results
         ]
 
-    def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str]]:
+    def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str | int | None]]:
         """Full-collection listing for building an out-of-process sparse index.
 
         Returns raw payload dicts (including the Qdrant point id) rather
@@ -102,6 +107,7 @@ class QdrantVectorRepository:
                 "id": str(point.id),
                 "text": str(point.payload.get("text", "")) if point.payload else "",
                 "source": str(point.payload.get("source", "")) if point.payload else "",
+                "page_number": point.payload.get("page_number") if point.payload else None,
             }
             for point in points
         ]

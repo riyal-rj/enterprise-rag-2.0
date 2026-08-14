@@ -31,11 +31,11 @@ class SparseVectorIndex:
 
     def __init__(self) -> None:
         self._vectorizer = TfidfVectorizer(stop_words="english")
-        self._documents: list[dict[str, str]] = []
+        self._documents: list[dict[str, str | int | None]] = []
         self._matrix: Any | None = None
         self._lock = threading.RLock()
 
-    def fit(self, documents: list[dict[str, str]]) -> None:
+    def fit(self, documents: list[dict[str, str | int | None]]) -> None:
         with self._lock:
             self._documents = documents
             self._matrix = None

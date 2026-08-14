@@ -156,7 +156,7 @@ def test_answer_with_no_chunks_still_generates_an_answer() -> None:
 
 
 def test_metadata_retrieved_chunks_mirror_search_results() -> None:
-    chunks = [RetrievedChunk(text="hi", source="a.pdf", score=0.5)]
+    chunks = [RetrievedChunk(text="hi", source="a.pdf", score=0.5, page_number=4)]
     service, _, _, _ = _service(results=chunks)
 
     response = service.answer("q")
@@ -166,6 +166,7 @@ def test_metadata_retrieved_chunks_mirror_search_results() -> None:
     assert response.metadata.retrieved_chunks[0].text == "hi"
     assert response.metadata.retrieved_chunks[0].source == "a.pdf"
     assert response.metadata.retrieved_chunks[0].score == 0.5
+    assert response.metadata.retrieved_chunks[0].page_number == 4
 
 
 def test_second_call_with_same_args_is_a_cache_hit_and_skips_llm() -> None:

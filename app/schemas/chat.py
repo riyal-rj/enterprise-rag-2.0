@@ -18,6 +18,7 @@ class RetrievedChunkPreview(BaseModel):
     text: str
     source: str
     score: float
+    page_number: int | None = None
 
 
 class ResponseMetadata(BaseModel):

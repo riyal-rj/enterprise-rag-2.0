@@ -71,7 +71,9 @@ class RAGService:
             metadata=ResponseMetadata(
                 route="rag",
                 retrieved_chunks=[
-                    RetrievedChunkPreview(text=c.text, source=c.source, score=c.score)
+                    RetrievedChunkPreview(
+                        text=c.text, source=c.source, score=c.score, page_number=c.page_number
+                    )
                     for c in chunks
                 ],
             ),

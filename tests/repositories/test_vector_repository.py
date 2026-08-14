@@ -23,7 +23,7 @@ class _FakeCollectionsResponse:
 
 @dataclass
 class _FakeScoredPoint:
-    payload: dict[str, str] | None
+    payload: dict[str, str | int] | None
     score: float
 
 
@@ -35,7 +35,7 @@ class _FakeQueryResponse:
 @dataclass
 class _FakeRecord:
     id: str
-    payload: dict[str, str] | None
+    payload: dict[str, str | int] | None
 
 
 class _FakeQdrantClient:
@@ -88,11 +88,11 @@ def test_init_does_not_recreate_existing_collection() -> None:
     assert fake.created_collections == []
 
 
-def test_upsert_chunks_sends_text_and_source_payload() -> None:
+def test_upsert_chunks_sends_text_source_and_page_number_payload() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     repo = _repo(fake)
     chunks = [
-        DocumentChunk(text="hello", source="a.pdf"),
+        DocumentChunk(text="hello", source="a.pdf", page_number=3),
         DocumentChunk(text="world", source="b.pdf"),
     ]
     embeddings = [[0.1, 0.2], [0.3, 0.4]]
@@ -102,7 +102,8 @@ def test_upsert_chunks_sends_text_and_source_payload() -> None:
     assert len(fake.upsert_calls) == 1
     points = cast(list, fake.upsert_calls[0]["points"])
     assert len(points) == 2
-    assert points[0].payload == {"text": "hello", "source": "a.pdf"}
+    assert points[0].payload == {"text": "hello", "source": "a.pdf", "page_number": 3}
+    assert points[1].payload == {"text": "world", "source": "b.pdf", "page_number": None}
     assert points[0].vector == [0.1, 0.2]
     assert points[0].id != points[1].id  # each point gets a unique id
 
@@ -118,13 +119,15 @@ def test_upsert_chunks_raises_on_length_mismatch() -> None:
 def test_search_maps_points_to_retrieved_chunks() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     fake.query_response = _FakeQueryResponse(
-        points=[_FakeScoredPoint(payload={"text": "hi", "source": "a.pdf"}, score=0.9)]
+        points=[
+            _FakeScoredPoint(payload={"text": "hi", "source": "a.pdf", "page_number": 4}, score=0.9)
+        ]
     )
     repo = _repo(fake)
 
     result = repo.search([0.1, 0.2], top_k=5)
 
-    assert result == [RetrievedChunk(text="hi", source="a.pdf", score=0.9)]
+    assert result == [RetrievedChunk(text="hi", source="a.pdf", score=0.9, page_number=4)]
 
 
 def test_search_handles_missing_payload() -> None:
@@ -134,17 +137,17 @@ def test_search_handles_missing_payload() -> None:
 
     result = repo.search([0.1], top_k=1)
 
-    assert result == [RetrievedChunk(text="", source="", score=0.5)]
+    assert result == [RetrievedChunk(text="", source="", score=0.5, page_number=None)]
 
 
-def test_scroll_all_chunks_returns_id_text_source_dicts() -> None:
+def test_scroll_all_chunks_returns_id_text_source_page_number_dicts() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     fake.scroll_response = (
-        [_FakeRecord(id="abc", payload={"text": "hi", "source": "a.pdf"})],
+        [_FakeRecord(id="abc", payload={"text": "hi", "source": "a.pdf", "page_number": 2})],
         None,
     )
     repo = _repo(fake)
 
     result = repo.scroll_all_chunks()
 
-    assert result == [{"id": "abc", "text": "hi", "source": "a.pdf"}]
+    assert result == [{"id": "abc", "text": "hi", "source": "a.pdf", "page_number": 2}]
