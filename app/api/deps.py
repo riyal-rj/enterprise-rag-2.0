@@ -10,21 +10,34 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from docling.chunking import HybridChunker
 from fastapi import Depends
 from openai import OpenAI
+from qdrant_client import QdrantClient
 from upstash_redis import Redis
 
 from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
+from app.core.ingestion.document_processor import (
+    DoclingDocumentProcessor,
+    DocumentProcessor,
+    build_docling_converter,
+)
 from app.core.llm.chat_client import LLMClient, OpenAILLMClient, build_openai_client
 from app.core.llm.embedding_client import EmbeddingClient, OpenAIEmbeddingClient
 from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
+from app.repositories.vector_repository import (
+    QdrantVectorRepository,
+    VectorRepository,
+    build_qdrant_client,
+)
 from app.services.auth_service import AuthService
 from app.services.health_checks import (
     HealthCheck,
@@ -79,6 +92,35 @@ def get_embedding_client() -> EmbeddingClient:
         cache=get_query_cache_service(),
         default_model=get_settings().llm.embedding_model,
     )
+
+
+@lru_cache(maxsize=1)
+def get_qdrant_client() -> QdrantClient:
+    """Process-wide Qdrant SDK client (lazily created, cached)."""
+    settings = get_settings().qdrant
+    return build_qdrant_client(settings.qdrant_url, settings.qdrant_timeout_seconds)
+
+
+@lru_cache(maxsize=1)
+def get_vector_repository() -> VectorRepository:
+    settings = get_settings().qdrant
+    return QdrantVectorRepository(
+        client=get_qdrant_client(), collection_name=settings.qdrant_collection
+    )
+
+
+@lru_cache(maxsize=1)
+def get_hybrid_retrieval_service() -> HybridRetrievalService:
+    return HybridRetrievalService(vector_repository=get_vector_repository())
+
+
+@lru_cache(maxsize=1)
+def get_document_processor() -> DocumentProcessor:
+    settings = get_settings().ingestion
+    converter = build_docling_converter(
+        settings.accelerator_device, settings.accelerator_num_threads
+    )
+    return DoclingDocumentProcessor(converter=converter, chunker=HybridChunker())
 
 
 @lru_cache(maxsize=1)
