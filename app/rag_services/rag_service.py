@@ -23,6 +23,7 @@ import logging
 from app.core.llm.chat_client import LLMClient
 from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
+from app.rag_services.confidence_scorer import compute_confidence_breakdown
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import ChatResponse, ResponseMetadata, RetrievedChunkPreview
 from app.services.query_cache_service import CacheTier, QueryCacheService
@@ -64,10 +65,23 @@ class RAGService:
         user_message = f"{self._build_context(chunks)}\n\nQuestion: {question}"
         llm_response = self._llm_client.generate(_SYSTEM_PROMPT, user_message)
 
+        confidence = compute_confidence_breakdown(chunks, llm_response.text)
+        logger.debug(
+            "rag.confidence_computed",
+            extra={
+                "confidence": confidence.total,
+                "evidence_coverage": confidence.evidence_coverage,
+                "faithfulness": confidence.faithfulness,
+                "retrieval_strength": confidence.retrieval_strength,
+                "citation_precision": confidence.citation_precision,
+                "answerability": confidence.answerability,
+            },
+        )
+
         response = ChatResponse(
             answer=llm_response.text,
             sources=sorted({chunk.source for chunk in chunks}),
-            confidence=0.7,
+            confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
                 retrieved_chunks=[

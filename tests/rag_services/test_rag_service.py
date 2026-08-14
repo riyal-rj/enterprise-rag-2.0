@@ -124,6 +124,25 @@ def test_answer_returns_llm_text_and_sorted_unique_sources() -> None:
     assert response.cache_hit is False
 
 
+def test_answer_confidence_is_computed_not_a_fixed_constant() -> None:
+    strong_chunks = [
+        RetrievedChunk(text="refunds within 30 days of purchase", source="a.pdf", score=0.9),
+        RetrievedChunk(text="30 day refund window applies", source="b.pdf", score=0.88),
+    ]
+    weak_chunks = [RetrievedChunk(text="unrelated boilerplate", source="z.pdf", score=0.2)]
+
+    strong_service, *_ = _service(
+        results=strong_chunks, answer="Refunds are available within 30 days [a.pdf][b.pdf]."
+    )
+    weak_service, *_ = _service(results=weak_chunks, answer="I don't know.")
+
+    strong_response = strong_service.answer("refund policy?")
+    weak_response = weak_service.answer("refund policy?")
+
+    assert strong_response.confidence != 0.7
+    assert weak_response.confidence < strong_response.confidence
+
+
 def test_answer_embeds_question_and_searches_with_top_k() -> None:
     service, embedding_client, vector_repository, _ = _service()
 
