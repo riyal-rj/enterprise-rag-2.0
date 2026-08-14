@@ -18,6 +18,7 @@ from upstash_redis import Redis
 
 from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
+from app.controllers.chat_controller import ChatController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
 from app.core.ingestion.document_processor import (
@@ -32,6 +33,7 @@ from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
 from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
+from app.rag_services.rag_service import RAGService
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -115,6 +117,16 @@ def get_hybrid_retrieval_service() -> HybridRetrievalService:
 
 
 @lru_cache(maxsize=1)
+def get_rag_service() -> RAGService:
+    return RAGService(
+        embedding_client=get_embedding_client(),
+        vector_repository=get_vector_repository(),
+        llm_client=get_llm_client(),
+        cache=get_query_cache_service(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_document_processor() -> DocumentProcessor:
     settings = get_settings().ingestion
     converter = build_docling_converter(
@@ -176,6 +188,12 @@ def get_auth_controller(
     auth_service: AuthService = Depends(get_auth_service),
 ) -> AuthController:
     return AuthController(auth_service)
+
+
+def get_chat_controller(
+    rag_service: RAGService = Depends(get_rag_service),
+) -> ChatController:
+    return ChatController(rag_service)
 
 
 def get_health_checks(

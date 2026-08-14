@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from app.api.deps import get_db_pool
 from app.api.routes.admin_routes import router as admin_router
 from app.api.routes.auth_routes import router as auth_router
+from app.api.routes.chat_routes import router as chat_router
 from app.core.config import get_settings
 from app.core.exception_handlers import register_exception_handlers
 
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
     app.include_router(auth_router)
     app.include_router(admin_router)
+    app.include_router(chat_router)
     return app
 
 
