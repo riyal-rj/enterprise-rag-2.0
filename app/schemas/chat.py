@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -31,6 +33,7 @@ class ResponseMetadata(BaseModel):
 
     route: str
     retrieved_chunks: list[RetrievedChunkPreview]
+    flagged_claims: list[str] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -41,3 +44,20 @@ class ChatResponse(BaseModel):
     confidence: float
     cache_hit: bool = False
     metadata: ResponseMetadata
+
+
+class ChatHistoryItem(BaseModel):
+    """A single past question/answer turn, as surfaced back to its owner."""
+
+    id: int
+    question: str
+    answer: str
+    sources: list[str]
+    confidence: float
+    created_at: datetime
+
+
+class ChatHistoryResponse(BaseModel):
+    """Response for ``GET /chat/history``, most recent turn first."""
+
+    items: list[ChatHistoryItem]

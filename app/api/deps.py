@@ -35,6 +35,10 @@ from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRate
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
 from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 from app.rag_services.rag_service import RAGService
+from app.repositories.chat_history_repository import (
+    ChatHistoryRepository,
+    PostgresChatHistoryRepository,
+)
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -206,10 +210,17 @@ def get_auth_controller(
     return AuthController(auth_service)
 
 
+def get_chat_history_repository(
+    pool: PostgresConnectionPool = Depends(get_db_pool),
+) -> ChatHistoryRepository:
+    return PostgresChatHistoryRepository(pool)
+
+
 def get_chat_controller(
     rag_service: RAGService = Depends(get_rag_service),
+    chat_history_repository: ChatHistoryRepository = Depends(get_chat_history_repository),
 ) -> ChatController:
-    return ChatController(rag_service)
+    return ChatController(rag_service, chat_history_repository)
 
 
 def get_health_checks(
