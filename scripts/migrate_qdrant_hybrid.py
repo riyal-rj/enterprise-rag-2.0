@@ -7,18 +7,35 @@ Default (safe) path::
 
 Creates a new physical collection (``{QDRANT_COLLECTION}_v2``), ingests
 every policy document into it via the same ``seed_docs()`` ingestion path
-the app itself uses, validates it has a non-zero point count, then
-atomically repoints the app-facing ``QDRANT_COLLECTION``-named alias at it.
+the app itself uses, requires a *complete* ``SeedReport`` (every
+discovered file succeeded, and the collection's actual point count and
+source set match what was written - not just "more than zero points"),
+then repoints the app-facing collection name at it.
 
-Qdrant has no native "rename collection" operation, so on the *first* run
-against a pre-existing bare physical collection (not yet alias-based -
-this app's actual starting state), freeing up that name for the alias
-means preserving the old collection under a new name first. That's done
-via Qdrant's own snapshot/recover mechanism (create a snapshot of the old
-collection, recover it into ``{QDRANT_COLLECTION}_v1``, then delete the
-original) - verified against a live Qdrant 1.17.0 instance during
-planning, not assumed. The old data is never deleted without a verified
-successful copy existing first.
+Qdrant forbids an alias sharing a name with an existing physical
+collection. That matters for how the target name is freed up:
+
+* If ``QDRANT_COLLECTION`` already names an alias (i.e. this script has
+  been run before), the old alias entry is dropped and the new one
+  created in a **single** ``update_collection_aliases()`` call - one
+  atomic request, so there is no window where the name resolves to
+  nothing.
+* On the *very first* run, ``QDRANT_COLLECTION`` still names a bare,
+  pre-migration physical collection. Reclaiming that literal name for an
+  alias would require deleting the physical collection first - reopening
+  exactly the not-found/race window ("a concurrent app instance
+  auto-creates a bare replacement collection under that name") this
+  migration exists to avoid. Instead, the first run creates a *new*,
+  permanent alias name (``{QDRANT_COLLECTION}_live``) pointing at the
+  freshly-seeded collection, and leaves the original bare collection
+  untouched - no deletion, no gap, no race.
+
+  This means the first run requires one manual follow-up: point
+  ``QDRANT_COLLECTION`` at ``{QDRANT_COLLECTION}_live`` and redeploy the
+  app. The script logs this instruction explicitly when it applies. The
+  original bare collection is left in place (not deleted) so it can be
+  removed manually once the app is confirmed running against the new
+  alias.
 
 Local-dev-only escape hatch (skips blue/green entirely, no rollback
 copy)::
@@ -45,9 +62,11 @@ from qdrant_client.models import (
 from app.api.deps import get_qdrant_client
 from app.core.config import get_settings
 from app.repositories.vector_repository import QdrantVectorRepository
-from scripts.seed_db import seed_docs
+from scripts.seed_db import SeedReport, seed_docs
 
 logger = logging.getLogger(__name__)
+
+_LIVE_ALIAS_SUFFIX = "_live"
 
 
 def force_local_recreate() -> None:
@@ -78,82 +97,126 @@ def blue_green_migrate() -> None:
     new_repository = QdrantVectorRepository(client=client, collection_name=new_collection_name)
 
     logger.info("migrate.ingesting | collection=%s", new_collection_name)
-    seed_docs(vector_repository=new_repository)
+    report = seed_docs(vector_repository=new_repository)
+    _require_complete_corpus(report)
 
     point_count = client.count(new_collection_name).count
+    actual_sources = {
+        str(row["source"]) for row in new_repository.scroll_all_chunks() if row["source"]
+    }
     logger.info(
-        "migrate.ingestion_complete | collection=%s points=%d", new_collection_name, point_count
+        "migrate.ingestion_complete | collection=%s points=%d sources=%d",
+        new_collection_name,
+        point_count,
+        len(actual_sources),
     )
-    if point_count == 0:
+    if point_count != report.chunks_written:
         raise RuntimeError(
-            f"'{new_collection_name}' has 0 points after ingestion - refusing to cut over. "
-            "Check the seed_docs() logs above for per-document failures."
+            f"'{new_collection_name}' has {point_count} points but seed_docs() reported "
+            f"writing {report.chunks_written} chunks - refusing to cut over on a mismatch "
+            "between what was written and what's actually queryable."
+        )
+    if actual_sources != report.sources:
+        raise RuntimeError(
+            f"'{new_collection_name}' contains sources {sorted(actual_sources)}, but "
+            f"seed_docs() reported ingesting {sorted(report.sources)} - refusing to cut "
+            "over on a mismatch between the ingested corpus and what's actually stored."
         )
 
-    _free_up_target_name(client, settings.qdrant_url, target_name)
-
-    client.update_collection_aliases(
-        change_aliases_operations=[
-            CreateAliasOperation(
-                create_alias=CreateAlias(collection_name=new_collection_name, alias_name=target_name)
-            )
-        ]
-    )
-    logger.info(
-        "migrate.cutover_complete | alias=%s -> %s (previous collection preserved for rollback)",
-        target_name,
-        new_collection_name,
-    )
+    _cutover_alias(client, target_name, new_collection_name)
 
 
-def _free_up_target_name(client: QdrantClient, qdrant_url: str, target_name: str) -> None:
-    """Make ``target_name`` available for the new alias, preserving whatever
-    currently answers to it (a prior alias, or the original bare collection)."""
+def _require_complete_corpus(report: SeedReport) -> None:
+    if report.failed_files:
+        raise RuntimeError(
+            f"seed_docs() failed to ingest {len(report.failed_files)}/{report.discovered_files} "
+            f"file(s): {report.failed_files} - refusing to cut over on a partial corpus. "
+            "Check the seed.document_ingestion_failed logs above for details."
+        )
+    if report.succeeded_files != report.discovered_files:
+        raise RuntimeError(
+            f"seed_docs() only succeeded on {report.succeeded_files}/{report.discovered_files} "
+            "discovered file(s) - refusing to cut over on a partial corpus."
+        )
+    if report.discovered_files == 0:
+        raise RuntimeError(
+            "seed_docs() discovered 0 files to ingest - refusing to cut over onto an empty "
+            "collection. Check the policy directory path."
+        )
+
+
+def _cutover_alias(client: QdrantClient, target_name: str, new_collection_name: str) -> None:
+    """Repoint ``target_name`` at ``new_collection_name``, atomically where
+    possible (see the module docstring for why the very first run can't
+    be fully atomic without introducing a new alias name)."""
     existing_aliases = {a.alias_name: a.collection_name for a in client.get_aliases().aliases}
 
     if target_name in existing_aliases:
-        # Already alias-based from an earlier run of this script - drop the
-        # old alias entry only; the physical collection it pointed at is
-        # untouched (that's the previous migration's rollback copy).
+        # Already alias-based from an earlier run of this script - delete
+        # the old entry and create the new one in a single atomic call,
+        # so there's no window where target_name resolves to nothing.
         client.update_collection_aliases(
             change_aliases_operations=[
-                DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=target_name))
+                DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=target_name)),
+                CreateAliasOperation(
+                    create_alias=CreateAlias(
+                        collection_name=new_collection_name, alias_name=target_name
+                    )
+                ),
             ]
+        )
+        logger.info(
+            "migrate.cutover_complete | alias=%s -> %s (previous collection preserved for rollback)",
+            target_name,
+            new_collection_name,
         )
         return
 
     if not client.collection_exists(target_name):
-        return  # nothing occupies the name yet - fresh install, nothing to preserve
+        # Fresh install - nothing occupies target_name yet, so it can
+        # become the alias directly.
+        client.update_collection_aliases(
+            change_aliases_operations=[
+                CreateAliasOperation(
+                    create_alias=CreateAlias(
+                        collection_name=new_collection_name, alias_name=target_name
+                    )
+                )
+            ]
+        )
+        logger.info("migrate.cutover_complete | alias=%s -> %s", target_name, new_collection_name)
+        return
 
     # First-ever migration: target_name is a bare physical collection, not
-    # an alias. Qdrant can't rename it, so snapshot + recover it under a
-    # new name before reclaiming target_name for the alias - never delete
-    # the original until the copy is confirmed to exist.
-    backup_name = f"{target_name}_v1"
-    if client.collection_exists(backup_name):
+    # an alias. Qdrant forbids an alias sharing a name with an existing
+    # collection, so claiming target_name itself would require deleting
+    # it first - reopening the not-found/race window this migration
+    # exists to avoid. Use a distinct, permanent alias name instead; the
+    # original collection is left untouched (no deletion, no gap).
+    live_alias = f"{target_name}{_LIVE_ALIAS_SUFFIX}"
+    if live_alias in existing_aliases or client.collection_exists(live_alias):
         raise RuntimeError(
-            f"Can't preserve '{target_name}' as '{backup_name}' - '{backup_name}' already "
-            "exists. Resolve manually (rename/delete it) before re-running this migration."
+            f"'{live_alias}' already exists - resolve manually (rename/delete it) before "
+            "re-running this migration."
         )
-
-    logger.info("migrate.snapshotting_original | collection=%s", target_name)
-    snapshot = client.create_snapshot(collection_name=target_name, wait=True)
-    if snapshot is None:
-        raise RuntimeError(f"Snapshot of '{target_name}' failed - refusing to delete it.")
-
-    location = f"{qdrant_url}/collections/{target_name}/snapshots/{snapshot.name}"
-    logger.info("migrate.restoring_as_backup | collection=%s", backup_name)
-    recovered = client.recover_snapshot(collection_name=backup_name, location=location, wait=True)
-    if not recovered or not client.collection_exists(backup_name):
-        raise RuntimeError(
-            f"Restoring '{target_name}' as '{backup_name}' failed - refusing to delete "
-            f"the original. ('{target_name}' is untouched.)"
-        )
-
-    logger.info(
-        "migrate.deleting_original | collection=%s (preserved as %s)", target_name, backup_name
+    client.update_collection_aliases(
+        change_aliases_operations=[
+            CreateAliasOperation(
+                create_alias=CreateAlias(collection_name=new_collection_name, alias_name=live_alias)
+            )
+        ]
     )
-    client.delete_collection(target_name)
+    logger.warning(
+        "migrate.cutover_complete_action_required | alias=%s -> %s | "
+        "original collection '%s' left untouched - set QDRANT_COLLECTION=%s and redeploy "
+        "the app to actually start serving the new alias, then delete '%s' manually once "
+        "traffic is confirmed on it",
+        live_alias,
+        new_collection_name,
+        target_name,
+        live_alias,
+        target_name,
+    )
 
 
 def main() -> None:

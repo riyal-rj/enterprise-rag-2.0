@@ -161,7 +161,11 @@ class RAGService:
         if cached is not None:
             return cached.model_copy(update={"cache_hit": True})
 
-        query_embedding = self._embedding_client.embed_texts([question])[0]
+        query_embedding = (
+            self._embedding_client.embed_texts([question])[0]
+            if strategy.requires_dense_embedding
+            else None
+        )
         chunks = strategy.retrieve(
             query_text=question,
             query_embedding=query_embedding,

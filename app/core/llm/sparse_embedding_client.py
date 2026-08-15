@@ -35,19 +35,32 @@ class FastEmbedSparseClient:
     The model name is pinned explicitly (not left to FastEmbed's default)
     so ingestion and query-time encoding can't silently drift apart if
     FastEmbed changes its default model in a future release.
+
+    Model loading is deferred to the first actual embed call, not
+    ``__init__``: this client is always constructed by
+    ``app.api.deps.get_retrieval_strategies`` regardless of
+    ``HYBRID_SEARCH_ENABLED`` (the eval harness needs sparse/hybrid
+    constructible even when the flag is off), so a dense-only deployment
+    must not pay for a local model load/download it will never use.
     """
 
     def __init__(self, model_name: str = "Qdrant/bm25") -> None:
-        self._model = SparseTextEmbedding(model_name=model_name)
+        self._model_name = model_name
+        self._model: SparseTextEmbedding | None = None
+
+    def _loaded_model(self) -> SparseTextEmbedding:
+        if self._model is None:
+            self._model = SparseTextEmbedding(model_name=self._model_name)
+        return self._model
 
     def embed_documents(self, texts: list[str]) -> list[SparseVector]:
         if not texts:
             return []
         return [
             SparseVector(indices=embedding.indices.tolist(), values=embedding.values.tolist())
-            for embedding in self._model.embed(texts)
+            for embedding in self._loaded_model().embed(texts)
         ]
 
     def embed_query(self, text: str) -> SparseVector:
-        embedding = next(iter(self._model.query_embed(text)))
+        embedding = next(iter(self._loaded_model().query_embed(text)))
         return SparseVector(indices=embedding.indices.tolist(), values=embedding.values.tolist())

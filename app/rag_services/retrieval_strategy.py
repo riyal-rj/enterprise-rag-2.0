@@ -25,8 +25,16 @@ class RetrievalStrategy(Protocol):
     @property
     def cache_namespace(self) -> str: ...
 
+    @property
+    def requires_dense_embedding(self) -> bool:
+        """Whether ``RAGService.answer()`` must compute a dense OpenAI
+        embedding before calling ``retrieve()``. ``False`` for
+        sparse-only retrieval, so pure BM25 evaluation/fallback doesn't
+        incur OpenAI embedding cost/latency it never uses."""
+        ...
+
     def retrieve(
-        self, *, query_text: str, query_embedding: list[float], top_k: int
+        self, *, query_text: str, query_embedding: list[float] | None, top_k: int
     ) -> list[RetrievedChunk]: ...
 
 
@@ -42,10 +50,15 @@ class DenseRetrievalStrategy:
     def cache_namespace(self) -> str:
         return "dense:v1"
 
+    @property
+    def requires_dense_embedding(self) -> bool:
+        return True
+
     def retrieve(
-        self, *, query_text: str, query_embedding: list[float], top_k: int
+        self, *, query_text: str, query_embedding: list[float] | None, top_k: int
     ) -> list[RetrievedChunk]:
         del query_text
+        assert query_embedding is not None, "dense retrieval requires a query embedding"
         return self._vector_repository.search_dense(query_embedding, top_k=top_k)
 
 
@@ -71,8 +84,12 @@ class SparseRetrievalStrategy:
     def cache_namespace(self) -> str:
         return "sparse:v1"
 
+    @property
+    def requires_dense_embedding(self) -> bool:
+        return False
+
     def retrieve(
-        self, *, query_text: str, query_embedding: list[float], top_k: int
+        self, *, query_text: str, query_embedding: list[float] | None, top_k: int
     ) -> list[RetrievedChunk]:
         del query_embedding
         query_sparse = self._sparse_embedding_client.embed_query(query_text)
@@ -104,9 +121,14 @@ class HybridRetrievalStrategy:
         # from the old pipeline can't be served under the new one's key.
         return "hybrid:v2"
 
+    @property
+    def requires_dense_embedding(self) -> bool:
+        return True
+
     def retrieve(
-        self, *, query_text: str, query_embedding: list[float], top_k: int
+        self, *, query_text: str, query_embedding: list[float] | None, top_k: int
     ) -> list[RetrievedChunk]:
+        assert query_embedding is not None, "hybrid retrieval requires a query embedding"
         candidate_top_k = max(top_k, self._candidate_top_k)
         return self.hybrid_search(
             query_embedding=query_embedding,

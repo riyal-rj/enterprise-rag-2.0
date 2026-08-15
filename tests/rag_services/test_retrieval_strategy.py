@@ -94,6 +94,7 @@ def test_dense_strategy_name_and_cache_namespace() -> None:
 
     assert strategy.name == "dense"
     assert strategy.cache_namespace == "dense:v1"
+    assert strategy.requires_dense_embedding is True
 
 
 def test_sparse_strategy_encodes_query_and_delegates_to_search_sparse() -> None:
@@ -120,6 +121,24 @@ def test_sparse_strategy_name_and_cache_namespace() -> None:
 
     assert strategy.name == "sparse"
     assert strategy.cache_namespace == "sparse:v1"
+    assert strategy.requires_dense_embedding is False
+
+
+def test_sparse_strategy_retrieves_without_a_query_embedding() -> None:
+    """Sparse retrieval must work with ``query_embedding=None`` - that's
+    what RAGService.answer() now passes when the strategy doesn't need a
+    dense embedding (see requires_dense_embedding)."""
+    sparse_results = [RetrievedChunk(text="sparse", source="b.pdf", score=0.5)]
+    fake = _FakeVectorRepository(sparse_results=sparse_results)
+    sparse_embedder = _FakeSparseEmbeddingClient()
+    strategy = SparseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, fake),
+        sparse_embedding_client=cast(SparseEmbeddingClient, sparse_embedder),
+    )
+
+    results = strategy.retrieve(query_text="refund policy", query_embedding=None, top_k=3)
+
+    assert results == sparse_results
 
 
 def _hybrid_strategy(
@@ -144,6 +163,7 @@ def test_hybrid_strategy_name_and_cache_namespace() -> None:
     # TF-IDF fusion to Qdrant-native fusion, so a stale cached answer from
     # the old pipeline can't be served under the new one's cache key.
     assert strategy.cache_namespace == "hybrid:v2"
+    assert strategy.requires_dense_embedding is True
 
 
 def test_hybrid_search_encodes_query_and_delegates_to_search_hybrid() -> None:

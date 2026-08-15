@@ -13,7 +13,11 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.rag_service import RAGService
-from app.rag_services.retrieval_strategy import DenseRetrievalStrategy, HybridRetrievalStrategy
+from app.rag_services.retrieval_strategy import (
+    DenseRetrievalStrategy,
+    HybridRetrievalStrategy,
+    SparseRetrievalStrategy,
+)
 from app.repositories.vector_repository import VectorRepository
 from app.services.query_cache_service import QueryCacheService
 
@@ -185,6 +189,37 @@ def test_answer_embeds_question_and_searches_with_top_k() -> None:
 
     assert embedding_client.calls == [["what is the policy?"]]
     assert vector_repository.search_calls[0]["top_k"] == 3
+
+
+def test_sparse_mode_never_calls_the_dense_embedding_client() -> None:
+    """Sparse retrieval must not incur OpenAI embedding cost/latency -
+    RAGService.answer() should skip embed_texts() entirely when the
+    selected strategy's requires_dense_embedding is False."""
+    sparse_chunks = [RetrievedChunk(text="sparse hit", source="a.pdf", score=0.9)]
+
+    class _SparseCapableRepo(_FakeVectorRepository):
+        def search_sparse(self, query_sparse: SparseVector, top_k: int = 5) -> list[RetrievedChunk]:
+            self.search_calls.append({"query_sparse": query_sparse, "top_k": top_k})
+            return self._results[:top_k]
+
+    sparse_repo = _SparseCapableRepo(sparse_chunks)
+    embedding_client = _FakeEmbeddingClient()
+    sparse_strategy = SparseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, sparse_repo),
+        sparse_embedding_client=cast(SparseEmbeddingClient, _FakeSparseEmbeddingClient()),
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, embedding_client),
+        retrieval_strategies={sparse_strategy.name: sparse_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode="sparse",
+    )
+
+    response = service.answer("refund policy?")
+
+    assert embedding_client.calls == []
+    assert response.sources == ["a.pdf"]
 
 
 def test_answer_builds_context_with_source_citations() -> None:
