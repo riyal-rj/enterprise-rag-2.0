@@ -43,6 +43,10 @@ from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
     PostgresChatHistoryRepository,
 )
+from app.repositories.conversation_repository import (
+    ConversationRepository,
+    PostgresConversationRepository,
+)
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -242,11 +246,18 @@ def get_chat_history_repository(
     return PostgresChatHistoryRepository(pool)
 
 
+def get_conversation_repository(
+    pool: PostgresConnectionPool = Depends(get_db_pool),
+) -> ConversationRepository:
+    return PostgresConversationRepository(pool)
+
+
 def get_chat_controller(
     rag_service: RAGService = Depends(get_rag_service),
     chat_history_repository: ChatHistoryRepository = Depends(get_chat_history_repository),
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
 ) -> ChatController:
-    return ChatController(rag_service, chat_history_repository)
+    return ChatController(rag_service, chat_history_repository, conversation_repository)
 
 
 def get_health_checks(

@@ -16,6 +16,7 @@ class ChatHistoryRepository(Protocol):
     def create(
         self,
         username: str,
+        conversation_id: int,
         question: str,
         answer: str,
         sources: list[str],
@@ -23,6 +24,10 @@ class ChatHistoryRepository(Protocol):
     ) -> ChatHistoryEntry: ...
 
     def list_by_user(self, username: str, limit: int, offset: int) -> list[ChatHistoryEntry]: ...
+
+    def list_by_conversation(
+        self, conversation_id: int, limit: int = 200
+    ) -> list[ChatHistoryEntry]: ...
 
 
 class PostgresChatHistoryRepository:
@@ -34,6 +39,7 @@ class PostgresChatHistoryRepository:
     def create(
         self,
         username: str,
+        conversation_id: int,
         question: str,
         answer: str,
         sources: list[str],
@@ -42,10 +48,11 @@ class PostgresChatHistoryRepository:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO chat_history (username, question, answer, sources, confidence) "
-                    "VALUES (%s, %s, %s, %s, %s) "
+                    "INSERT INTO chat_history "
+                    "(username, conversation_id, question, answer, sources, confidence) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
                     "RETURNING id, created_at",
-                    (username, question, answer, Json(sources), confidence),
+                    (username, conversation_id, question, answer, Json(sources), confidence),
                 )
                 row = cur.fetchone()
                 if row is None:
@@ -81,6 +88,31 @@ class PostgresChatHistoryRepository:
                 sources=list(row[3]),
                 confidence=row[4],
                 created_at=row[5],
+            )
+            for row in rows
+        ]
+
+    def list_by_conversation(
+        self, conversation_id: int, limit: int = 200
+    ) -> list[ChatHistoryEntry]:
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, question, answer, sources, confidence, created_at "
+                "FROM chat_history WHERE conversation_id = %s "
+                "ORDER BY created_at ASC "
+                "LIMIT %s",
+                (conversation_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            ChatHistoryEntry(
+                id=row[0],
+                username=row[1],
+                question=row[2],
+                answer=row[3],
+                sources=list(row[4]),
+                confidence=row[5],
+                created_at=row[6],
             )
             for row in rows
         ]

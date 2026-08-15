@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.exceptions import (
     AppError,
+    ConversationNotFoundError,
     FileTooLargeError,
     InvalidCredentialsError,
     InvalidTokenError,
@@ -31,6 +32,7 @@ _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     RateLimitExceededError: status.HTTP_429_TOO_MANY_REQUESTS,
     UnsupportedFileTypeError: status.HTTP_400_BAD_REQUEST,
     FileTooLargeError: status.HTTP_413_CONTENT_TOO_LARGE,
+    ConversationNotFoundError: status.HTTP_404_NOT_FOUND,
 }
 
 

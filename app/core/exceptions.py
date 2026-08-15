@@ -77,3 +77,15 @@ class FileTooLargeError(AppError):
     def __init__(self, filename: str, max_size_mb: int) -> None:
         super().__init__(f"'{filename}' exceeds the maximum upload size of {max_size_mb}MB")
         self.filename = filename
+
+
+class ConversationNotFoundError(AppError):
+    """Raised when a conversation doesn't exist or isn't owned by the caller.
+
+    Deliberately doesn't distinguish the two cases in the message - the 404
+    shouldn't leak whether a given id belongs to someone else.
+    """
+
+    def __init__(self, conversation_id: int) -> None:
+        super().__init__(f"Conversation {conversation_id} not found")
+        self.conversation_id = conversation_id
