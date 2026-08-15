@@ -15,8 +15,10 @@ class _FakeRAGService:
         self._response = response
         self.calls: list[dict[str, object]] = []
 
-    def answer(self, question: str, top_k: int = 5) -> ChatResponse:
-        self.calls.append({"question": question, "top_k": top_k})
+    def answer(
+        self, question: str, top_k: int = 5, retrieval_mode: str | None = None
+    ) -> ChatResponse:
+        self.calls.append({"question": question, "top_k": top_k, "retrieval_mode": retrieval_mode})
         return self._response
 
 
@@ -75,6 +77,18 @@ def test_chat_returns_rag_response_unchanged() -> None:
     result = controller.chat("alice", ChatRequest(question="what is the policy?"))
 
     assert result.answer == "the answer"
+
+
+def test_chat_forwards_retrieval_mode_override_to_rag_service() -> None:
+    rag_service = _FakeRAGService(_response("the answer"))
+    history_repo = _FakeChatHistoryRepository()
+    controller = ChatController(
+        cast(RAGService, rag_service), cast(ChatHistoryRepository, history_repo)
+    )
+
+    controller.chat("alice", ChatRequest(question="what is the policy?", retrieval_mode="hybrid"))
+
+    assert rag_service.calls[0]["retrieval_mode"] == "hybrid"
 
 
 def test_chat_persists_a_history_entry_for_the_caller() -> None:

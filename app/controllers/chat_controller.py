@@ -23,7 +23,9 @@ class ChatController:
         self._chat_history_repository = chat_history_repository
 
     def chat(self, username: str, payload: ChatRequest) -> ChatResponse:
-        response = self._rag_service.answer(payload.question, top_k=payload.top_k)
+        response = self._rag_service.answer(
+            payload.question, top_k=payload.top_k, retrieval_mode=payload.retrieval_mode
+        )
         self._save_history(username, payload.question, response)
         return response
 

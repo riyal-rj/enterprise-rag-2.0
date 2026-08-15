@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+RetrievalMode = Literal["dense", "hybrid"]
 
 
 class ChatRequest(BaseModel):
@@ -12,6 +15,10 @@ class ChatRequest(BaseModel):
 
     question: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=5, gt=0, le=50)
+    retrieval_mode: RetrievalMode | None = Field(
+        default=None,
+        description="Overrides the server-configured default retrieval strategy for this request.",
+    )
 
 
 class RetrievedChunkPreview(BaseModel):

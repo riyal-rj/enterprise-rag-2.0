@@ -34,6 +34,11 @@ from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
 from app.rag_services.rag_service import RAGService
+from app.rag_services.retrieval_strategy import (
+    DenseRetrievalStrategy,
+    HybridRetrievalStrategy,
+    RetrievalStrategy,
+)
 from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
     PostgresChatHistoryRepository,
@@ -56,11 +61,6 @@ from app.services.health_checks import (
 )
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
-from app.rag_services.retrieval_strategy import (
-    DenseRetrievalStrategy,
-    RetrievalStrategy,
-    HybridRetrievalStrategy,
-)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _POLICY_DIR = _REPO_ROOT / "policy"
@@ -125,31 +125,39 @@ def get_vector_repository() -> VectorRepository:
 
 
 @lru_cache(maxsize=1)
-def get_retrieval_strategy() -> RetrievalStrategy:
-    settings = get_settings().rag
+def get_retrieval_strategies() -> dict[str, RetrievalStrategy]:
+    """Every retrieval strategy the API can serve, keyed by ``RetrievalMode``.
 
+    Both are always built - unlike the old single-strategy wiring, the
+    ``hybrid_search_enabled`` flag no longer decides which strategy exists,
+    only which one ``get_default_retrieval_mode`` picks - so a per-request
+    ``ChatRequest.retrieval_mode`` override (see the UI retrieval toggle)
+    can select either one regardless of the server default.
+    """
+    settings = get_settings().rag
     vector_repository = get_vector_repository()
 
-    if settings.hybrid_search_enabled:
-        return HybridRetrievalStrategy(
-            vector_repository=vector_repository,
-            rrf_k=settings.rrf_k,
-            candidate_top_k=settings.hybrid_candidate_top_k
-        )
-
-    return DenseRetrievalStrategy(
-        vector_repository=vector_repository
+    dense: RetrievalStrategy = DenseRetrievalStrategy(vector_repository=vector_repository)
+    hybrid: RetrievalStrategy = HybridRetrievalStrategy(
+        vector_repository=vector_repository,
+        rrf_k=settings.rrf_k,
+        candidate_top_k=settings.hybrid_candidate_top_k,
     )
+    return {dense.name: dense, hybrid.name: hybrid}
 
+
+def get_default_retrieval_mode() -> str:
+    return "hybrid" if get_settings().rag.hybrid_search_enabled else "dense"
 
 
 @lru_cache(maxsize=1)
 def get_rag_service() -> RAGService:
     return RAGService(
         embedding_client=get_embedding_client(),
-        retrieval_strategy=get_retrieval_strategy(),
+        retrieval_strategies=get_retrieval_strategies(),
         llm_client=get_llm_client(),
         cache=get_query_cache_service(),
+        default_retrieval_mode=get_default_retrieval_mode(),
     )
 
 

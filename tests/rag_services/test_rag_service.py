@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from app.core.config.cache import CacheSettings
 from app.core.ingestion.document_processor import DocumentChunk
 from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.rag_service import RAGService
-from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
+from app.rag_services.retrieval_strategy import DenseRetrievalStrategy, HybridRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.services.query_cache_service import QueryCacheService
 
@@ -62,7 +64,9 @@ class _FakeVectorRepository:
         return self._results[:top_k]
 
     def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str]]:
-        raise NotImplementedError
+        # Empty, not NotImplementedError: HybridRetrievalStrategy always
+        # builds a sparse index from this, even in dense-only-focused tests.
+        return []
 
 
 class _FakeLLMClient:
@@ -101,14 +105,15 @@ def _service(
     vector_repository = _FakeVectorRepository(results or [])
     llm_client = _FakeLLMClient(answer)
     cache = QueryCacheService(backend or _InMemoryCacheBackend(), CacheSettings())
-    retrieval_strategy = DenseRetrievalStrategy(
+    dense_strategy = DenseRetrievalStrategy(
         vector_repository=cast(VectorRepository, vector_repository)
     )
     service = RAGService(
         embedding_client=cast(EmbeddingClient, embedding_client),
-        retrieval_strategy=retrieval_strategy,
+        retrieval_strategies={dense_strategy.name: dense_strategy},
         llm_client=cast(LLMClient, llm_client),
         cache=cache,
+        default_retrieval_mode=dense_strategy.name,
     )
     return service, embedding_client, vector_repository, llm_client
 
@@ -230,3 +235,55 @@ def test_cache_write_failure_does_not_crash() -> None:
     response = service.answer("q")
 
     assert response.answer == "the answer"
+
+
+def test_constructor_rejects_default_mode_absent_from_strategies() -> None:
+    dense_strategy = DenseRetrievalStrategy(vector_repository=cast(VectorRepository, object()))
+
+    with pytest.raises(ValueError, match="default_retrieval_mode"):
+        RAGService(
+            embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+            retrieval_strategies={dense_strategy.name: dense_strategy},
+            llm_client=cast(LLMClient, _FakeLLMClient()),
+            cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+            default_retrieval_mode="hybrid",
+        )
+
+
+def test_retrieval_mode_override_selects_a_different_strategy_and_cache_bucket() -> None:
+    dense_chunks = [RetrievedChunk(text="dense hit", source="a.pdf", score=0.9)]
+    hybrid_chunks = [RetrievedChunk(text="hybrid hit", source="b.pdf", score=0.9)]
+    dense_vector_repository = _FakeVectorRepository(dense_chunks)
+    hybrid_vector_repository = _FakeVectorRepository(hybrid_chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, dense_vector_repository)
+    )
+    hybrid_strategy = HybridRetrievalStrategy(
+        vector_repository=cast(VectorRepository, hybrid_vector_repository)
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy, hybrid_strategy.name: hybrid_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode="dense",
+    )
+
+    default_response = service.answer("what is the policy?")
+    hybrid_response = service.answer("what is the policy?", retrieval_mode="hybrid")
+
+    assert default_response.metadata.retrieval_mode == "dense"
+    assert default_response.sources == ["a.pdf"]
+    assert hybrid_response.metadata.retrieval_mode == "hybrid"
+    assert hybrid_response.sources == ["b.pdf"]
+    # Distinct cache namespaces per mode - the hybrid call wasn't a cache hit
+    # off the dense call's cached response.
+    assert hybrid_response.cache_hit is False
+
+
+def test_unknown_retrieval_mode_falls_back_to_default() -> None:
+    service, _, _, _ = _service(results=[RetrievedChunk(text="x", source="a.pdf", score=0.9)])
+
+    response = service.answer("q", retrieval_mode="nonexistent")
+
+    assert response.metadata.retrieval_mode == "dense"

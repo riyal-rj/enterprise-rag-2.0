@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 
 from app.core.llm.chat_client import LLMClient
 from app.core.llm.embedding_client import EmbeddingClient
@@ -114,23 +115,36 @@ class RAGService:
     def __init__(
         self,
         embedding_client: EmbeddingClient,
-        retrieval_strategy: RetrievalStrategy,
+        retrieval_strategies: Mapping[str, RetrievalStrategy],
         llm_client: LLMClient,
         cache: QueryCacheService,
+        default_retrieval_mode: str,
     ) -> None:
+        if default_retrieval_mode not in retrieval_strategies:
+            raise ValueError(
+                f"default_retrieval_mode {default_retrieval_mode!r} is not among "
+                f"the available retrieval_strategies: {sorted(retrieval_strategies)}"
+            )
         self._embedding_client = embedding_client
-        self._retrieval_strategy = retrieval_strategy
+        self._retrieval_strategies = retrieval_strategies
         self._llm_client = llm_client
         self._cache = cache
+        self._default_retrieval_mode = default_retrieval_mode
 
-    def answer(self, question: str, top_k: int = 5) -> ChatResponse:
-        cache_key = self._cache_key(question, top_k)
+    def answer(
+        self, question: str, top_k: int = 5, retrieval_mode: str | None = None
+    ) -> ChatResponse:
+        strategy = self._retrieval_strategies.get(
+            retrieval_mode or self._default_retrieval_mode
+        ) or self._retrieval_strategies[self._default_retrieval_mode]
+
+        cache_key = self._cache_key(question, top_k, strategy.cache_namespace)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached.model_copy(update={"cache_hit": True})
 
         query_embedding = self._embedding_client.embed_texts([question])[0]
-        chunks = self._retrieval_strategy.retrieve(
+        chunks = strategy.retrieve(
             query_text=question,
             query_embedding=query_embedding,
             top_k=top_k,
@@ -165,7 +179,7 @@ class RAGService:
             confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
-                retrieval_mode=self._retrieval_strategy.name,
+                retrieval_mode=strategy.name,
                 retrieved_chunks=[
                     RetrievedChunkPreview(
                         text=c.text, source=c.source, score=c.score, page_number=c.page_number
@@ -194,12 +208,12 @@ class RAGService:
             )
         return "\n\n".join(sections)
 
-    def _cache_key(self, question: str, top_k: int) -> str:
+    def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
        normalized_question = " ".join(question.split())
 
        raw_key = (
            f"rag:v2:"
-           f"{self._retrieval_strategy.cache_namespace}:"
+           f"{cache_namespace}:"
            f"{top_k}:"
            f"{normalized_question}"
        )
