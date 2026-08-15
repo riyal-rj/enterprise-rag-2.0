@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from qdrant_client.models import SparseVector
 
 from app.core.exceptions import FileTooLargeError, UnsupportedFileTypeError
 from app.core.ingestion.document_processor import DocumentChunk, DocumentProcessor
 from app.core.llm.embedding_client import EmbeddingClient
+from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.repositories.vector_repository import VectorRepository
 from app.services.policy_ingestion_service import PolicyIngestionService
 
@@ -31,18 +33,41 @@ class _FakeEmbeddingClient:
         return [[0.1, 0.2] for _ in texts]
 
 
+class _FakeSparseEmbeddingClient:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed_documents(self, texts: list[str]) -> list[SparseVector]:
+        self.calls.append(texts)
+        return [SparseVector(indices=[1], values=[1.0]) for _ in texts]
+
+    def embed_query(self, text: str) -> SparseVector:
+        raise NotImplementedError
+
+
 class _FakeVectorRepository:
     def __init__(self, existing_records: list[dict[str, str | int | None]] | None = None) -> None:
         self._records = existing_records or []
-        self.upsert_calls: list[tuple[list[DocumentChunk], list[list[float]]]] = []
+        self.upsert_calls: list[tuple[list[DocumentChunk], list[list[float]], list[SparseVector]]] = []
         self.delete_calls: list[str] = []
         self.call_order: list[str] = []
 
-    def upsert_chunks(self, chunks: list[DocumentChunk], embeddings: list[list[float]]) -> None:
-        self.upsert_calls.append((chunks, embeddings))
+    def upsert_chunks(
+        self,
+        chunks: list[DocumentChunk],
+        dense_embeddings: list[list[float]],
+        sparse_embeddings: list[SparseVector],
+    ) -> None:
+        self.upsert_calls.append((chunks, dense_embeddings, sparse_embeddings))
         self.call_order.append("upsert")
 
-    def search(self, query_embedding: list[float], top_k: int = 5):
+    def search_dense(self, query_embedding: list[float], top_k: int = 5):
+        raise NotImplementedError
+
+    def search_sparse(self, query_sparse: SparseVector, top_k: int = 5):
+        raise NotImplementedError
+
+    def search_hybrid(self, *args: object, **kwargs: object):
         raise NotImplementedError
 
     def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str | int | None]]:
@@ -60,23 +85,29 @@ def _service(
     existing_records: list[dict[str, str | int | None]] | None = None,
     max_upload_size_mb: int = 25,
 ) -> tuple[
-    PolicyIngestionService, _FakeDocumentProcessor, _FakeEmbeddingClient, _FakeVectorRepository
+    PolicyIngestionService,
+    _FakeDocumentProcessor,
+    _FakeEmbeddingClient,
+    _FakeSparseEmbeddingClient,
+    _FakeVectorRepository,
 ]:
     processor = _FakeDocumentProcessor(chunks)
     embedder = _FakeEmbeddingClient()
+    sparse_embedder = _FakeSparseEmbeddingClient()
     repository = _FakeVectorRepository(existing_records)
     service = PolicyIngestionService(
         document_processor=cast(DocumentProcessor, processor),
         embedding_client=cast(EmbeddingClient, embedder),
+        sparse_embedding_client=cast(SparseEmbeddingClient, sparse_embedder),
         vector_repository=cast(VectorRepository, repository),
         policy_dir=tmp_path / "policy",
         max_upload_size_mb=max_upload_size_mb,
     )
-    return service, processor, embedder, repository
+    return service, processor, embedder, sparse_embedder, repository
 
 
 def test_ingest_fresh_document_upserts_without_deleting(tmp_path: Path) -> None:
-    service, _processor, _embedder, repository = _service(tmp_path)
+    service, _processor, _embedder, _sparse, repository = _service(tmp_path)
 
     response = service.ingest("refund-policy.pdf", b"pdf bytes")
 
@@ -88,7 +119,7 @@ def test_ingest_fresh_document_upserts_without_deleting(tmp_path: Path) -> None:
 
 
 def test_ingest_existing_source_deletes_before_upserting(tmp_path: Path) -> None:
-    service, _processor, _embedder, repository = _service(
+    service, _processor, _embedder, _sparse, repository = _service(
         tmp_path,
         existing_records=[{"id": "1", "text": "old", "source": "refund-policy.pdf", "page_number": None}],
     )
@@ -103,7 +134,7 @@ def test_ingest_existing_source_deletes_before_upserting(tmp_path: Path) -> None
 def test_ingest_passes_the_original_filename_to_the_document_processor(tmp_path: Path) -> None:
     """Docling derives the stored `source` from the on-disk filename, so the
     temp file it's given must keep the original name, not a random temp one."""
-    service, processor, _embedder, _repository = _service(tmp_path)
+    service, processor, _embedder, _sparse, _repository = _service(tmp_path)
 
     service.ingest("refund-policy.pdf", b"pdf bytes")
 
@@ -112,7 +143,7 @@ def test_ingest_passes_the_original_filename_to_the_document_processor(tmp_path:
 
 
 def test_ingest_copies_the_file_into_the_policy_directory(tmp_path: Path) -> None:
-    service, _processor, _embedder, _repository = _service(tmp_path)
+    service, _processor, _embedder, _sparse, _repository = _service(tmp_path)
 
     service.ingest("refund-policy.pdf", b"pdf bytes")
 
@@ -121,15 +152,16 @@ def test_ingest_copies_the_file_into_the_policy_directory(tmp_path: Path) -> Non
 
 def test_ingest_embeds_every_chunks_text(tmp_path: Path) -> None:
     chunks = [DocumentChunk(text="a", source="x"), DocumentChunk(text="b", source="x")]
-    service, _processor, embedder, _repository = _service(tmp_path, chunks=chunks)
+    service, _processor, embedder, sparse_embedder, _repository = _service(tmp_path, chunks=chunks)
 
     service.ingest("multi-chunk.pdf", b"pdf bytes")
 
     assert embedder.calls == [["a", "b"]]
+    assert sparse_embedder.calls == [["a", "b"]]
 
 
 def test_ingest_rejects_unsupported_file_type(tmp_path: Path) -> None:
-    service, processor, embedder, repository = _service(tmp_path)
+    service, processor, embedder, _sparse, repository = _service(tmp_path)
 
     with pytest.raises(UnsupportedFileTypeError):
         service.ingest("notes.txt", b"plain text")
@@ -140,7 +172,7 @@ def test_ingest_rejects_unsupported_file_type(tmp_path: Path) -> None:
 
 
 def test_ingest_rejects_oversized_content(tmp_path: Path) -> None:
-    service, processor, _embedder, _repository = _service(tmp_path, max_upload_size_mb=1)
+    service, processor, _embedder, _sparse, _repository = _service(tmp_path, max_upload_size_mb=1)
 
     with pytest.raises(FileTooLargeError):
         service.ingest("big.pdf", b"x" * (2 * 1024 * 1024))
@@ -149,7 +181,7 @@ def test_ingest_rejects_oversized_content(tmp_path: Path) -> None:
 
 
 def test_ingest_raises_when_no_chunks_are_extracted(tmp_path: Path) -> None:
-    service, _processor, embedder, repository = _service(tmp_path, chunks=[])
+    service, _processor, embedder, _sparse, repository = _service(tmp_path, chunks=[])
 
     with pytest.raises(ValueError, match="No content could be extracted"):
         service.ingest("empty.pdf", b"pdf bytes")

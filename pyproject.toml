@@ -7,54 +7,42 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "python-multipart>=0.0.12",
-
     # Settings & validation
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
-
     # LLM
     "openai>=1.54.0",
     "tiktoken>=0.8.0",
-
     # Vector DB & embeddings
     "qdrant-client>=1.12.0",
-
     # Doc parsing
     "docling>=2.9.0",
-
     # Text2SQL
     "vanna[openai,postgres]>=0.7.0",
-
     # Postgres
     "psycopg2-binary>=2.9.10",
-
     # Cache
     "upstash-redis>=1.2.0",
-
     # Auth
     "pyjwt>=2.10.0",
     "bcrypt>=4.0.0",
-
     # Logging
     "loguru>=0.7.2",
-
     # Agent orchestration
     "langgraph>=0.2.50",
     "langgraph-checkpoint-postgres>=2.0",
-
     # === Phase 2+ deps pinned now to avoid churn ===
     "sentence-transformers>=3.3.0",
     "voyageai>=0.3.0",
     "tavily-python>=0.5.0",
-
     # === Phase 4 deps ===
     "llm-guard>=0.3.15",
     "boto3>=1.35.0",
     "pypdf>=5.1.0",
-
     # === Data pipeline deps ===
     "pyyaml>=6.0",   # config.yaml parsing in scripts/data_pipeline/
     "faker>=33.0.0", # synthetic K8s ops SQL generation
+    "fastembed>=0.8.0",
 ]
 
 [project.optional-dependencies]

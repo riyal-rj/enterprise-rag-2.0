@@ -5,7 +5,19 @@ from typing import cast
 
 import pytest
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    Modifier,
+    Prefetch,
+    Rrf,
+    RrfQuery,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 
 from app.core.ingestion.document_processor import DocumentChunk
 from app.models.retrieved_chunk import RetrievedChunk
@@ -41,12 +53,17 @@ class _FakeRecord:
 
 class _FakeQdrantClient:
     def __init__(self, existing_collections: list[str] | None = None) -> None:
-        self._existing = list(existing_collections or [])
+        self._existing = set(existing_collections or [])
         self.created_collections: list[dict[str, object]] = []
+        self.created_payload_indexes: list[dict[str, object]] = []
         self.upsert_calls: list[dict[str, object]] = []
         self.delete_calls: list[dict[str, object]] = []
+        self.query_points_calls: list[dict[str, object]] = []
         self.query_response: _FakeQueryResponse = _FakeQueryResponse(points=[])
         self.scroll_response: tuple[list[_FakeRecord], None] = ([], None)
+
+    def collection_exists(self, collection_name: str) -> bool:
+        return collection_name in self._existing
 
     def get_collections(self) -> _FakeCollectionsResponse:
         return _FakeCollectionsResponse(
@@ -55,12 +72,16 @@ class _FakeQdrantClient:
 
     def create_collection(self, **kwargs: object) -> None:
         self.created_collections.append(kwargs)
-        self._existing.append(cast(str, kwargs["collection_name"]))
+        self._existing.add(cast(str, kwargs["collection_name"]))
+
+    def create_payload_index(self, **kwargs: object) -> None:
+        self.created_payload_indexes.append(kwargs)
 
     def upsert(self, **kwargs: object) -> None:
         self.upsert_calls.append(kwargs)
 
     def query_points(self, **kwargs: object) -> _FakeQueryResponse:
+        self.query_points_calls.append(kwargs)
         return self.query_response
 
     def scroll(self, **kwargs: object) -> tuple[list[_FakeRecord], None]:
@@ -70,19 +91,30 @@ class _FakeQdrantClient:
         self.delete_calls.append(kwargs)
 
 
-def _repo(
-    fake: _FakeQdrantClient, collection_name: str = "docs"
-) -> QdrantVectorRepository:
+def _repo(fake: _FakeQdrantClient, collection_name: str = "docs") -> QdrantVectorRepository:
     return QdrantVectorRepository(client=cast(QdrantClient, fake), collection_name=collection_name)
 
 
-def test_init_creates_collection_when_missing() -> None:
+def test_init_creates_collection_with_named_dense_and_sparse_vectors_when_missing() -> None:
     fake = _FakeQdrantClient(existing_collections=[])
 
     _repo(fake)
 
     assert len(fake.created_collections) == 1
-    assert fake.created_collections[0]["collection_name"] == "docs"
+    created = fake.created_collections[0]
+    assert created["collection_name"] == "docs"
+    assert created["vectors_config"] == {"dense": VectorParams(size=1536, distance=Distance.COSINE)}
+    assert created["sparse_vectors_config"] == {"bm25": SparseVectorParams(modifier=Modifier.IDF)}
+
+
+def test_init_creates_a_payload_index_on_source_when_collection_is_missing() -> None:
+    fake = _FakeQdrantClient(existing_collections=[])
+
+    _repo(fake)
+
+    assert len(fake.created_payload_indexes) == 1
+    assert fake.created_payload_indexes[0]["collection_name"] == "docs"
+    assert fake.created_payload_indexes[0]["field_name"] == "source"
 
 
 def test_init_does_not_recreate_existing_collection() -> None:
@@ -91,25 +123,43 @@ def test_init_does_not_recreate_existing_collection() -> None:
     _repo(fake)
 
     assert fake.created_collections == []
+    assert fake.created_payload_indexes == []
 
 
-def test_upsert_chunks_sends_text_source_and_page_number_payload() -> None:
+def test_init_treats_an_alias_as_an_existing_collection() -> None:
+    """``collection_exists`` (not a literal ``get_collections()`` name match)
+    is what gates creation - Qdrant resolves aliases transparently, and a
+    blue/green cutover (see scripts/migrate_qdrant_hybrid.py) repoints the
+    configured name to an alias, not always a physical collection."""
+    fake = _FakeQdrantClient(existing_collections=[])
+    fake.collection_exists = lambda name: name == "docs"  # type: ignore[method-assign]
+
+    _repo(fake)
+
+    assert fake.created_collections == []
+
+
+def test_upsert_chunks_sends_named_dense_and_sparse_vectors_with_payload() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     repo = _repo(fake)
     chunks = [
         DocumentChunk(text="hello", source="a.pdf", page_number=3),
         DocumentChunk(text="world", source="b.pdf"),
     ]
-    embeddings = [[0.1, 0.2], [0.3, 0.4]]
+    dense_embeddings = [[0.1, 0.2], [0.3, 0.4]]
+    sparse_embeddings = [
+        SparseVector(indices=[1, 2], values=[0.5, 0.6]),
+        SparseVector(indices=[3], values=[0.7]),
+    ]
 
-    repo.upsert_chunks(chunks, embeddings)
+    repo.upsert_chunks(chunks, dense_embeddings, sparse_embeddings)
 
     assert len(fake.upsert_calls) == 1
     points = cast(list, fake.upsert_calls[0]["points"])
     assert len(points) == 2
     assert points[0].payload == {"text": "hello", "source": "a.pdf", "page_number": 3}
     assert points[1].payload == {"text": "world", "source": "b.pdf", "page_number": None}
-    assert points[0].vector == [0.1, 0.2]
+    assert points[0].vector == {"dense": [0.1, 0.2], "bm25": sparse_embeddings[0]}
     assert points[0].id != points[1].id  # each point gets a unique id
 
 
@@ -118,10 +168,10 @@ def test_upsert_chunks_raises_on_length_mismatch() -> None:
     repo = _repo(fake)
 
     with pytest.raises(ValueError, match="shorter than"):
-        repo.upsert_chunks([DocumentChunk(text="a", source="s")], [])
+        repo.upsert_chunks([DocumentChunk(text="a", source="s")], [], [])
 
 
-def test_search_maps_points_to_retrieved_chunks() -> None:
+def test_search_dense_maps_points_and_uses_the_dense_vector() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     fake.query_response = _FakeQueryResponse(
         points=[
@@ -130,19 +180,70 @@ def test_search_maps_points_to_retrieved_chunks() -> None:
     )
     repo = _repo(fake)
 
-    result = repo.search([0.1, 0.2], top_k=5)
+    result = repo.search_dense([0.1, 0.2], top_k=5)
 
     assert result == [RetrievedChunk(text="hi", source="a.pdf", score=0.9, page_number=4)]
+    call = fake.query_points_calls[0]
+    assert call["using"] == "dense"
+    assert call["query"] == [0.1, 0.2]
+    assert call["limit"] == 5
 
 
-def test_search_handles_missing_payload() -> None:
+def test_search_dense_handles_missing_payload() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
     fake.query_response = _FakeQueryResponse(points=[_FakeScoredPoint(payload=None, score=0.5)])
     repo = _repo(fake)
 
-    result = repo.search([0.1], top_k=1)
+    result = repo.search_dense([0.1], top_k=1)
 
     assert result == [RetrievedChunk(text="", source="", score=0.5, page_number=None)]
+
+
+def test_search_sparse_maps_points_and_uses_the_bm25_vector() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    fake.query_response = _FakeQueryResponse(
+        points=[_FakeScoredPoint(payload={"text": "hi", "source": "a.pdf"}, score=1.2)]
+    )
+    repo = _repo(fake)
+    query_sparse = SparseVector(indices=[1], values=[1.0])
+
+    result = repo.search_sparse(query_sparse, top_k=3)
+
+    assert result == [RetrievedChunk(text="hi", source="a.pdf", score=1.2, page_number=None)]
+    call = fake.query_points_calls[0]
+    assert call["using"] == "bm25"
+    assert call["query"] == query_sparse
+    assert call["limit"] == 3
+
+
+def test_search_hybrid_prefetches_both_vectors_and_fuses_via_configurable_rrf() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    fake.query_response = _FakeQueryResponse(
+        points=[_FakeScoredPoint(payload={"text": "hi", "source": "a.pdf"}, score=0.03)]
+    )
+    repo = _repo(fake)
+    query_sparse = SparseVector(indices=[1], values=[1.0])
+
+    result = repo.search_hybrid(
+        query_embedding=[0.1, 0.2],
+        query_sparse=query_sparse,
+        top_k=5,
+        candidate_top_k=20,
+        rrf_k=42,
+    )
+
+    assert result == [RetrievedChunk(text="hi", source="a.pdf", score=0.03, page_number=None)]
+    call = fake.query_points_calls[0]
+    prefetch = cast(list[Prefetch], call["prefetch"])
+    assert len(prefetch) == 2
+    dense_prefetch = next(p for p in prefetch if p.using == "dense")
+    sparse_prefetch = next(p for p in prefetch if p.using == "bm25")
+    assert dense_prefetch.query == [0.1, 0.2]
+    assert dense_prefetch.limit == 20
+    assert sparse_prefetch.query == query_sparse
+    assert sparse_prefetch.limit == 20
+    assert call["query"] == RrfQuery(rrf=Rrf(k=42))
+    assert call["limit"] == 5
 
 
 def test_scroll_all_chunks_returns_id_text_source_page_number_dicts() -> None:

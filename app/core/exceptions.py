@@ -89,3 +89,21 @@ class ConversationNotFoundError(AppError):
     def __init__(self, conversation_id: int) -> None:
         super().__init__(f"Conversation {conversation_id} not found")
         self.conversation_id = conversation_id
+
+
+class HybridRetrievalDisabledError(AppError):
+    """Raised when a request asks for a retrieval mode the rollout flag
+    (``RAGFeatureSettings.hybrid_search_enabled``) currently disallows.
+
+    An explicit error, not a silent fallback to dense: the flag is meant
+    to be a real kill switch during the Qdrant-native hybrid rollout, and
+    silently downgrading a caller's explicit request would make that gate
+    unverifiable from the outside.
+    """
+
+    def __init__(self, requested_mode: str) -> None:
+        super().__init__(
+            f"retrieval_mode={requested_mode!r} is currently disabled by "
+            "the server (hybrid retrieval rollout gate)"
+        )
+        self.requested_mode = requested_mode

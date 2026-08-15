@@ -21,6 +21,7 @@ import hashlib
 import logging
 from collections.abc import Mapping
 
+from app.core.exceptions import HybridRetrievalDisabledError
 from app.core.llm.chat_client import LLMClient
 from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
@@ -119,24 +120,41 @@ class RAGService:
         llm_client: LLMClient,
         cache: QueryCacheService,
         default_retrieval_mode: str,
+        allowed_retrieval_modes: frozenset[str] | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
                 f"default_retrieval_mode {default_retrieval_mode!r} is not among "
                 f"the available retrieval_strategies: {sorted(retrieval_strategies)}"
             )
+        # None means "everything registered is allowed" - the eval harness's
+        # unrestricted RAGService instance uses this, since it must be able
+        # to run hybrid/sparse for real before the rollout flag is ever
+        # flipped on for real HTTP traffic (see app.eval.invokers).
+        if allowed_retrieval_modes is None:
+            allowed_retrieval_modes = frozenset(retrieval_strategies)
+        if default_retrieval_mode not in allowed_retrieval_modes:
+            raise ValueError(
+                f"default_retrieval_mode {default_retrieval_mode!r} is not among "
+                f"allowed_retrieval_modes: {sorted(allowed_retrieval_modes)}"
+            )
         self._embedding_client = embedding_client
         self._retrieval_strategies = retrieval_strategies
         self._llm_client = llm_client
         self._cache = cache
         self._default_retrieval_mode = default_retrieval_mode
+        self._allowed_retrieval_modes = allowed_retrieval_modes
 
     def answer(
         self, question: str, top_k: int = 5, retrieval_mode: str | None = None
     ) -> ChatResponse:
-        strategy = self._retrieval_strategies.get(
-            retrieval_mode or self._default_retrieval_mode
-        ) or self._retrieval_strategies[self._default_retrieval_mode]
+        mode = retrieval_mode or self._default_retrieval_mode
+        if mode in self._retrieval_strategies:
+            if mode not in self._allowed_retrieval_modes:
+                raise HybridRetrievalDisabledError(mode)
+            strategy = self._retrieval_strategies[mode]
+        else:
+            strategy = self._retrieval_strategies[self._default_retrieval_mode]
 
         cache_key = self._cache_key(question, top_k, strategy.cache_namespace)
         cached = self._get_cached(cache_key)

@@ -16,9 +16,15 @@ from pathlib import Path
 
 import psycopg2
 
-from app.api.deps import get_document_processor, get_embedding_client, get_vector_repository
+from app.api.deps import (
+    get_document_processor,
+    get_embedding_client,
+    get_sparse_embedding_client,
+    get_vector_repository,
+)
 from app.core.config import get_settings
 from app.core.ingestion.document_processor import SUPPORTED_SUFFIXES
+from app.repositories.vector_repository import VectorRepository
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +57,14 @@ def run_migrations() -> None:
         conn.close()
 
 
-def seed_docs(policy_dir: Path = _POLICY_DIR) -> None:
+def seed_docs(policy_dir: Path = _POLICY_DIR, vector_repository: VectorRepository | None = None) -> None:
     """Chunk, embed, and upsert every PDF/DOCX in ``policy_dir`` into Qdrant.
+
+    ``vector_repository`` defaults to the DI-provided singleton (the
+    app's configured collection); pass an explicit one to target a
+    different collection - e.g. ``scripts/migrate_qdrant_hybrid.py``
+    ingesting into a new physical collection ahead of an alias cutover,
+    without a permanent env change.
 
     One document's processing failure (a corrupt file, an unsupported
     layout) is logged and skipped rather than aborting the whole run -
@@ -60,7 +72,8 @@ def seed_docs(policy_dir: Path = _POLICY_DIR) -> None:
     """
     processor = get_document_processor()
     embedder = get_embedding_client()
-    repository = get_vector_repository()
+    sparse_embedder = get_sparse_embedding_client()
+    repository = vector_repository if vector_repository is not None else get_vector_repository()
 
     files = sorted(p for p in policy_dir.iterdir() if p.suffix.lower() in SUPPORTED_SUFFIXES)
     if not files:
@@ -75,8 +88,10 @@ def seed_docs(policy_dir: Path = _POLICY_DIR) -> None:
                 logger.warning("seed.no_chunks_extracted | file=%s", path.name)
                 continue
 
-            embeddings = embedder.embed_texts([chunk.text for chunk in chunks])
-            repository.upsert_chunks(chunks, embeddings)
+            texts = [chunk.text for chunk in chunks]
+            dense_embeddings = embedder.embed_texts(texts)
+            sparse_embeddings = sparse_embedder.embed_documents(texts)
+            repository.upsert_chunks(chunks, dense_embeddings, sparse_embeddings)
         except Exception:
             logger.exception("seed.document_ingestion_failed | file=%s", path.name)
             continue

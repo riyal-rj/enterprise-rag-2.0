@@ -39,6 +39,13 @@ def diff_reports(before: EvalPayload, after: EvalPayload) -> None:
             continue
         print(f"  {name:<20} {b:.3f} -> {a:.3f}  ({a - b:+.3f})")
 
+    print("\nRetrieval metric deltas (after - before):")
+    for name in ("hit_rate", "mrr"):
+        b, a = before_agg.get(name), after_agg.get(name)
+        if b is None or a is None:
+            continue
+        print(f"  {name:<20} {b:.3f} -> {a:.3f}  ({a - b:+.3f})")
+
     before_by_id = {row["id"]: row for row in before.get("rows", [])}
     after_by_id = {row["id"]: row for row in after.get("rows", [])}
 

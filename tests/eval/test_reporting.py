@@ -10,6 +10,7 @@ def _row(
     forbidden_ok: bool = True,
     forbidden_found: list[str] | None = None,
     metrics: dict[str, float] | None = None,
+    retrieval: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "id": case_id,
@@ -17,6 +18,7 @@ def _row(
         "forbidden_check": {"passed": forbidden_ok, "found": forbidden_found or []},
         "source_overlap": {"passed": True, "ratio": 1.0, "matched": []},
         "ragas_metrics": metrics or {},
+        "retrieval_metrics": retrieval,
     }
 
 
@@ -28,6 +30,29 @@ def test_aggregate_empty_rows_has_none_metrics_and_zero_violations() -> None:
     assert summary["context_recall"] is None
     assert summary["answer_relevancy"] is None
     assert summary["forbidden_violations"] == 0
+    assert summary["hit_rate"] is None
+    assert summary["mrr"] is None
+
+
+def test_aggregate_computes_hit_rate_and_mrr_means() -> None:
+    rows = [
+        _row("q-001", "baseline", retrieval={"hit_rate": True, "mrr": 1.0}),
+        _row("q-002", "baseline", retrieval={"hit_rate": False, "mrr": 0.0}),
+    ]
+
+    summary = aggregate(rows)
+
+    assert summary["hit_rate"] == 0.5
+    assert summary["mrr"] == 0.5
+
+
+def test_aggregate_ignores_rows_without_retrieval_metrics() -> None:
+    rows = [_row("q-001", "baseline")]  # no `retrieval=` - not yet scored
+
+    summary = aggregate(rows)
+
+    assert summary["hit_rate"] is None
+    assert summary["mrr"] is None
 
 
 def test_aggregate_computes_rounded_means_and_violation_count() -> None:

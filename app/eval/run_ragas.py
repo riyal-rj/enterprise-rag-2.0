@@ -19,7 +19,7 @@ from typing import Any, cast
 
 from app.eval.invokers import Invoker, InvokeResponse, RetrievedChunk, ServiceInvoker, SkippedIntent
 from app.eval.loader import load_golden_cases
-from app.eval.post_checks import forbidden_keywords_check, source_overlap
+from app.eval.post_checks import forbidden_keywords_check, retrieval_metrics, source_overlap
 from app.eval.profiles import PROFILES, PipelineProfile
 from app.eval.ragas_adapter import run as score_with_ragas
 from app.eval.reporting import aggregate, print_table
@@ -86,6 +86,10 @@ def _build_row(case: GoldenCase, response: InvokeResponse, chunks: list[Retrieve
         "contexts": [chunk.text for chunk in chunks],
         "ground_truth": ", ".join(case.golden_answer_keywords),
         "actual_sources": response.sources,
+        # In actual retrieval-rank order, unlike `actual_sources` (an
+        # alphabetically sorted set) - needed for rank-aware metrics
+        # (MRR). See app.eval.post_checks.retrieval_metrics.
+        "ranked_sources": [chunk.source for chunk in chunks],
         "golden_sources": case.golden_sources,
         "forbidden_keywords": case.forbidden_keywords,
     }
@@ -137,6 +141,7 @@ def _score_rows(rows: list[EvalRow]) -> None:
         row["ragas_metrics"] = cast(Any, row_metrics)
         row["forbidden_check"] = forbidden_keywords_check(row["answer"], row["forbidden_keywords"])
         row["source_overlap"] = source_overlap(row["actual_sources"], row["golden_sources"])
+        row["retrieval_metrics"] = retrieval_metrics(row["ranked_sources"], row["golden_sources"])
 
 
 def _resolve_output_path(output: str | None, profile: str, timestamp: datetime.datetime) -> Path:

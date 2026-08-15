@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
+from qdrant_client.models import SparseVector
 
 from app.core.config.cache import CacheSettings
+from app.core.exceptions import HybridRetrievalDisabledError
 from app.core.ingestion.document_processor import DocumentChunk
 from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
+from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.rag_service import RAGService
 from app.rag_services.retrieval_strategy import DenseRetrievalStrategy, HybridRetrievalStrategy
@@ -55,18 +58,41 @@ class _FakeVectorRepository:
         self.search_calls: list[dict[str, object]] = []
 
     def upsert_chunks(
-        self, chunks: list[DocumentChunk], embeddings: list[list[float]]
+        self,
+        chunks: list[DocumentChunk],
+        dense_embeddings: list[list[float]],
+        sparse_embeddings: list[SparseVector],
     ) -> None:
         raise NotImplementedError
 
-    def search(self, query_embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]:
+    def search_dense(self, query_embedding: list[float], top_k: int = 5) -> list[RetrievedChunk]:
+        self.search_calls.append({"query_embedding": query_embedding, "top_k": top_k})
+        return self._results[:top_k]
+
+    def search_sparse(self, query_sparse: SparseVector, top_k: int = 5) -> list[RetrievedChunk]:
+        raise NotImplementedError
+
+    def search_hybrid(
+        self,
+        query_embedding: list[float],
+        query_sparse: SparseVector,
+        top_k: int = 5,
+        candidate_top_k: int = 20,
+        rrf_k: int = 60,
+    ) -> list[RetrievedChunk]:
         self.search_calls.append({"query_embedding": query_embedding, "top_k": top_k})
         return self._results[:top_k]
 
     def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str]]:
-        # Empty, not NotImplementedError: HybridRetrievalStrategy always
-        # builds a sparse index from this, even in dense-only-focused tests.
-        return []
+        raise NotImplementedError
+
+
+class _FakeSparseEmbeddingClient:
+    def embed_documents(self, texts: list[str]) -> list[SparseVector]:
+        raise NotImplementedError
+
+    def embed_query(self, text: str) -> SparseVector:
+        return SparseVector(indices=[1], values=[1.0])
 
 
 class _FakeLLMClient:
@@ -259,7 +285,8 @@ def test_retrieval_mode_override_selects_a_different_strategy_and_cache_bucket()
         vector_repository=cast(VectorRepository, dense_vector_repository)
     )
     hybrid_strategy = HybridRetrievalStrategy(
-        vector_repository=cast(VectorRepository, hybrid_vector_repository)
+        vector_repository=cast(VectorRepository, hybrid_vector_repository),
+        sparse_embedding_client=cast(SparseEmbeddingClient, _FakeSparseEmbeddingClient()),
     )
     service = RAGService(
         embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
@@ -287,3 +314,63 @@ def test_unknown_retrieval_mode_falls_back_to_default() -> None:
     response = service.answer("q", retrieval_mode="nonexistent")
 
     assert response.metadata.retrieval_mode == "dense"
+
+
+def _service_with_allowed_modes(
+    allowed_retrieval_modes: frozenset[str] | None,
+) -> RAGService:
+    dense_repo = _FakeVectorRepository([RetrievedChunk(text="d", source="a.pdf", score=0.9)])
+    hybrid_repo = _FakeVectorRepository([RetrievedChunk(text="h", source="b.pdf", score=0.9)])
+    dense_strategy = DenseRetrievalStrategy(vector_repository=cast(VectorRepository, dense_repo))
+    hybrid_strategy = HybridRetrievalStrategy(
+        vector_repository=cast(VectorRepository, hybrid_repo),
+        sparse_embedding_client=cast(SparseEmbeddingClient, _FakeSparseEmbeddingClient()),
+    )
+    return RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy, hybrid_strategy.name: hybrid_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode="dense",
+        allowed_retrieval_modes=allowed_retrieval_modes,
+    )
+
+
+def test_constructor_rejects_default_mode_not_in_allowed_modes() -> None:
+    dense_strategy = DenseRetrievalStrategy(vector_repository=cast(VectorRepository, object()))
+
+    with pytest.raises(ValueError, match="allowed_retrieval_modes"):
+        RAGService(
+            embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+            retrieval_strategies={dense_strategy.name: dense_strategy},
+            llm_client=cast(LLMClient, _FakeLLMClient()),
+            cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+            default_retrieval_mode="dense",
+            allowed_retrieval_modes=frozenset({"hybrid"}),
+        )
+
+
+def test_explicit_retrieval_mode_is_rejected_when_not_allowed() -> None:
+    service = _service_with_allowed_modes(frozenset({"dense"}))
+
+    with pytest.raises(HybridRetrievalDisabledError):
+        service.answer("q", retrieval_mode="hybrid")
+
+
+def test_dense_mode_is_always_allowed_even_when_hybrid_is_gated_off() -> None:
+    service = _service_with_allowed_modes(frozenset({"dense"}))
+
+    response = service.answer("q", retrieval_mode="dense")
+
+    assert response.metadata.retrieval_mode == "dense"
+
+
+def test_none_allowed_modes_permits_every_registered_strategy() -> None:
+    """``allowed_retrieval_modes=None`` (the eval harness's bypass, see
+    app.eval.invokers) permits every registered mode, regardless of any
+    server-side rollout flag."""
+    service = _service_with_allowed_modes(None)
+
+    response = service.answer("q", retrieval_mode="hybrid")
+
+    assert response.metadata.retrieval_mode == "hybrid"

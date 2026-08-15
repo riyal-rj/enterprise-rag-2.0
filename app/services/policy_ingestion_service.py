@@ -1,9 +1,10 @@
 """Admin-triggered ingestion of a single uploaded policy document.
 
-Wraps the same three DI-provided pieces ``scripts/seed_db.py`` already
-uses (``DocumentProcessor``, ``EmbeddingClient``, ``VectorRepository``) so
-an admin upload is chunked/embedded/stored exactly as the batch seed
-script would do it - no second ingestion code path to drift out of sync.
+Wraps the same DI-provided pieces ``scripts/seed_db.py`` already uses
+(``DocumentProcessor``, ``EmbeddingClient``, ``SparseEmbeddingClient``,
+``VectorRepository``) so an admin upload is chunked/embedded/stored
+exactly as the batch seed script would do it - no second ingestion code
+path to drift out of sync.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 from app.core.exceptions import FileTooLargeError, UnsupportedFileTypeError
 from app.core.ingestion.document_processor import SUPPORTED_SUFFIXES, DocumentProcessor
 from app.core.llm.embedding_client import EmbeddingClient
+from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.policy import PolicyListResponse, PolicySummary, PolicyUploadResponse
 
@@ -29,12 +31,14 @@ class PolicyIngestionService:
         self,
         document_processor: DocumentProcessor,
         embedding_client: EmbeddingClient,
+        sparse_embedding_client: SparseEmbeddingClient,
         vector_repository: VectorRepository,
         policy_dir: Path,
         max_upload_size_mb: int,
     ) -> None:
         self._document_processor = document_processor
         self._embedding_client = embedding_client
+        self._sparse_embedding_client = sparse_embedding_client
         self._vector_repository = vector_repository
         self._policy_dir = policy_dir
         self._max_upload_size_bytes = max_upload_size_mb * 1024 * 1024
@@ -79,14 +83,16 @@ class PolicyIngestionService:
             if not chunks:
                 raise ValueError(f"No content could be extracted from '{filename}'")
 
-            embeddings = self._embedding_client.embed_texts([chunk.text for chunk in chunks])
+            texts = [chunk.text for chunk in chunks]
+            dense_embeddings = self._embedding_client.embed_texts(texts)
+            sparse_embeddings = self._sparse_embedding_client.embed_documents(texts)
 
             self._policy_dir.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(temp_path, self._policy_dir / filename)
 
             if is_replacing:
                 self._vector_repository.delete_by_source(filename)
-            self._vector_repository.upsert_chunks(chunks, embeddings)
+            self._vector_repository.upsert_chunks(chunks, dense_embeddings, sparse_embeddings)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

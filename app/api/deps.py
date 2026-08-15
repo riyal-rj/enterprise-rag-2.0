@@ -29,6 +29,7 @@ from app.core.ingestion.document_processor import (
 )
 from app.core.llm.chat_client import LLMClient, OpenAILLMClient, build_openai_client
 from app.core.llm.embedding_client import EmbeddingClient, OpenAIEmbeddingClient
+from app.core.llm.sparse_embedding_client import FastEmbedSparseClient, SparseEmbeddingClient
 from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
@@ -38,6 +39,7 @@ from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,
     RetrievalStrategy,
+    SparseRetrievalStrategy,
 )
 from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
@@ -129,29 +131,53 @@ def get_vector_repository() -> VectorRepository:
 
 
 @lru_cache(maxsize=1)
+def get_sparse_embedding_client() -> SparseEmbeddingClient:
+    """Process-wide FastEmbed BM25 client (loads a local model - expensive
+    to reconstruct per call, so cached like the other clients here)."""
+    return FastEmbedSparseClient()
+
+
+@lru_cache(maxsize=1)
 def get_retrieval_strategies() -> dict[str, RetrievalStrategy]:
     """Every retrieval strategy the API can serve, keyed by ``RetrievalMode``.
 
-    Both are always built - unlike the old single-strategy wiring, the
-    ``hybrid_search_enabled`` flag no longer decides which strategy exists,
-    only which one ``get_default_retrieval_mode`` picks - so a per-request
-    ``ChatRequest.retrieval_mode`` override (see the UI retrieval toggle)
-    can select either one regardless of the server default.
+    All three are always built - the ``hybrid_search_enabled`` flag doesn't
+    decide which strategies exist, only which ones ``get_rag_service``'s
+    ``allowed_retrieval_modes`` currently permits a real HTTP request to
+    resolve to (see ``RAGService.answer``) - the eval harness needs every
+    strategy constructible regardless of that flag.
     """
     settings = get_settings().rag
     vector_repository = get_vector_repository()
+    sparse_embedding_client = get_sparse_embedding_client()
 
     dense: RetrievalStrategy = DenseRetrievalStrategy(vector_repository=vector_repository)
+    sparse: RetrievalStrategy = SparseRetrievalStrategy(
+        vector_repository=vector_repository, sparse_embedding_client=sparse_embedding_client
+    )
     hybrid: RetrievalStrategy = HybridRetrievalStrategy(
         vector_repository=vector_repository,
+        sparse_embedding_client=sparse_embedding_client,
         rrf_k=settings.rrf_k,
         candidate_top_k=settings.hybrid_candidate_top_k,
     )
-    return {dense.name: dense, hybrid.name: hybrid}
+    return {dense.name: dense, sparse.name: sparse, hybrid.name: hybrid}
 
 
 def get_default_retrieval_mode() -> str:
     return "hybrid" if get_settings().rag.hybrid_search_enabled else "dense"
+
+
+def get_allowed_retrieval_modes() -> frozenset[str]:
+    """Modes a real HTTP ``/chat`` request is currently allowed to resolve
+    to - the rollout gate. ``dense`` is always allowed (the safe fallback);
+    ``sparse``/``hybrid`` require ``hybrid_search_enabled``. The eval
+    harness bypasses this entirely (see ``app.eval.invokers``), since it
+    must be able to run every mode for real ahead of flipping this flag.
+    """
+    if get_settings().rag.hybrid_search_enabled:
+        return frozenset(get_retrieval_strategies())
+    return frozenset({"dense"})
 
 
 @lru_cache(maxsize=1)
@@ -162,6 +188,7 @@ def get_rag_service() -> RAGService:
         llm_client=get_llm_client(),
         cache=get_query_cache_service(),
         default_retrieval_mode=get_default_retrieval_mode(),
+        allowed_retrieval_modes=get_allowed_retrieval_modes(),
     )
 
 
@@ -179,6 +206,7 @@ def get_policy_ingestion_service() -> PolicyIngestionService:
     return PolicyIngestionService(
         document_processor=get_document_processor(),
         embedding_client=get_embedding_client(),
+        sparse_embedding_client=get_sparse_embedding_client(),
         vector_repository=get_vector_repository(),
         policy_dir=_POLICY_DIR,
         max_upload_size_mb=get_settings().ingestion.max_upload_size_mb,
