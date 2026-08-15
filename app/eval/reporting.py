@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from statistics import mean
-from typing import cast
+from typing import Literal, cast
 
 from app.eval.types import AggregateResult, EvalPayload, EvalRow, MetricName
 
@@ -25,6 +25,8 @@ def aggregate(rows: list[EvalRow]) -> AggregateResult:
         forbidden_violations=sum(
             1 for row in rows if not row.get("forbidden_check", {}).get("passed", True)
         ),
+        hit_rate=_mean_retrieval_metric(rows, "hit_rate"),
+        mrr=_mean_retrieval_metric(rows, "mrr"),
     )
 
 
@@ -40,6 +42,21 @@ def _mean_metric(rows: list[EvalRow], metric: MetricName) -> float | None:
     return round(mean(values), 3) if values else None
 
 
+def _mean_retrieval_metric(rows: list[EvalRow], metric: Literal["hit_rate", "mrr"]) -> float | None:
+    """Mean of a deterministic retrieval metric across rows.
+
+    ``hit_rate`` is a bool per row - averaging it is exactly Hit Rate@K
+    (the fraction of cases with at least one golden source retrieved).
+    """
+    values: list[float] = []
+    for row in rows:
+        retrieval = row.get("retrieval_metrics")
+        if retrieval is None:
+            continue
+        values.append(float(retrieval[metric]))
+    return round(mean(values), 3) if values else None
+
+
 def _fmt(value: float | None) -> str:
     """Render a metric for display: ``N/A`` when unscored, never a bare ``0``."""
     return f"{value:.2f}" if value is not None else "N/A"
@@ -49,6 +66,7 @@ def print_table(payload: EvalPayload) -> None:
     """Print a markdown table of per-question results plus an aggregate row."""
     print(f"\n## Eval - profile={payload['profile']} mode={payload['mode']}")
     print(f"Skipped: {len(payload['skipped'])}")
+    print(f"Errors: {len(payload.get('errors', []))}")
     print()
     print("| id | feature | faith | ctx_prec | ctx_recall | ans_rel | forbidden |")
     print("|----|---------|-------|----------|------------|---------|-----------|")
@@ -80,3 +98,4 @@ def print_table(payload: EvalPayload) -> None:
         f"**{_fmt(agg['answer_relevancy'])}** | "
         f"violations={agg['forbidden_violations']} |"
     )
+    print(f"hit_rate={_fmt(agg['hit_rate'])}  mrr={_fmt(agg['mrr'])}")

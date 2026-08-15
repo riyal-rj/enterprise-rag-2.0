@@ -1,4 +1,4 @@
-.PHONY: help install sync seed seed-data api streamlit eval eval-baseline eval-hybrid eval-rerank eval-hyde eval-crag eval-all eval-diff test lint format
+.PHONY: help install sync seed seed-data api streamlit eval eval-baseline eval-sparse eval-hybrid eval-rerank eval-hyde eval-crag eval-all eval-diff test lint format
 
 
 help:
@@ -42,6 +42,9 @@ streamlit:
 
 eval-baseline:
 	uv run python -m app.eval.run_ragas --profile naive
+
+eval-sparse:
+	uv run python -m app.eval.run_ragas --profile sparse_only
 
 eval-hybrid:
 	uv run python -m app.eval.run_ragas --profile hybrid

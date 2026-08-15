@@ -60,3 +60,50 @@ class PermissionDeniedError(AppError):
 
     def __init__(self) -> None:
         super().__init__("You do not have permission to perform this action")
+
+
+class UnsupportedFileTypeError(AppError):
+    """Raised when an uploaded policy document isn't a type the ingestion pipeline handles."""
+
+    def __init__(self, filename: str, supported_suffixes: set[str]) -> None:
+        suffixes = ", ".join(sorted(supported_suffixes))
+        super().__init__(f"'{filename}' is not a supported file type (expected one of: {suffixes})")
+        self.filename = filename
+
+
+class FileTooLargeError(AppError):
+    """Raised when an uploaded policy document exceeds the configured size limit."""
+
+    def __init__(self, filename: str, max_size_mb: int) -> None:
+        super().__init__(f"'{filename}' exceeds the maximum upload size of {max_size_mb}MB")
+        self.filename = filename
+
+
+class ConversationNotFoundError(AppError):
+    """Raised when a conversation doesn't exist or isn't owned by the caller.
+
+    Deliberately doesn't distinguish the two cases in the message - the 404
+    shouldn't leak whether a given id belongs to someone else.
+    """
+
+    def __init__(self, conversation_id: int) -> None:
+        super().__init__(f"Conversation {conversation_id} not found")
+        self.conversation_id = conversation_id
+
+
+class HybridRetrievalDisabledError(AppError):
+    """Raised when a request asks for a retrieval mode the rollout flag
+    (``RAGFeatureSettings.hybrid_search_enabled``) currently disallows.
+
+    An explicit error, not a silent fallback to dense: the flag is meant
+    to be a real kill switch during the Qdrant-native hybrid rollout, and
+    silently downgrading a caller's explicit request would make that gate
+    unverifiable from the outside.
+    """
+
+    def __init__(self, requested_mode: str) -> None:
+        super().__init__(
+            f"retrieval_mode={requested_mode!r} is currently disabled by "
+            "the server (hybrid retrieval rollout gate)"
+        )
+        self.requested_mode = requested_mode

@@ -62,3 +62,6 @@ Thumbs.db
 uv.lock
 
 EnterpriseRAG_live
+
+policy
+frontend

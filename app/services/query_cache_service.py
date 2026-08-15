@@ -60,6 +60,26 @@ class UpstashCacheBackend:
         return len(keys)
 
 
+class NoOpCacheBackend:
+    """:class:`CacheBackend` that never stores anything - every ``get()``
+    is a miss, ``set()``/``delete_prefix()`` are no-ops.
+
+    Gives a caller that must always execute the real pipeline (the eval
+    harness - see ``app.eval.invokers.ServiceInvoker``) a normal
+    ``QueryCacheService`` to depend on, without risking a stale answer
+    computed under a different config (e.g. a changed ``rrf_k``) being
+    served back instead of actually re-running retrieval/generation."""
+
+    def get(self, key: str) -> str | None:
+        return None
+
+    def set(self, key: str, value: str, ttl_seconds: int) -> None:
+        pass
+
+    def delete_prefix(self, prefix: str) -> int:
+        return 0
+
+
 class TierStatsDict(TypedDict):
     hits: int
     misses: int

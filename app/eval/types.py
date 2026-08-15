@@ -25,6 +25,15 @@ class SourceOverlapResult(TypedDict):
     matched: list[str]
 
 
+class RetrievalMetrics(TypedDict):
+    """Deterministic, rank-aware retrieval quality - computed from
+    ``EvalRow.ranked_sources`` (retrieval order), not ``actual_sources``
+    (which is alphabetically sorted - see ``ChatResponse.sources``)."""
+
+    hit_rate: bool
+    mrr: float
+
+
 class RagasMetrics(TypedDict, total=False):
     """Per-row RAGAS scores. Every key is optional — a metric is absent
     when RAGAS couldn't or didn't score it for that row."""
@@ -51,11 +60,13 @@ class EvalRow(TypedDict):
     contexts: list[str]
     ground_truth: str
     actual_sources: list[str]
+    ranked_sources: list[str]
     golden_sources: list[str]
     forbidden_keywords: list[str]
     ragas_metrics: NotRequired[RagasMetrics]
     forbidden_check: NotRequired[ForbiddenCheckResult]
     source_overlap: NotRequired[SourceOverlapResult]
+    retrieval_metrics: NotRequired[RetrievalMetrics]
 
 
 class SkippedEntry(TypedDict):
@@ -69,6 +80,8 @@ class AggregateResult(TypedDict):
     context_recall: float | None
     answer_relevancy: float | None
     forbidden_violations: int
+    hit_rate: float | None
+    mrr: float | None
 
 
 class EvalPayload(TypedDict):
@@ -79,4 +92,5 @@ class EvalPayload(TypedDict):
     mode: str
     rows: list[EvalRow]
     skipped: list[SkippedEntry]
+    errors: list[SkippedEntry]
     aggregate: AggregateResult

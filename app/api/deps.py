@@ -9,6 +9,7 @@ limiting) never touches service/controller code.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from docling.chunking import HybridChunker
 from fastapi import Depends
@@ -18,6 +19,7 @@ from upstash_redis import Redis
 
 from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
+from app.controllers.chat_controller import ChatController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
 from app.core.ingestion.document_processor import (
@@ -27,11 +29,26 @@ from app.core.ingestion.document_processor import (
 )
 from app.core.llm.chat_client import LLMClient, OpenAILLMClient, build_openai_client
 from app.core.llm.embedding_client import EmbeddingClient, OpenAIEmbeddingClient
+from app.core.llm.sparse_embedding_client import FastEmbedSparseClient, SparseEmbeddingClient
 from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
-from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
+from app.rag_services.rag_service import RAGService
+from app.rag_services.retrieval_strategy import (
+    DenseRetrievalStrategy,
+    HybridRetrievalStrategy,
+    RetrievalStrategy,
+    SparseRetrievalStrategy,
+)
+from app.repositories.chat_history_repository import (
+    ChatHistoryRepository,
+    PostgresChatHistoryRepository,
+)
+from app.repositories.conversation_repository import (
+    ConversationRepository,
+    PostgresConversationRepository,
+)
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -48,7 +65,11 @@ from app.services.health_checks import (
     RedisHealthCheck,
     TavilyHealthCheck,
 )
+from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_POLICY_DIR = _REPO_ROOT / "policy"
 
 
 @lru_cache(maxsize=1)
@@ -110,8 +131,65 @@ def get_vector_repository() -> VectorRepository:
 
 
 @lru_cache(maxsize=1)
-def get_hybrid_retrieval_service() -> HybridRetrievalService:
-    return HybridRetrievalService(vector_repository=get_vector_repository())
+def get_sparse_embedding_client() -> SparseEmbeddingClient:
+    """Process-wide FastEmbed BM25 client (loads a local model - expensive
+    to reconstruct per call, so cached like the other clients here)."""
+    return FastEmbedSparseClient()
+
+
+@lru_cache(maxsize=1)
+def get_retrieval_strategies() -> dict[str, RetrievalStrategy]:
+    """Every retrieval strategy the API can serve, keyed by ``RetrievalMode``.
+
+    All three are always built - the ``hybrid_search_enabled`` flag doesn't
+    decide which strategies exist, only which ones ``get_rag_service``'s
+    ``allowed_retrieval_modes`` currently permits a real HTTP request to
+    resolve to (see ``RAGService.answer``) - the eval harness needs every
+    strategy constructible regardless of that flag.
+    """
+    settings = get_settings().rag
+    vector_repository = get_vector_repository()
+    sparse_embedding_client = get_sparse_embedding_client()
+
+    dense: RetrievalStrategy = DenseRetrievalStrategy(vector_repository=vector_repository)
+    sparse: RetrievalStrategy = SparseRetrievalStrategy(
+        vector_repository=vector_repository, sparse_embedding_client=sparse_embedding_client
+    )
+    hybrid: RetrievalStrategy = HybridRetrievalStrategy(
+        vector_repository=vector_repository,
+        sparse_embedding_client=sparse_embedding_client,
+        rrf_k=settings.rrf_k,
+        candidate_top_k=settings.hybrid_candidate_top_k,
+    )
+    return {dense.name: dense, sparse.name: sparse, hybrid.name: hybrid}
+
+
+def get_default_retrieval_mode() -> str:
+    return "hybrid" if get_settings().rag.hybrid_search_enabled else "dense"
+
+
+def get_allowed_retrieval_modes() -> frozenset[str]:
+    """Modes a real HTTP ``/chat`` request is currently allowed to resolve
+    to - the rollout gate. ``dense`` is always allowed (the safe fallback);
+    ``sparse``/``hybrid`` require ``hybrid_search_enabled``. The eval
+    harness bypasses this entirely (see ``app.eval.invokers``), since it
+    must be able to run every mode for real ahead of flipping this flag.
+    """
+    if get_settings().rag.hybrid_search_enabled:
+        return frozenset(get_retrieval_strategies())
+    return frozenset({"dense"})
+
+
+@lru_cache(maxsize=1)
+def get_rag_service() -> RAGService:
+    return RAGService(
+        embedding_client=get_embedding_client(),
+        retrieval_strategies=get_retrieval_strategies(),
+        llm_client=get_llm_client(),
+        cache=get_query_cache_service(),
+        default_retrieval_mode=get_default_retrieval_mode(),
+        allowed_retrieval_modes=get_allowed_retrieval_modes(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -121,6 +199,18 @@ def get_document_processor() -> DocumentProcessor:
         settings.accelerator_device, settings.accelerator_num_threads
     )
     return DoclingDocumentProcessor(converter=converter, chunker=HybridChunker())
+
+
+@lru_cache(maxsize=1)
+def get_policy_ingestion_service() -> PolicyIngestionService:
+    return PolicyIngestionService(
+        document_processor=get_document_processor(),
+        embedding_client=get_embedding_client(),
+        sparse_embedding_client=get_sparse_embedding_client(),
+        vector_repository=get_vector_repository(),
+        policy_dir=_POLICY_DIR,
+        max_upload_size_mb=get_settings().ingestion.max_upload_size_mb,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -178,6 +268,26 @@ def get_auth_controller(
     return AuthController(auth_service)
 
 
+def get_chat_history_repository(
+    pool: PostgresConnectionPool = Depends(get_db_pool),
+) -> ChatHistoryRepository:
+    return PostgresChatHistoryRepository(pool)
+
+
+def get_conversation_repository(
+    pool: PostgresConnectionPool = Depends(get_db_pool),
+) -> ConversationRepository:
+    return PostgresConversationRepository(pool)
+
+
+def get_chat_controller(
+    rag_service: RAGService = Depends(get_rag_service),
+    chat_history_repository: ChatHistoryRepository = Depends(get_chat_history_repository),
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+) -> ChatController:
+    return ChatController(rag_service, chat_history_repository, conversation_repository)
+
+
 def get_health_checks(
     settings: Settings = Depends(get_settings),
     pool: PostgresConnectionPool = Depends(get_db_pool),
@@ -208,5 +318,6 @@ def get_query_cache_service() -> QueryCacheService:
 def get_admin_controller(
     health_check_service: HealthCheckService = Depends(get_health_check_service),
     query_cache: QueryCacheService = Depends(get_query_cache_service),
+    policy_ingestion_service: PolicyIngestionService = Depends(get_policy_ingestion_service),
 ) -> AdminController:
-    return AdminController(health_check_service, query_cache)
+    return AdminController(health_check_service, query_cache, policy_ingestion_service)

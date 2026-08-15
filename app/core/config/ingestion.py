@@ -23,3 +23,5 @@ class IngestionSettings(EnvBaseSettings):
 
     accelerator_device: AcceleratorDeviceName = Field(default="auto")
     accelerator_num_threads: int = Field(default=8, gt=0)
+
+    max_upload_size_mb: int = Field(default=25, gt=0)

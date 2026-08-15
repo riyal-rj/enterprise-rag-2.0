@@ -1,10 +1,12 @@
-"""Admin controller: health checks and query-cache administration."""
+"""Admin controller: health checks, query-cache administration, and policy ingestion."""
 
 from __future__ import annotations
 
 from app.schemas.cache import CacheClearResponse, CacheStatsResponse, CacheTierStats
 from app.schemas.health import HealthCheckResponse
+from app.schemas.policy import PolicyListResponse, PolicyUploadResponse
 from app.services.health_checks import HealthCheckService
+from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import CacheTier, QueryCacheService
 
 _TIER_TO_RESPONSE_FIELD: dict[CacheTier, str] = {
@@ -19,11 +21,13 @@ _TIER_TO_RESPONSE_FIELD: dict[CacheTier, str] = {
 class AdminController:
     """Orchestrates health checks and cache admin calls for ``/admin`` routes."""
 
-    def __init__(self, 
-                 health_check_service: HealthCheckService, 
-                 query_cache: QueryCacheService) -> None:
+    def __init__(self,
+                 health_check_service: HealthCheckService,
+                 query_cache: QueryCacheService,
+                 policy_ingestion_service: PolicyIngestionService) -> None:
         self._health_check_service = health_check_service
         self._query_cache = query_cache
+        self._policy_ingestion_service = policy_ingestion_service
 
     async def health(self) -> HealthCheckResponse:
         results = await self._health_check_service.run()
@@ -41,3 +45,9 @@ class AdminController:
     def cache_clear(self) -> CacheClearResponse:
         cleared = self._query_cache.clear()
         return CacheClearResponse(status="ok", cleared=cleared)
+
+    def list_policies(self) -> PolicyListResponse:
+        return self._policy_ingestion_service.list_policies()
+
+    def upload_policy(self, filename: str, content: bytes) -> PolicyUploadResponse:
+        return self._policy_ingestion_service.ingest(filename, content)

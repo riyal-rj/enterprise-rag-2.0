@@ -12,3 +12,4 @@ class RetrievedChunk:
     text: str
     source: str
     score: float
+    page_number: int | None = None
