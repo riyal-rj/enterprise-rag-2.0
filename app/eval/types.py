@@ -92,4 +92,5 @@ class EvalPayload(TypedDict):
     mode: str
     rows: list[EvalRow]
     skipped: list[SkippedEntry]
+    errors: list[SkippedEntry]
     aggregate: AggregateResult

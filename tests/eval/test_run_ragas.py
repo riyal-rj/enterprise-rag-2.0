@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import sys
 
 import pytest
 
@@ -76,7 +78,11 @@ def test_build_row_shapes_the_row_correctly() -> None:
     assert "ragas_metrics" not in row  # not scored yet
 
 
-def test_invoke_all_buckets_skipped_vs_errored_vs_rows() -> None:
+def test_invoke_all_buckets_rows_vs_skipped_vs_errored_separately() -> None:
+    """Skipped (intentional, SkippedIntent) and errored (anything else)
+    must land in different buckets - conflating them would make a broken
+    profile that errors on every case indistinguishable from one that
+    legitimately has nothing applicable to run."""
     cases = [_case("q-991"), _case("q-992"), _case("q-993")]
     invoker = _FakeInvoker(
         {
@@ -86,12 +92,12 @@ def test_invoke_all_buckets_skipped_vs_errored_vs_rows() -> None:
         }
     )
 
-    rows, skipped = run_ragas._invoke_all(invoker, cases, PROFILES["naive"])
+    rows, skipped, errors = run_ragas._invoke_all(invoker, cases, PROFILES["naive"])
 
     assert [row["id"] for row in rows] == ["q-991"]
-    assert {entry["id"] for entry in skipped} == {"q-992", "q-993"}
-    q993 = next(entry for entry in skipped if entry["id"] == "q-993")
-    assert "error: boom" in q993["reason"]
+    assert [entry["id"] for entry in skipped] == ["q-992"]
+    assert [entry["id"] for entry in errors] == ["q-993"]
+    assert "boom" in errors[0]["reason"]
 
 
 def test_score_rows_survives_ragas_failure_without_losing_rows(
@@ -120,6 +126,49 @@ def test_resolve_output_path_uses_explicit_output_when_given() -> None:
     )
 
     assert str(path) == "custom.json"
+
+
+def test_main_exits_nonzero_when_any_case_errors(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """A genuine invocation failure must fail the run (non-zero exit),
+    not disappear into the same bucket as an intentional skip - CI must
+    be able to tell a broken profile apart from a clean-but-empty one."""
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(sys, "argv", ["run_ragas", "--profile", "naive", "--output", str(out_path)])
+    monkeypatch.setattr(run_ragas, "_load_cases", lambda *args, **kwargs: [_case("q-991")])
+    monkeypatch.setattr(
+        run_ragas,
+        "_select_invoker",
+        lambda mode: _FakeInvoker({"question for q-991": ValueError("boom")}),
+    )
+    monkeypatch.setattr(run_ragas, "score_with_ragas", lambda rows: [])
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_ragas.main()
+
+    assert exc_info.value.code == 1
+    payload = json.loads(out_path.read_text())
+    assert payload["errors"] == [{"id": "q-991", "reason": "boom"}]
+    assert payload["rows"] == []
+
+
+def test_main_exits_zero_when_only_intentional_skips_occur(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(sys, "argv", ["run_ragas", "--profile", "naive", "--output", str(out_path)])
+    monkeypatch.setattr(run_ragas, "_load_cases", lambda *args, **kwargs: [_case("q-991")])
+    monkeypatch.setattr(
+        run_ragas,
+        "_select_invoker",
+        lambda mode: _FakeInvoker({"question for q-991": SkippedIntent("not applicable")}),
+    )
+    monkeypatch.setattr(run_ragas, "score_with_ragas", lambda rows: [])
+
+    run_ragas.main()  # must not raise SystemExit
+
+    payload = json.loads(out_path.read_text())
+    assert payload["errors"] == []
+    assert payload["skipped"] == [{"id": "q-991", "reason": "not applicable"}]
 
 
 def test_resolve_output_path_defaults_to_timestamped_results_path() -> None:

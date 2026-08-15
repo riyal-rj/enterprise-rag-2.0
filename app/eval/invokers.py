@@ -12,13 +12,17 @@ so implementations don't need to inherit from anything, just match the
 shape. Switching this one to an ABC would be the odd one out.
 
 ``ServiceInvoker`` only attempts intents the pipeline can run headlessly.
-SQL and hybrid cases are excluded: Text2SQL requires a human-in-the-loop
+SQL cases are excluded: Text2SQL requires a human-in-the-loop
 ``interrupt()`` approval step before execution (see the ``sql``-tagged
 golden cases' notes in ``data/goldens.yaml``), which a batch eval run has
-no one to answer. ``web_fallback`` additionally requires Tavily to be
-configured. Both are checked *before* calling the pipeline, so an
-unsupported/misconfigured case is cleanly skipped with a clear reason
-rather than erroring partway through a real call.
+no one to answer. ``web_fallback`` is excluded too - a Tavily search
+adapter exists (``app.services.web_search.search_web``), but nothing
+wires its results into an answer-generation pipeline yet, so there's
+nothing web-fallback-specific to actually invoke; running it would just
+silently re-run ``RAGService.answer()`` against the policy corpus.
+Unsupported intents are checked *before* calling the pipeline, so a case
+is cleanly skipped with a clear reason rather than erroring partway
+through a real call.
 
 ``_call_pipeline`` calls the real :class:`~app.rag_services.rag_service.RAGService`,
 via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override -
@@ -87,9 +91,16 @@ class ServiceInvoker:
     rollout gate that a real HTTP ``/chat`` request is subject to (via
     ``app.api.deps.get_rag_service``) - eval must be able to run every mode
     for real ahead of that flag ever being flipped on.
+
+    The wrapped ``RAGService`` is given a :class:`~app.services.query_cache_service.NoOpCacheBackend`,
+    not the shared production cache - a case must actually execute the
+    current retriever/config every run, not silently return a cached
+    answer computed under a previous ``rrf_k``/candidate-count/corpus
+    version (the cache key doesn't cover every tunable, so a stale hit
+    would go unnoticed).
     """
 
-    SUPPORTED_INTENTS = frozenset({Intent.RAG, Intent.WEB_FALLBACK})
+    SUPPORTED_INTENTS = frozenset({Intent.RAG})
 
     def __init__(self, rag_service: RAGService | None = None) -> None:
         self._rag_service_override = rag_service
@@ -105,15 +116,15 @@ class ServiceInvoker:
             get_default_retrieval_mode,
             get_embedding_client,
             get_llm_client,
-            get_query_cache_service,
             get_retrieval_strategies,
         )
+        from app.services.query_cache_service import NoOpCacheBackend, QueryCacheService
 
         return RAGService(
             embedding_client=get_embedding_client(),
             retrieval_strategies=get_retrieval_strategies(),
             llm_client=get_llm_client(),
-            cache=get_query_cache_service(),
+            cache=QueryCacheService(NoOpCacheBackend(), get_settings().cache),
             default_retrieval_mode=get_default_retrieval_mode(),
             allowed_retrieval_modes=None,
         )
@@ -124,16 +135,11 @@ class ServiceInvoker:
         if intent not in self.SUPPORTED_INTENTS:
             raise SkippedIntent(
                 f"intent={intent.value} not supported in service mode "
-                "(sql/hybrid need human-in-the-loop approval, not runnable headlessly)"
+                "(sql/hybrid need human-in-the-loop approval, not runnable headlessly; "
+                "web_fallback has no implemented answer-generation pipeline yet)"
             )
 
-        if intent == Intent.WEB_FALLBACK and not self._tavily_configured():
-            raise SkippedIntent("tavily_unset: TAVILY_API_KEY not configured")
-
         return self._call_pipeline(question, flags)
-
-    def _tavily_configured(self) -> bool:
-        return bool(get_settings().external_apis.tavily_api_key.get_secret_value())
 
     def _call_pipeline(
         self, question: str, flags: PipelineProfile

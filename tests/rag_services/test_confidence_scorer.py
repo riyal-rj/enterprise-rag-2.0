@@ -115,6 +115,66 @@ def test_short_refusal_scores_lower_than_a_long_answer_with_a_refusal_style_cave
     assert short_score < long_score
 
 
+def test_hybrid_mode_treats_all_returned_chunks_as_supporting_evidence() -> None:
+    """A hybrid RRF-normalized score isn't on the cosine scale
+    _RELEVANCE_FLOOR was calibrated for (see the confidence_scorer module
+    docstring) - evidence_coverage must not gate non-dense scores against
+    it the same way it gates dense cosine similarity."""
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.1)]
+
+    hybrid = compute_confidence_breakdown(
+        chunks, "Refunds within 30 days [a.pdf].", retrieval_mode="hybrid"
+    )
+    dense = compute_confidence_breakdown(
+        chunks, "Refunds within 30 days [a.pdf].", retrieval_mode="dense"
+    )
+
+    assert hybrid.evidence_coverage > 0.0
+    assert dense.evidence_coverage == 0.0  # below _RELEVANCE_FLOOR
+
+
+def test_hybrid_mode_retrieval_strength_is_neutral_regardless_of_score() -> None:
+    """No calibrated absolute-relevance signal exists yet for a
+    rank-derived hybrid score - retrieval_strength must stay a fixed
+    neutral value rather than reading a false confidence signal into it."""
+    low = compute_confidence_breakdown(
+        [RetrievedChunk(text="x", source="a.pdf", score=0.05)],
+        "x [a.pdf]",
+        retrieval_mode="hybrid",
+    )
+    high = compute_confidence_breakdown(
+        [RetrievedChunk(text="x", source="a.pdf", score=0.95)],
+        "x [a.pdf]",
+        retrieval_mode="hybrid",
+    )
+
+    assert low.retrieval_strength == pytest.approx(0.5)
+    assert high.retrieval_strength == pytest.approx(0.5)
+
+
+def test_dense_mode_retrieval_strength_still_varies_with_score() -> None:
+    """The dense-mode calibration must be unaffected by the hybrid/sparse
+    neutral fallback - this is the default and the only mode with a
+    genuinely calibrated score."""
+    low = compute_confidence_breakdown(
+        [RetrievedChunk(text="x", source="a.pdf", score=0.1)], "x [a.pdf]", retrieval_mode="dense"
+    )
+    high = compute_confidence_breakdown(
+        [RetrievedChunk(text="x", source="a.pdf", score=0.9)], "x [a.pdf]", retrieval_mode="dense"
+    )
+
+    assert low.retrieval_strength < high.retrieval_strength
+
+
+def test_retrieval_mode_defaults_to_dense() -> None:
+    chunks = [RetrievedChunk(text="x", source="a.pdf", score=0.1)]
+
+    explicit_dense = compute_confidence_breakdown(chunks, "x [a.pdf]", retrieval_mode="dense")
+    default = compute_confidence_breakdown(chunks, "x [a.pdf]")
+
+    assert default == explicit_dense
+
+
 def test_breakdown_total_matches_weighted_sum_of_its_components() -> None:
     chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
     answer = "Refunds within 30 days [a.pdf]."

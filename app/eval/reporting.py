@@ -66,6 +66,7 @@ def print_table(payload: EvalPayload) -> None:
     """Print a markdown table of per-question results plus an aggregate row."""
     print(f"\n## Eval - profile={payload['profile']} mode={payload['mode']}")
     print(f"Skipped: {len(payload['skipped'])}")
+    print(f"Errors: {len(payload.get('errors', []))}")
     print()
     print("| id | feature | faith | ctx_prec | ctx_recall | ans_rel | forbidden |")
     print("|----|---------|-------|----------|------------|---------|-----------|")

@@ -175,7 +175,9 @@ class RAGService:
         user_message = f"{self._build_context(chunks)}\n\nQuestion: {question}"
         llm_response = self._llm_client.generate(_SYSTEM_PROMPT, user_message)
 
-        confidence = compute_confidence_breakdown(chunks, llm_response.text)
+        confidence = compute_confidence_breakdown(
+            chunks, llm_response.text, retrieval_mode=strategy.name
+        )
         logger.debug(
             "rag.confidence_computed",
             extra={

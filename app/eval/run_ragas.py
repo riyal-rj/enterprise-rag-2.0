@@ -97,11 +97,23 @@ def _build_row(case: GoldenCase, response: InvokeResponse, chunks: list[Retrieve
 
 def _invoke_all(
     invoker: Invoker, cases: list[GoldenCase], flags: PipelineProfile
-) -> tuple[list[EvalRow], list[SkippedEntry]]:
-    """Call ``invoker`` for every case, bucketing failures into ``skipped``
-    instead of letting one bad case abort the whole run."""
+) -> tuple[list[EvalRow], list[SkippedEntry], list[SkippedEntry]]:
+    """Call ``invoker`` for every case, sorting outcomes into three
+    disjoint buckets - not two.
+
+    ``skipped`` is for :class:`SkippedIntent`: a case this profile
+    *intentionally* doesn't run (sql/hybrid need human approval,
+    web_fallback has no pipeline, a profile requests an unimplemented
+    feature). ``errors`` is for anything else - a genuine invocation
+    failure. The two must stay apart: if they're merged, a regression
+    that breaks every case in a profile is indistinguishable from a
+    profile that legitimately has nothing applicable to run, and
+    ``aggregate()`` (which only sees ``rows``) would silently report an
+    empty-but-passing run instead of a failing one. See ``main()``, which
+    fails the run (non-zero exit) when ``errors`` is non-empty."""
     rows: list[EvalRow] = []
     skipped: list[SkippedEntry] = []
+    errors: list[SkippedEntry] = []
 
     for case in cases:
         try:
@@ -112,12 +124,12 @@ def _invoke_all(
             continue
         except Exception as exc:  # noqa: BLE001 - one bad case shouldn't kill the run
             logger.warning("eval.case_errored", extra={"case_id": case.id, "error": str(exc)})
-            skipped.append({"id": case.id, "reason": f"error: {exc}"})
+            errors.append({"id": case.id, "reason": str(exc)})
             continue
 
         rows.append(_build_row(case, response, chunks))
 
-    return rows, skipped
+    return rows, skipped, errors
 
 
 def _score_rows(rows: list[EvalRow]) -> None:
@@ -156,6 +168,7 @@ def _build_payload(
     timestamp: datetime.datetime,
     rows: list[EvalRow],
     skipped: list[SkippedEntry],
+    errors: list[SkippedEntry],
 ) -> EvalPayload:
     return {
         "profile": args.profile,
@@ -165,6 +178,7 @@ def _build_payload(
         "mode": args.mode,
         "rows": rows,
         "skipped": skipped,
+        "errors": errors,
         "aggregate": aggregate(rows),
     }
 
@@ -180,22 +194,36 @@ def main() -> None:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
-    rows, skipped = _invoke_all(invoker, cases, flags)
+    rows, skipped, errors = _invoke_all(invoker, cases, flags)
     _score_rows(rows)
 
     timestamp = datetime.datetime.now(datetime.UTC)
     out_path = _resolve_output_path(args.output, args.profile, timestamp)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = _build_payload(args, flags, timestamp, rows, skipped)
+    payload = _build_payload(args, flags, timestamp, rows, skipped, errors)
     out_path.write_text(json.dumps(payload, indent=2, default=str))
 
     logger.info(
         "eval.run_complete",
-        extra={"profile": args.profile, "rows": len(rows), "skipped": len(skipped)},
+        extra={
+            "profile": args.profile,
+            "rows": len(rows),
+            "skipped": len(skipped),
+            "errors": len(errors),
+        },
     )
     print_table(payload)
     print(f"\nWrote: {out_path}")
+
+    if errors:
+        # Non-zero exit so CI actually fails on a broken profile, instead
+        # of a run that errored on every case looking like "0 applicable
+        # cases, all clean" (see _invoke_all's docstring).
+        print(f"\n{len(errors)} case(s) errored (not skipped):", file=sys.stderr)
+        for entry in errors:
+            print(f"  {entry['id']}: {entry['reason']}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

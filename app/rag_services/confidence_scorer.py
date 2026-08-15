@@ -24,6 +24,20 @@ Both swaps are additive: keep the same weighting scheme, replace one
 component's inputs. Calibration (Brier score / ECE against a golden
 set) is deliberately not attempted here - that requires RAG-111's
 labeled evaluation set and is tracked separately.
+
+``retrieval_strength``/``evidence_coverage`` further assume ``chunk.score``
+is a dense cosine similarity, calibrated so ``_RELEVANCE_FLOOR`` means
+something. That assumption breaks for hybrid: RRF fusion produces a
+rank-derived score (see
+``app.rag_services.retrieval_strategy.HybridRetrievalStrategy``'s
+``max_rrf_score`` normalization) - a chunk ranked first by only one of
+the two branches lands at ~0.5 regardless of its actual relevance, so
+comparing it against a cosine-calibrated floor as if the two were on the
+same scale would misjudge it. Callers pass ``retrieval_mode`` so these
+two components can fall back to a neutral, non-cosine-scale treatment
+for hybrid/sparse instead of silently misapplying the dense calibration
+(see ``_evidence_coverage``/``_retrieval_strength``). This is a stopgap,
+not a real hybrid calibration - that also needs RAG-111's labeled set.
 """
 
 from __future__ import annotations
@@ -104,20 +118,28 @@ class ConfidenceBreakdown:
     total: float
 
 
-def compute_confidence(chunks: list[RetrievedChunk], answer: str) -> float:
+def compute_confidence(chunks: list[RetrievedChunk], answer: str, *, retrieval_mode: str = "dense") -> float:
     """Composite, explainable confidence in ``[0.0, 1.0]``."""
-    return compute_confidence_breakdown(chunks, answer).total
+    return compute_confidence_breakdown(chunks, answer, retrieval_mode=retrieval_mode).total
 
 
-def compute_confidence_breakdown(chunks: list[RetrievedChunk], answer: str) -> ConfidenceBreakdown:
+def compute_confidence_breakdown(
+    chunks: list[RetrievedChunk], answer: str, *, retrieval_mode: str = "dense"
+) -> ConfidenceBreakdown:
     """Same score as :func:`compute_confidence`, with each component exposed.
 
     Each component is independently a ``[0.0, 1.0]`` score; the weighted
     sum is a probability-flavored estimate, not a calibrated probability.
+
+    ``retrieval_mode`` should be the retrieval strategy's ``name`` (e.g.
+    ``"dense"``, ``"hybrid"``, ``"sparse"``) - only ``"dense"`` scores are
+    on a cosine-similarity scale ``_RELEVANCE_FLOOR`` was calibrated for
+    (see the module docstring). Any other mode uses a neutral treatment
+    for the two components that assume that scale.
     """
-    coverage = _evidence_coverage(chunks)
+    coverage = _evidence_coverage(chunks, retrieval_mode)
     faithfulness = _faithfulness(chunks, answer)
-    retrieval_strength = _retrieval_strength(chunks)
+    retrieval_strength = _retrieval_strength(chunks, retrieval_mode)
     citation_precision = _citation_precision(chunks, answer)
     answerability = _answerability(chunks, answer)
 
@@ -138,9 +160,16 @@ def compute_confidence_breakdown(chunks: list[RetrievedChunk], answer: str) -> C
     )
 
 
-def _evidence_coverage(chunks: list[RetrievedChunk]) -> float:
+def _evidence_coverage(chunks: list[RetrievedChunk], retrieval_mode: str) -> float:
     """How much independent, above-floor evidence backs the answer."""
-    supporting = [c for c in chunks if c.score >= _RELEVANCE_FLOOR]
+    if retrieval_mode == "dense":
+        supporting = [c for c in chunks if c.score >= _RELEVANCE_FLOOR]
+    else:
+        # Non-dense scores aren't on the cosine scale _RELEVANCE_FLOOR was
+        # calibrated for (see module docstring) - treat every returned
+        # chunk as supporting evidence instead of gating on a magnitude
+        # comparison that isn't meaningful for a rank-derived score.
+        supporting = list(chunks)
     if not supporting:
         return 0.0
     count_score = min(len(supporting) / _COVERAGE_SATURATION_COUNT, 1.0)
@@ -151,10 +180,17 @@ def _evidence_coverage(chunks: list[RetrievedChunk]) -> float:
     return (count_score + diversity_score) / 2
 
 
-def _retrieval_strength(chunks: list[RetrievedChunk]) -> float:
+def _retrieval_strength(chunks: list[RetrievedChunk], retrieval_mode: str) -> float:
     """How strong and how clearly-dominant the top match is."""
     if not chunks:
         return 0.0
+    if retrieval_mode != "dense":
+        # No calibrated absolute-relevance signal exists yet for a
+        # rank-derived (hybrid) or lexical (sparse) score - stay neutral
+        # rather than feeding an uncalibrated score through cosine-scale
+        # math (see module docstring; real calibration needs RAG-111's
+        # labeled evaluation set).
+        return 0.5
     top_score = max(0.0, min(1.0, chunks[0].score))
     rest = chunks[1:]
     if not rest:

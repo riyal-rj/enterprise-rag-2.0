@@ -12,6 +12,7 @@ from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
+from app.rag_services.confidence_scorer import compute_confidence_breakdown
 from app.rag_services.rag_service import RAGService
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
@@ -220,6 +221,38 @@ def test_sparse_mode_never_calls_the_dense_embedding_client() -> None:
 
     assert embedding_client.calls == []
     assert response.sources == ["a.pdf"]
+
+
+def test_hybrid_mode_confidence_uses_hybrid_calibration_not_dense() -> None:
+    """RAGService.answer() must pass the selected strategy's name through
+    to confidence scoring as retrieval_mode, not leave it defaulted to
+    dense - otherwise a hybrid RRF-normalized score would be misjudged
+    against the cosine-calibrated dense floor (see confidence_scorer's
+    _evidence_coverage)."""
+    low_rrf_chunks = [RetrievedChunk(text="hit", source="a.pdf", score=0.1)]
+    repo = _FakeVectorRepository(low_rrf_chunks)
+    hybrid_strategy = HybridRetrievalStrategy(
+        vector_repository=cast(VectorRepository, repo),
+        sparse_embedding_client=cast(SparseEmbeddingClient, _FakeSparseEmbeddingClient()),
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={hybrid_strategy.name: hybrid_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode="hybrid",
+    )
+
+    response = service.answer("q")
+
+    expected_hybrid = compute_confidence_breakdown(
+        low_rrf_chunks, response.answer, retrieval_mode="hybrid"
+    ).total
+    expected_dense = compute_confidence_breakdown(
+        low_rrf_chunks, response.answer, retrieval_mode="dense"
+    ).total
+    assert response.confidence == pytest.approx(expected_hybrid)
+    assert response.confidence > expected_dense
 
 
 def test_answer_builds_context_with_source_citations() -> None:

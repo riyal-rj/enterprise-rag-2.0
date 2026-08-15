@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -27,7 +28,68 @@ def _row_ok(row: EvalRow) -> bool:
     return bool(forbidden_check.get("passed")) and bool(source_overlap.get("passed"))
 
 
-def diff_reports(before: EvalPayload, after: EvalPayload) -> None:
+def _attempted_case_ids(payload: EvalPayload) -> set[str]:
+    """Every case id the run attempted, whether it produced a scored row
+    or an intentional skip. Deliberately excludes ``errors`` (see
+    ``run_ragas._invoke_all``) - a genuine invocation failure isn't a
+    case this profile chose not to run."""
+    row_ids = {row["id"] for row in payload.get("rows", [])}
+    skipped_ids = {entry["id"] for entry in payload.get("skipped", [])}
+    return row_ids | skipped_ids
+
+
+def check_case_parity(before: EvalPayload, after: EvalPayload) -> bool:
+    """Warn (or, for the same-cases-but-different-outcome case, flag as a
+    real problem) when ``before``/``after`` don't cover the same cases -
+    the improved/regressed comparison below silently drops any case id
+    absent from either side, so a mismatch here would otherwise pass
+    unnoticed.
+
+    Returns ``False`` when both reports attempted the exact same cases
+    but scored a different subset of them (``rows`` differ) - that
+    specifically means a case succeeded under one profile and
+    errored/was skipped under the other despite an identical case set,
+    which is a correctness signal worth failing the comparison over, not
+    just a heads-up. A difference in the *attempted* sets (e.g. one
+    report used ``--filter`` and the other didn't) is only a heads-up -
+    comparing a filtered run against an unfiltered one is a legitimate
+    workflow, not a bug.
+    """
+    before_attempted, after_attempted = _attempted_case_ids(before), _attempted_case_ids(after)
+    if before_attempted != after_attempted:
+        only_before = sorted(before_attempted - after_attempted)
+        only_after = sorted(after_attempted - before_attempted)
+        print(
+            "\nWARNING: the two reports attempted different case sets "
+            "(different --filter?) - the comparison below only covers the overlap."
+        )
+        if only_before:
+            print(f"  only attempted in before: {only_before}")
+        if only_after:
+            print(f"  only attempted in after: {only_after}")
+        return True
+
+    before_rows = {row["id"] for row in before.get("rows", [])}
+    after_rows = {row["id"] for row in after.get("rows", [])}
+    if before_rows != after_rows:
+        print(
+            "\nWARNING: both reports attempted the same cases, but scored a different "
+            "subset - some case(s) errored or were skipped on one side only, silently "
+            "dropped from the improved/regressed comparison below:"
+        )
+        print(f"  scored only in before: {sorted(before_rows - after_rows)}")
+        print(f"  scored only in after: {sorted(after_rows - before_rows)}")
+        return False
+
+    return True
+
+
+def diff_reports(before: EvalPayload, after: EvalPayload) -> bool:
+    """Print the comparison; returns whether the two reports had matching
+    case-id parity (see :func:`check_case_parity`) - ``main()`` uses this
+    to fail the run when they don't."""
+    parity_ok = check_case_parity(before, after)
+
     before_agg, after_agg = before["aggregate"], after["aggregate"]
     print(f"{before['profile']}: forbidden_violations={before_agg.get('forbidden_violations', 0)}")
     print(f"{after['profile']}: forbidden_violations={after_agg.get('forbidden_violations', 0)}")
@@ -64,6 +126,8 @@ def diff_reports(before: EvalPayload, after: EvalPayload) -> None:
     print(f"\nImproved ({len(improved)}): {', '.join(sorted(improved)) or 'none'}")
     print(f"Regressed ({len(regressed)}): {', '.join(sorted(regressed)) or 'none'}")
 
+    return parity_ok
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Diff two eval report JSON files.")
@@ -74,7 +138,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    diff_reports(_load_payload(args.before), _load_payload(args.after))
+    parity_ok = diff_reports(_load_payload(args.before), _load_payload(args.after))
+    if not parity_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
