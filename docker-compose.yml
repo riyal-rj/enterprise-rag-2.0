@@ -42,6 +42,7 @@ services:
       - PYTHONPATH=/app
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/adv_rag
       - QDRANT_URL=http://qdrant:6333
+      - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED}
       - UPSTASH_REDIS_URL=${UPSTASH_REDIS_URL}
       - UPSTASH_REDIS_TOKEN=${UPSTASH_REDIS_TOKEN}
       - OPENAI_API_KEY=${OPENAI_API_KEY}

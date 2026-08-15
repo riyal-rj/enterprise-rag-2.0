@@ -25,7 +25,7 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
-from app.repositories.vector_repository import VectorRepository
+from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.schemas.chat import ChatResponse, ResponseMetadata, RetrievedChunkPreview
 from app.services.query_cache_service import CacheTier, QueryCacheService
 
@@ -114,12 +114,12 @@ class RAGService:
     def __init__(
         self,
         embedding_client: EmbeddingClient,
-        vector_repository: VectorRepository,
+        retrieval_strategy: RetrievalStrategy,
         llm_client: LLMClient,
         cache: QueryCacheService,
     ) -> None:
         self._embedding_client = embedding_client
-        self._vector_repository = vector_repository
+        self._retrieval_strategy = retrieval_strategy
         self._llm_client = llm_client
         self._cache = cache
 
@@ -130,7 +130,11 @@ class RAGService:
             return cached.model_copy(update={"cache_hit": True})
 
         query_embedding = self._embedding_client.embed_texts([question])[0]
-        chunks = self._vector_repository.search(query_embedding, top_k=top_k)
+        chunks = self._retrieval_strategy.retrieve(
+            query_text=question,
+            query_embedding=query_embedding,
+            top_k=top_k,
+        )
 
         user_message = f"{self._build_context(chunks)}\n\nQuestion: {question}"
         llm_response = self._llm_client.generate(_SYSTEM_PROMPT, user_message)
@@ -161,6 +165,7 @@ class RAGService:
             confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
+                retrieval_mode=self._retrieval_strategy.name,
                 retrieved_chunks=[
                     RetrievedChunkPreview(
                         text=c.text, source=c.source, score=c.score, page_number=c.page_number
@@ -176,11 +181,30 @@ class RAGService:
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
         if not chunks:
             return "No relevant context was found."
-        return "\n\n".join(f"[{chunk.source}]\n{chunk.text}" for chunk in chunks)
+
+        sections: list[str] = []
+        for chunk in chunks:
+            source_label = chunk.source
+
+            if chunk.page_number is not None:
+                source_label = f"{source_label} page. {chunk.page_number}"
+
+            sections.append(
+                f"[{source_label}]\n{chunk.text}"
+            )
+        return "\n\n".join(sections)
 
     def _cache_key(self, question: str, top_k: int) -> str:
-        digest = hashlib.sha256(f"{top_k}:{question}".encode()).hexdigest()
-        return digest
+       normalized_question = " ".join(question.split())
+
+       raw_key = (
+           f"rag:v2:"
+           f"{self._retrieval_strategy.cache_namespace}:"
+           f"{top_k}:"
+           f"{normalized_question}"
+       )
+
+       return hashlib.sha256(raw_key.encode()).hexdigest()
 
     def _get_cached(self, key: str) -> ChatResponse | None:
         try:

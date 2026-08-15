@@ -33,7 +33,6 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
-from app.rag_services.hybrid_retrieval_service import HybridRetrievalService
 from app.rag_services.rag_service import RAGService
 from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
@@ -57,6 +56,11 @@ from app.services.health_checks import (
 )
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
+from app.rag_services.retrieval_strategy import (
+    DenseRetrievalStrategy,
+    RetrievalStrategy,
+    HybridRetrievalStrategy,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _POLICY_DIR = _REPO_ROOT / "policy"
@@ -121,15 +125,29 @@ def get_vector_repository() -> VectorRepository:
 
 
 @lru_cache(maxsize=1)
-def get_hybrid_retrieval_service() -> HybridRetrievalService:
-    return HybridRetrievalService(vector_repository=get_vector_repository())
+def get_retrieval_strategy() -> RetrievalStrategy:
+    settings = get_settings().rag
+
+    vector_repository = get_vector_repository()
+
+    if settings.hybrid_search_enabled:
+        return HybridRetrievalStrategy(
+            vector_repository=vector_repository,
+            rrf_k=settings.rrf_k,
+            candidate_top_k=settings.hybrid_candidate_top_k
+        )
+
+    return DenseRetrievalStrategy(
+        vector_repository=vector_repository
+    )
+
 
 
 @lru_cache(maxsize=1)
 def get_rag_service() -> RAGService:
     return RAGService(
         embedding_client=get_embedding_client(),
-        vector_repository=get_vector_repository(),
+        retrieval_strategy=get_retrieval_strategy(),
         llm_client=get_llm_client(),
         cache=get_query_cache_service(),
     )

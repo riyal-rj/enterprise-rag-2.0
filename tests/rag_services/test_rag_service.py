@@ -8,6 +8,7 @@ from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.rag_service import RAGService
+from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.services.query_cache_service import QueryCacheService
 
@@ -100,9 +101,12 @@ def _service(
     vector_repository = _FakeVectorRepository(results or [])
     llm_client = _FakeLLMClient(answer)
     cache = QueryCacheService(backend or _InMemoryCacheBackend(), CacheSettings())
+    retrieval_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
     service = RAGService(
         embedding_client=cast(EmbeddingClient, embedding_client),
-        vector_repository=cast(VectorRepository, vector_repository),
+        retrieval_strategy=retrieval_strategy,
         llm_client=cast(LLMClient, llm_client),
         cache=cache,
     )

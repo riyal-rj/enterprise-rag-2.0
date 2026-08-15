@@ -4,7 +4,7 @@
 dense (embedding) search: lexical/keyword matching via TF-IDF cosine
 similarity, no embedding calls involved. ``fuse_rrf`` combines any number
 of ranked result lists (e.g. dense + sparse) into one - see
-``RAGFeatureSettings.rrf_k`` and ``HybridRetrievalService``.
+``RAGFeatureSettings.rrf_k`` and ``HybridRetrievalStrategy``.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from dataclasses import replace
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -67,9 +68,11 @@ class SparseVectorIndex:
                 if score <= 0:
                     continue
                 doc = self._documents[index]
+                page_value = doc.get("page_number")
+                page_number = page_value if isinstance(page_value, int) else None
                 results.append(
                     RetrievedChunk(
-                        text=doc.get("text", ""), source=doc.get("source", ""), score=score
+                        text=doc.get("text", ""), source=doc.get("source", ""), score=score, page_number=page_number
                     )
                 )
             return results
@@ -87,14 +90,17 @@ def fuse_rrf(result_lists: list[list[RetrievedChunk]], rrf_k: int = 60) -> list[
     disclaimer paragraph), and collapsing those into one entry would
     silently drop a real hit and misattribute its source.
     """
-    scores: dict[tuple[str, str], float] = {}
-    chunks_by_key: dict[tuple[str, str], RetrievedChunk] = {}
+    scores: dict[tuple[str, int | None, str], float] = {}
+    chunks_by_key: dict[tuple[str, int | None, str], RetrievedChunk] = {}
 
     for result_list in result_lists:
         for rank, chunk in enumerate(result_list, start=1):
-            key = (chunk.source, chunk.text)
+            key = (chunk.source, chunk.page_number,chunk.text)
             scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank)
             chunks_by_key.setdefault(key, chunk)
 
     ranked_keys = sorted(scores, key=lambda key: scores[key], reverse=True)
-    return [RetrievedChunk(text=key[1], source=key[0], score=scores[key]) for key in ranked_keys]
+    return [
+        replace(chunks_by_key[key], score=scores[key]) 
+        for key in ranked_keys
+    ]

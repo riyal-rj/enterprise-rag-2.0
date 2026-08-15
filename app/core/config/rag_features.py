@@ -22,7 +22,8 @@ class RAGFeatureSettings(EnvBaseSettings):
 
     hyde_num_hypotheses: int = Field(default=3, gt=0)
     hyde_enabled_by_default: bool = Field(default=False)
-
+    
+    hybrid_candidate_top_k: int = Field(default=20, gt=0)
     hybrid_search_enabled: bool = Field(default=True)
     rrf_k: int = Field(default=60, gt=0)
 
@@ -40,3 +41,5 @@ class RAGFeatureSettings(EnvBaseSettings):
     reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
     max_reflection_retries: int = Field(default=2, ge=0)
     self_reflective_enabled_by_default: bool = Field(default=False)
+
+
