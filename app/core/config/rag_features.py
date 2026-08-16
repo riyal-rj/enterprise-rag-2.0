@@ -66,5 +66,3 @@ class RAGFeatureSettings(EnvBaseSettings):
     reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
     max_reflection_retries: int = Field(default=2, ge=0)
     self_reflective_enabled_by_default: bool = Field(default=False)
-
-

@@ -434,7 +434,10 @@ def test_retrieval_mode_override_selects_a_different_strategy_and_cache_bucket()
     )
     service = RAGService(
         embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
-        retrieval_strategies={dense_strategy.name: dense_strategy, hybrid_strategy.name: hybrid_strategy},
+        retrieval_strategies={
+            dense_strategy.name: dense_strategy,
+            hybrid_strategy.name: hybrid_strategy,
+        },
         llm_client=cast(LLMClient, _FakeLLMClient()),
         cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
         default_retrieval_mode="dense",
@@ -472,7 +475,10 @@ def _service_with_allowed_modes(
     )
     return RAGService(
         embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
-        retrieval_strategies={dense_strategy.name: dense_strategy, hybrid_strategy.name: hybrid_strategy},
+        retrieval_strategies={
+            dense_strategy.name: dense_strategy,
+            hybrid_strategy.name: hybrid_strategy,
+        },
         llm_client=cast(LLMClient, _FakeLLMClient()),
         cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
         default_retrieval_mode="dense",
@@ -550,9 +556,7 @@ def test_reranking_disabled_by_default_never_calls_the_reranker() -> None:
         RetrievedChunk(text="a", source="a.pdf", score=0.9),
         RetrievedChunk(text="b", source="b.pdf", score=0.8),
     ]
-    service, vector_repository, reranker = _service_with_reranker(
-        chunks, reranking_enabled=False
-    )
+    service, vector_repository, reranker = _service_with_reranker(chunks, reranking_enabled=False)
 
     service.answer("q", top_k=2)
 

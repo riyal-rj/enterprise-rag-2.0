@@ -10,12 +10,9 @@ from app.rag_services.reranker import ReRankedChunk, ReRankOutcome
 
 
 class VoyageReranker:
-
-    def __init__(self,*,
-                 api_key: str,
-                 model_name: str,
-                 max_concurrency: int = 4,
-                 client:Any|None = None) -> None:
+    def __init__(
+        self, *, api_key: str, model_name: str, max_concurrency: int = 4, client: Any | None = None
+    ) -> None:
 
         if not api_key:
             raise ValueError("api_key is required")
@@ -43,20 +40,15 @@ class VoyageReranker:
     def cache_namespace(self) -> str:
         return f"reranker:voyage:{self._model_name}:v1"
 
-    def rerank(self,*,
-               query: str,
-               candidates: Sequence[RetrievedChunk],
-               top_k: int) -> ReRankOutcome:
+    def rerank(
+        self, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
+    ) -> ReRankOutcome:
 
         if top_k <= 0:
             raise ValueError("top_k must be positive")
 
         if not candidates:
-            return ReRankOutcome(
-                items=(),
-                backend=self.name,
-                applied=True
-            )
+            return ReRankOutcome(items=(), backend=self.name, applied=True)
 
         limit = min(top_k, len(candidates))
 
@@ -66,7 +58,7 @@ class VoyageReranker:
                 documents=[candidate.text for candidate in candidates],
                 model=self._model_name,
                 top_k=limit,
-                truncation=True
+                truncation=True,
             )
 
         seen_indexes: set[int] = set()
@@ -74,7 +66,7 @@ class VoyageReranker:
 
         for result in response.results:
             index = int(result.index)
-            score=float(result.relevance_score)
+            score = float(result.relevance_score)
 
             if index < 0 or index >= len(candidates):
                 raise RuntimeError("Voyage returned an invalid document index")
@@ -87,11 +79,7 @@ class VoyageReranker:
 
             seen_indexes.add(index)
             ranked.append(
-                ReRankedChunk(
-                    chunk=candidates[index],
-                    original_rank=index+1,
-                    rerank_score=score
-                )
+                ReRankedChunk(chunk=candidates[index], original_rank=index + 1, rerank_score=score)
             )
 
         if len(ranked) != limit:
@@ -109,5 +97,5 @@ class VoyageReranker:
             items=tuple(ranked),
             backend=self.name,
             applied=True,
-            usage_tokens=getattr(response, "total_tokens", None)
+            usage_tokens=getattr(response, "total_tokens", None),
         )

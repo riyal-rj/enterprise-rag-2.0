@@ -350,7 +350,9 @@ class RAGService:
                 for item in rerank_items
             ]
         return [
-            RetrievedChunkPreview(text=c.text, source=c.source, score=c.score, page_number=c.page_number)
+            RetrievedChunkPreview(
+                text=c.text, source=c.source, score=c.score, page_number=c.page_number
+            )
             for c in chunks
         ]
 
@@ -365,26 +367,19 @@ class RAGService:
             if chunk.page_number is not None:
                 source_label = f"{source_label} page. {chunk.page_number}"
 
-            sections.append(
-                f"[{source_label}]\n{chunk.text}"
-            )
+            sections.append(f"[{source_label}]\n{chunk.text}")
         return "\n\n".join(sections)
 
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
-       normalized_question = " ".join(question.split())
+        normalized_question = " ".join(question.split())
 
-       # v3: cache_namespace now folds in the reranker's candidate pool
-       # size (see answer()) - bumped so a v2 key computed under the old
-       # (candidate-pool-blind) namespace scheme can't collide with or
-       # mask a v3 key for the same question/config.
-       raw_key = (
-           f"rag:v3:"
-           f"{cache_namespace}:"
-           f"{top_k}:"
-           f"{normalized_question}"
-       )
+        # v3: cache_namespace now folds in the reranker's candidate pool
+        # size (see answer()) - bumped so a v2 key computed under the old
+        # (candidate-pool-blind) namespace scheme can't collide with or
+        # mask a v3 key for the same question/config.
+        raw_key = f"rag:v3:{cache_namespace}:{top_k}:{normalized_question}"
 
-       return hashlib.sha256(raw_key.encode()).hexdigest()
+        return hashlib.sha256(raw_key.encode()).hexdigest()
 
     def _get_cached(self, key: str) -> ChatResponse | None:
         try:

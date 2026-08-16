@@ -132,7 +132,9 @@ def _controller(
     *,
     answer: str = "the answer",
     fail_create: bool = False,
-) -> tuple[ChatController, _FakeRAGService, _FakeChatHistoryRepository, _FakeConversationRepository]:
+) -> tuple[
+    ChatController, _FakeRAGService, _FakeChatHistoryRepository, _FakeConversationRepository
+]:
     rag_service = _FakeRAGService(_response(answer))
     history_repo = _FakeChatHistoryRepository(fail_create=fail_create)
     conversation_repo = _FakeConversationRepository()

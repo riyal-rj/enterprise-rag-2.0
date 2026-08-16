@@ -22,11 +22,13 @@ _TIER_TO_RESPONSE_FIELD: dict[CacheTier, str] = {
 class AdminController:
     """Orchestrates health checks and cache admin calls for ``/admin`` routes."""
 
-    def __init__(self,
-                 health_check_service: HealthCheckService,
-                 query_cache: QueryCacheService,
-                 policy_ingestion_service: PolicyIngestionService,
-                 semantic_query_cache: SemanticQueryCache | None = None) -> None:
+    def __init__(
+        self,
+        health_check_service: HealthCheckService,
+        query_cache: QueryCacheService,
+        policy_ingestion_service: PolicyIngestionService,
+        semantic_query_cache: SemanticQueryCache | None = None,
+    ) -> None:
         self._health_check_service = health_check_service
         self._query_cache = query_cache
         self._policy_ingestion_service = policy_ingestion_service

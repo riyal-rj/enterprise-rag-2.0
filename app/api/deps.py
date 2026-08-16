@@ -218,6 +218,7 @@ def get_allowed_retrieval_modes() -> frozenset[str]:
 @lru_cache(maxsize=1)
 def get_rag_service() -> RAGService:
     settings = get_settings().rag
+    semantic_cache = get_semantic_query_cache() if settings.semantic_cache_enabled else None
     return RAGService(
         embedding_client=get_embedding_client(),
         retrieval_strategies=get_retrieval_strategies(),
@@ -228,7 +229,7 @@ def get_rag_service() -> RAGService:
         reranker=get_reranker(),
         reranker_initial_top_k=settings.reranker_initial_top_k,
         reranking_enabled=settings.reranking_enabled_by_default,
-        semantic_cache=get_semantic_query_cache(),
+        semantic_cache=semantic_cache,
         semantic_cache_enabled=settings.semantic_cache_enabled,
     )
 

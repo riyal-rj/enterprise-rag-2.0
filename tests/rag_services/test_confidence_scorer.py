@@ -14,9 +14,15 @@ def test_no_chunks_scores_low() -> None:
 
 def test_strong_diverse_evidence_with_correct_citations_scores_high() -> None:
     chunks = [
-        RetrievedChunk(text="refunds are issued within 30 days of purchase", source="a.pdf", score=0.9),
-        RetrievedChunk(text="a 30 day refund window applies to all purchases", source="b.pdf", score=0.88),
-        RetrievedChunk(text="refund requests must be made within 30 days", source="c.pdf", score=0.85),
+        RetrievedChunk(
+            text="refunds are issued within 30 days of purchase", source="a.pdf", score=0.9
+        ),
+        RetrievedChunk(
+            text="a 30 day refund window applies to all purchases", source="b.pdf", score=0.88
+        ),
+        RetrievedChunk(
+            text="refund requests must be made within 30 days", source="c.pdf", score=0.85
+        ),
     ]
     answer = "Refunds are available within 30 days of purchase [a.pdf][b.pdf][c.pdf]."
 
@@ -28,8 +34,12 @@ def test_strong_diverse_evidence_with_correct_citations_scores_high() -> None:
 def test_weak_single_low_score_chunk_scores_lower_than_strong_evidence() -> None:
     weak_chunks = [RetrievedChunk(text="unrelated boilerplate text", source="z.pdf", score=0.3)]
     strong_chunks = [
-        RetrievedChunk(text="refunds are issued within 30 days of purchase", source="a.pdf", score=0.9),
-        RetrievedChunk(text="a 30 day refund window applies to all purchases", source="b.pdf", score=0.88),
+        RetrievedChunk(
+            text="refunds are issued within 30 days of purchase", source="a.pdf", score=0.9
+        ),
+        RetrievedChunk(
+            text="a 30 day refund window applies to all purchases", source="b.pdf", score=0.88
+        ),
     ]
     answer = "Refunds are available within 30 days of purchase [a.pdf][b.pdf]."
 

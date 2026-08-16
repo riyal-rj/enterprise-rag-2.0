@@ -9,19 +9,22 @@ from app.models.retrieved_chunk import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ReRankedChunk:
     chunk: RetrievedChunk
     original_rank: int
-    rerank_score: float| None
+    rerank_score: float | None
+
 
 @dataclass
 class ReRankOutcome:
-    items: tuple[ReRankedChunk,...]
+    items: tuple[ReRankedChunk, ...]
     backend: str
     applied: bool
     fallback: bool = False
     usage_tokens: int | None = None
+
 
 @runtime_checkable
 class ReRanker(Protocol):
@@ -35,11 +38,10 @@ class ReRanker(Protocol):
         """Stable identifier containing backend, model and implementation version."""
         ...
 
-    def rerank(self,*,
-               query: str,
-               candidates: Sequence[RetrievedChunk],
-               top_k: int) -> ReRankOutcome:
-        ...
+    def rerank(
+        self, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
+    ) -> ReRankOutcome: ...
+
 
 class NoOpReranker:
     @property
@@ -50,10 +52,9 @@ class NoOpReranker:
     def cache_namespace(self) -> str:
         return "reranker:none:v1"
 
-    def rerank(self,*,
-               query: str,
-               candidates: Sequence[RetrievedChunk],
-               top_k: int) -> ReRankOutcome:
+    def rerank(
+        self, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
+    ) -> ReRankOutcome:
         if top_k <= 0:
             raise ValueError("top_k must be positive")
 
@@ -67,8 +68,8 @@ class NoOpReranker:
         )
 
         return ReRankOutcome(
-            items = items,
-            backend = self.name,
+            items=items,
+            backend=self.name,
             applied=False,
         )
 
@@ -76,42 +77,31 @@ class NoOpReranker:
 class FailOpenReranker:
     """Resilience decorator"""
 
-    def __init__(self,
-                 delegate: ReRanker,
-                 fallback: ReRanker | None = None) -> None:
-        self._delegate= delegate
+    def __init__(self, delegate: ReRanker, fallback: ReRanker | None = None) -> None:
+        self._delegate = delegate
         self._fallback = fallback
-
 
     @property
     def name(self) -> str:
         return self._delegate.name
 
-
     @property
     def cache_namespace(self) -> str:
         return f"fail-open:v1:{self._delegate.cache_namespace}"
 
-
-    def rerank(self,
-               *,
-               query: str,
-               candidates: Sequence[RetrievedChunk],
-               top_k: int) -> ReRankOutcome:
+    def rerank(
+        self, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
+    ) -> ReRankOutcome:
 
         try:
-            return self._delegate.rerank(
-                query=query,
-                candidates=candidates,
-                top_k=top_k
-            )
+            return self._delegate.rerank(query=query, candidates=candidates, top_k=top_k)
         except Exception:
             logger.exception(
                 "Rerank failed, using retrieval ordering",
                 extra={
-                "reranker": self._delegate.name,
-                "candidate_count": len(candidates),
-                "top_k": top_k,
+                    "reranker": self._delegate.name,
+                    "candidate_count": len(candidates),
+                    "top_k": top_k,
                 },
             )
 
