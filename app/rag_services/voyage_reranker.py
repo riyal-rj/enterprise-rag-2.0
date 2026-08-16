@@ -66,7 +66,7 @@ class VoyageReranker:
                 documents=[candidate.text for candidate in candidates],
                 model=self._model_name,
                 top_k=limit,
-                truncate=True
+                truncation=True
             )
 
         seen_indexes: set[int] = set()
@@ -109,5 +109,5 @@ class VoyageReranker:
             items=tuple(ranked),
             backend=self.name,
             applied=True,
-            usage_tokens=getattr(response, "usage_tokens", None)
+            usage_tokens=getattr(response, "total_tokens", None)
         )

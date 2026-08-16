@@ -13,7 +13,8 @@ cross retrieval mode/reranker config or return a different chunk count than
 requested. Stores only a pointer (``cache_key``) into the existing
 ``CacheTier.RAG_ANSWER`` Redis entry, not a duplicate copy of the answer -
 if that Redis entry has since expired or been cleared, the pointer is
-simply stale and the caller falls back to generating a fresh answer.
+simply stale and the caller should try the next-nearest candidate (see
+``find_candidates``) before falling back to generating a fresh answer.
 """
 
 from __future__ import annotations
@@ -38,18 +39,29 @@ from qdrant_client.models import (
 # same embedding client's output.
 _VECTOR_SIZE = 1536
 
+# How many nearest neighbors to consider per lookup. Only the single
+# nearest point is usually live, but if its Redis-backed answer expired
+# ahead of the next-nearest match, checking only the top-1 would treat a
+# perfectly good semantic hit as a miss. Small and fixed rather than a
+# setting - this is an implementation deepening of the recall guarantee,
+# not something a deployment should need to tune.
+_CANDIDATE_LIMIT = 5
+
 
 class SemanticQueryCache(Protocol):
-    """Paraphrase-aware cache lookup: nearest previously-answered question
-    by embedding similarity, within the same retrieval-mode/reranker/top_k
+    """Paraphrase-aware cache lookup: previously-answered questions by
+    embedding similarity, within the same retrieval-mode/reranker/top_k
     partition."""
 
-    def find_similar(
+    def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
-    ) -> str | None:
-        """Return the exact-match cache key of the closest previously
-        cached question in this partition, or ``None`` if nothing clears
-        the configured similarity threshold."""
+    ) -> list[str]:
+        """Return exact-match cache keys of previously-cached questions in
+        this partition that clear the configured similarity threshold,
+        nearest-first. Empty if nothing clears it. Callers should try each
+        key in order (via the exact-match cache) until one is still live,
+        since the nearest embedding match's underlying answer may have
+        expired."""
         ...
 
     def record(
@@ -57,6 +69,17 @@ class SemanticQueryCache(Protocol):
     ) -> None:
         """Index a freshly generated answer's question so future
         paraphrases can find it."""
+        ...
+
+    def clear(self) -> int:
+        """Delete every indexed point. Returns the number removed.
+
+        Called from the same admin action that clears the Redis-backed
+        exact-match cache (see ``AdminController.cache_clear``) - without
+        this, a Redis clear (e.g. after a corpus re-ingestion) leaves
+        semantic pointers that still resolve to stale answers as soon as
+        Redis repopulates under the same keys.
+        """
         ...
 
 
@@ -82,27 +105,26 @@ class QdrantSemanticQueryCache:
         self._similarity_threshold = similarity_threshold
         self._ensure_collection()
 
-    def find_similar(
+    def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
-    ) -> str | None:
+    ) -> list[str]:
         results = self._client.query_points(
             collection_name=self._collection_name,
             query=query_embedding,
             query_filter=self._partition_filter(cache_namespace, top_k),
-            limit=1,
+            limit=_CANDIDATE_LIMIT,
             with_payload=True,
         ).points
 
-        if not results:
-            return None
-
-        best = results[0]
-        if best.score < self._similarity_threshold:
-            return None
-
-        payload = best.payload or {}
-        cache_key = payload.get("cache_key")
-        return str(cache_key) if cache_key is not None else None
+        candidates: list[str] = []
+        for point in results:
+            if point.score < self._similarity_threshold:
+                break  # results are score-sorted descending; nothing after this clears it either
+            payload = point.payload or {}
+            cache_key = payload.get("cache_key")
+            if cache_key is not None:
+                candidates.append(str(cache_key))
+        return candidates
 
     def record(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int, cache_key: str
@@ -117,6 +139,12 @@ class QdrantSemanticQueryCache:
             },
         )
         self._client.upsert(collection_name=self._collection_name, points=[point])
+
+    def clear(self) -> int:
+        count = self._client.count(collection_name=self._collection_name).count
+        self._client.delete_collection(collection_name=self._collection_name)
+        self._ensure_collection()
+        return count
 
     def _partition_filter(self, cache_namespace: str, top_k: int) -> Filter:
         return Filter(

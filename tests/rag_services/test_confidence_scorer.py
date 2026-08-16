@@ -190,3 +190,63 @@ def test_breakdown_total_matches_weighted_sum_of_its_components() -> None:
     )
     assert breakdown.total == pytest.approx(expected)
     assert compute_confidence(chunks, answer) == breakdown.total
+
+
+def test_retrieval_strength_defaults_to_reading_chunks_order_when_not_given() -> None:
+    """Without an explicit retrieval_ordered_chunks, retrieval_strength
+    must keep reading position 0 of ``chunks`` itself - the pre-reranking
+    behavior every non-reranking caller still relies on."""
+    chunks = [
+        RetrievedChunk(text="a", source="a.pdf", score=0.95),
+        RetrievedChunk(text="b", source="b.pdf", score=0.20),
+    ]
+    answer = "a [a.pdf]"
+
+    default = compute_confidence_breakdown(chunks, answer)
+    explicit = compute_confidence_breakdown(chunks, answer, retrieval_ordered_chunks=chunks)
+
+    assert default.retrieval_strength == explicit.retrieval_strength
+
+
+def test_retrieval_strength_uses_retrieval_ordered_chunks_not_reranked_order() -> None:
+    """A reranker can promote a chunk with a weak retrieval score to
+    position 0 while leaving .score (the original retrieval score)
+    untouched. retrieval_strength must reflect the strength of the
+    original retrieval's top hit, not whichever chunk the reranker put
+    first - otherwise a strong candidate pool the reranker buried reads
+    as a weak one, and vice versa."""
+    retrieval_order = [
+        RetrievedChunk(text="strongest retrieval hit", source="a.pdf", score=0.95),
+        RetrievedChunk(text="weak retrieval hit", source="b.pdf", score=0.15),
+    ]
+    # Reranker promoted the weak-retrieval-score chunk to position 0.
+    reranked_order = [retrieval_order[1], retrieval_order[0]]
+    answer = "weak retrieval hit [b.pdf]"
+
+    naive = compute_confidence_breakdown(reranked_order, answer)
+    corrected = compute_confidence_breakdown(
+        reranked_order, answer, retrieval_ordered_chunks=retrieval_order
+    )
+
+    # Naive (reads reranked_order[0].score=0.15) must score retrieval
+    # strength lower than corrected (reads retrieval_order[0].score=0.95).
+    assert naive.retrieval_strength < corrected.retrieval_strength
+
+
+def test_retrieval_ordered_chunks_only_affects_retrieval_strength() -> None:
+    """The other four components must still read the actual (reranked)
+    chunks passed as `chunks` - they describe what the LLM saw and cited,
+    which retrieval_ordered_chunks must not silently override."""
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
+    different_ordering_chunks = [RetrievedChunk(text="unrelated", source="z.pdf", score=0.1)]
+    answer = "Refunds within 30 days [a.pdf]."
+
+    breakdown = compute_confidence_breakdown(
+        chunks, answer, retrieval_ordered_chunks=different_ordering_chunks
+    )
+    baseline = compute_confidence_breakdown(chunks, answer)
+
+    assert breakdown.evidence_coverage == baseline.evidence_coverage
+    assert breakdown.faithfulness == baseline.faithfulness
+    assert breakdown.citation_precision == baseline.citation_precision
+    assert breakdown.answerability == baseline.answerability

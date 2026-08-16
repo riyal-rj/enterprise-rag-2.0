@@ -360,5 +360,8 @@ def get_admin_controller(
     health_check_service: HealthCheckService = Depends(get_health_check_service),
     query_cache: QueryCacheService = Depends(get_query_cache_service),
     policy_ingestion_service: PolicyIngestionService = Depends(get_policy_ingestion_service),
+    semantic_query_cache: SemanticQueryCache = Depends(get_semantic_query_cache),
 ) -> AdminController:
-    return AdminController(health_check_service, query_cache, policy_ingestion_service)
+    return AdminController(
+        health_check_service, query_cache, policy_ingestion_service, semantic_query_cache
+    )

@@ -10,9 +10,15 @@ from app.eval.invokers import RetrievedChunk, ServiceInvoker, SkippedIntent
 from app.eval.profiles import PROFILES
 from app.eval.schemas import Intent
 from app.rag_services.rag_service import RAGService
+from app.rag_services.reranker import NoOpReranker
 from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
-from app.schemas.chat import ChatResponse, ResponseMetadata, RetrievedChunkPreview
+from app.schemas.chat import (
+    ChatResponse,
+    RerankingMetadata,
+    ResponseMetadata,
+    RetrievedChunkPreview,
+)
 
 
 class _FakeSecretStr:
@@ -39,9 +45,21 @@ class _FakeRAGService:
         self.calls: list[dict[str, object]] = []
 
     def answer(
-        self, question: str, top_k: int = 5, retrieval_mode: str | None = None
+        self,
+        question: str,
+        top_k: int = 5,
+        retrieval_mode: str | None = None,
+        *,
+        reranking_enabled: bool | None = None,
     ) -> ChatResponse:
-        self.calls.append({"question": question, "top_k": top_k, "retrieval_mode": retrieval_mode})
+        self.calls.append(
+            {
+                "question": question,
+                "top_k": top_k,
+                "retrieval_mode": retrieval_mode,
+                "reranking_enabled": reranking_enabled,
+            }
+        )
         return self._response
 
 
@@ -53,6 +71,7 @@ def _response(answer: str = "the answer") -> ChatResponse:
         metadata=ResponseMetadata(
             route="rag",
             retrieval_mode="dense",
+            reranking=RerankingMetadata(enabled=False, backend="none"),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
@@ -98,6 +117,7 @@ def test_service_invoker_calls_the_real_rag_service_for_a_supported_profile() ->
             "question": "what is the policy?",
             "top_k": PROFILES["naive"].top_k,
             "retrieval_mode": "dense",
+            "reranking_enabled": False,
         }
     ]
 
@@ -111,15 +131,28 @@ def test_service_invoker_passes_search_mode_as_retrieval_mode_override() -> None
     assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
 
 
-@pytest.mark.parametrize(
-    "profile_name", ["hybrid+rerank", "hybrid+rerank+hyde", "hybrid+rerank+crag", "all"]
-)
+def test_service_invoker_passes_enable_rerank_as_a_per_call_override() -> None:
+    """hybrid+rerank must actually exercise reranking through the real
+    RAGService.answer() override, not silently no-op - this is what makes
+    a baseline-vs-reranker RAGAS comparison possible."""
+    fake_rag_service = _FakeRAGService(_response())
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    invoker.invoke("q", PROFILES["hybrid+rerank"], Intent.RAG)
+
+    assert fake_rag_service.calls[0]["reranking_enabled"] is True
+    assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
+
+
+@pytest.mark.parametrize("profile_name", ["hybrid+rerank+hyde", "hybrid+rerank+crag", "all"])
 def test_service_invoker_skips_profiles_requesting_unimplemented_features(
     profile_name: str,
 ) -> None:
-    """Reranking/HyDE/CRAG/self-reflective don't exist in the pipeline yet -
-    silently ignoring the flag would produce misleading pass/fail results,
-    so these skip cleanly instead, even with a working rag_service wired up."""
+    """HyDE/CRAG/self-reflective don't exist in the pipeline yet - silently
+    ignoring the flag would produce misleading pass/fail results, so these
+    skip cleanly instead, even with a working rag_service wired up.
+    Reranking alone (hybrid+rerank) is no longer in this list - see
+    test_service_invoker_passes_enable_rerank_as_a_per_call_override."""
     fake_rag_service = _FakeRAGService(_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
 
@@ -200,6 +233,7 @@ def test_service_invoker_bypasses_the_shared_production_cache(
     monkeypatch.setattr("app.api.deps.get_llm_client", lambda: llm_client)
     monkeypatch.setattr("app.api.deps.get_retrieval_strategies", lambda: {"dense": dense_strategy})
     monkeypatch.setattr("app.api.deps.get_default_retrieval_mode", lambda: "dense")
+    monkeypatch.setattr("app.api.deps.get_reranker", lambda: NoOpReranker())
     invoker = ServiceInvoker()
 
     invoker.invoke("same question", PROFILES["naive"], Intent.RAG)

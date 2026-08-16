@@ -164,20 +164,20 @@ class _FakeSemanticQueryCache:
     def __init__(
         self,
         *,
-        match_key: str | None = None,
+        candidate_keys: list[str] | None = None,
         raise_on_find: bool = False,
         raise_on_record: bool = False,
     ) -> None:
-        self.match_key = match_key
+        self.candidate_keys = candidate_keys or []
         self._raise_on_find = raise_on_find
         self._raise_on_record = raise_on_record
-        self.find_similar_calls: list[dict[str, object]] = []
+        self.find_candidates_calls: list[dict[str, object]] = []
         self.record_calls: list[dict[str, object]] = []
 
-    def find_similar(
+    def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
-    ) -> str | None:
-        self.find_similar_calls.append(
+    ) -> list[str]:
+        self.find_candidates_calls.append(
             {
                 "query_embedding": query_embedding,
                 "cache_namespace": cache_namespace,
@@ -186,7 +186,7 @@ class _FakeSemanticQueryCache:
         )
         if self._raise_on_find:
             raise RuntimeError("boom")
-        return self.match_key
+        return self.candidate_keys
 
     def record(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int, cache_key: str
@@ -572,7 +572,15 @@ def test_reranking_enabled_reorders_chunks_and_marks_metadata() -> None:
     assert len(reranker.calls) == 1
     assert response.metadata.retrieved_chunks[0].text == "second"
     assert response.metadata.retrieved_chunks[1].text == "first"
-    assert response.metadata.reranked is True
+    assert response.metadata.reranking.enabled is True
+    assert response.metadata.reranking.applied is True
+    assert response.metadata.reranking.fallback is False
+    assert response.metadata.reranking.backend == "fake-reranker"
+    assert response.metadata.reranking.candidate_count == 2
+    # rerank_score/original_rank threaded through from the reranker's
+    # output, not discarded at the chunks = [item.chunk ...] reassignment.
+    assert response.metadata.retrieved_chunks[0].rerank_score == 1.0
+    assert response.metadata.retrieved_chunks[0].original_rank == 1
 
 
 def test_reranking_expands_candidate_pool_to_reranker_initial_top_k() -> None:
@@ -603,15 +611,18 @@ def test_reranking_skips_the_reranker_call_when_no_candidates_were_retrieved() -
     response = service.answer("q")
 
     assert reranker.calls == []
-    assert response.metadata.reranked is False
+    assert response.metadata.reranking.applied is False
+    assert response.metadata.reranking.candidate_count == 0
 
 
-def test_default_response_metadata_reranked_is_false_without_a_reranker() -> None:
+def test_default_response_metadata_reranking_is_disabled_without_a_reranker() -> None:
     service, _, _, _ = _service(results=[RetrievedChunk(text="x", source="a.pdf", score=0.9)])
 
     response = service.answer("q")
 
-    assert response.metadata.reranked is False
+    assert response.metadata.reranking.enabled is False
+    assert response.metadata.reranking.applied is False
+    assert response.metadata.reranking.backend == "none"
 
 
 def test_reranking_success_emits_a_debug_telemetry_log(caplog: pytest.LogCaptureFixture) -> None:
@@ -693,12 +704,12 @@ def test_semantic_cache_disabled_by_default_never_calls_it() -> None:
 
     service.answer("q", top_k=3)
 
-    assert semantic_cache.find_similar_calls == []
+    assert semantic_cache.find_candidates_calls == []
     assert semantic_cache.record_calls == []
 
 
 def test_semantic_cache_miss_generates_normally_and_records_afterwards() -> None:
-    semantic_cache = _FakeSemanticQueryCache(match_key=None)
+    semantic_cache = _FakeSemanticQueryCache(candidate_keys=[])
     chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
     service, llm_client = _service_with_semantic_cache(chunks, semantic_cache=semantic_cache)
 
@@ -706,9 +717,9 @@ def test_semantic_cache_miss_generates_normally_and_records_afterwards() -> None
 
     assert len(llm_client.calls) == 1
     assert response.cache_hit is False
-    assert len(semantic_cache.find_similar_calls) == 1
-    assert semantic_cache.find_similar_calls[0]["cache_namespace"] == "dense:v1"
-    assert semantic_cache.find_similar_calls[0]["top_k"] == 3
+    assert len(semantic_cache.find_candidates_calls) == 1
+    assert semantic_cache.find_candidates_calls[0]["cache_namespace"] == "dense:v1"
+    assert semantic_cache.find_candidates_calls[0]["top_k"] == 3
     assert len(semantic_cache.record_calls) == 1
     assert semantic_cache.record_calls[0]["cache_namespace"] == "dense:v1"
     assert semantic_cache.record_calls[0]["top_k"] == 3
@@ -725,7 +736,7 @@ def test_semantic_cache_hit_serves_a_paraphrases_answer_without_regenerating() -
     assert len(llm_client.calls) == 1
     # Point the fake at the exact-match key the first call just recorded -
     # simulating a real semantic match against a differently-worded question.
-    semantic_cache.match_key = semantic_cache.record_calls[0]["cache_key"]
+    semantic_cache.candidate_keys = [semantic_cache.record_calls[0]["cache_key"]]
 
     second = service.answer("once arrears pass 90 days, what classification applies?", top_k=3)
 
@@ -734,8 +745,31 @@ def test_semantic_cache_hit_serves_a_paraphrases_answer_without_regenerating() -
     assert second.answer == first.answer == "first answer"
 
 
-def test_semantic_cache_match_pointing_at_an_expired_entry_falls_through() -> None:
-    semantic_cache = _FakeSemanticQueryCache(match_key="a-key-that-was-never-cached")
+def test_semantic_cache_falls_through_to_the_next_candidate_when_nearest_is_stale() -> None:
+    """The nearest match's Redis entry may have expired while a
+    farther-but-still-live match hasn't - find_candidates returns several
+    ranked candidates for exactly this reason (see
+    QdrantSemanticQueryCache.find_candidates); RAGService must try each in
+    order rather than giving up after the first stale one."""
+    semantic_cache = _FakeSemanticQueryCache()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, llm_client = _service_with_semantic_cache(
+        chunks, semantic_cache=semantic_cache, llm_client=_FakeLLMClient("first answer")
+    )
+
+    first = service.answer("q1", top_k=3)
+    live_key = semantic_cache.record_calls[0]["cache_key"]
+    semantic_cache.candidate_keys = ["stale-key-never-cached", live_key]
+
+    second = service.answer("q2", top_k=3)
+
+    assert len(llm_client.calls) == 1  # no second generation - the live candidate was found
+    assert second.cache_hit is True
+    assert second.answer == first.answer == "first answer"
+
+
+def test_semantic_cache_all_candidates_stale_falls_through_to_fresh_generation() -> None:
+    semantic_cache = _FakeSemanticQueryCache(candidate_keys=["never-cached-a", "never-cached-b"])
     chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
     service, llm_client = _service_with_semantic_cache(chunks, semantic_cache=semantic_cache)
 
@@ -774,7 +808,7 @@ def test_semantic_cache_is_skipped_for_strategies_without_dense_embedding() -> N
 
     service.answer("q")
 
-    assert semantic_cache.find_similar_calls == []
+    assert semantic_cache.find_candidates_calls == []
     assert semantic_cache.record_calls == []
 
 
@@ -832,5 +866,124 @@ def test_semantic_cache_partitions_by_reranking_cache_namespace() -> None:
 
     service.answer("q", top_k=3)
 
-    assert semantic_cache.find_similar_calls[0]["cache_namespace"] == "dense:v1:reranker:my-reranker:v1"
-    assert semantic_cache.record_calls[0]["cache_namespace"] == "dense:v1:reranker:my-reranker:v1"
+    expected_namespace = "dense:v1:reranker:my-reranker:v1:candidates=20"
+    assert semantic_cache.find_candidates_calls[0]["cache_namespace"] == expected_namespace
+    assert semantic_cache.record_calls[0]["cache_namespace"] == expected_namespace
+
+
+def test_fallback_reranking_response_is_not_cached_exact_match() -> None:
+    """A fallback response (reranker failed, retrieval order used) must
+    not be cached under the reranker-configured namespace - otherwise
+    later requests keep getting the degraded answer forever, even after
+    the reranker recovers, since nothing else would ever invalidate it."""
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, _, _ = _service_with_reranker(
+        chunks, reranking_enabled=True, reranker=_FakeReranker(fallback=True)
+    )
+    first = service.answer("q", top_k=1)
+    second = service.answer("q", top_k=1)
+
+    assert first.cache_hit is False
+    assert second.cache_hit is False  # still not cached - the fallback was never written
+
+
+def test_fallback_reranking_response_is_not_semantically_recorded() -> None:
+    semantic_cache = _FakeSemanticQueryCache()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        reranker=_FakeReranker(fallback=True),
+        reranking_enabled=True,
+        semantic_cache=cast(SemanticQueryCache, semantic_cache),
+        semantic_cache_enabled=True,
+    )
+
+    response = service.answer("q", top_k=1)
+
+    assert response.metadata.reranking.fallback is True
+    assert semantic_cache.record_calls == []
+
+
+def test_semantic_record_is_skipped_when_the_redis_write_itself_fails() -> None:
+    """_set_cached must gate semantic recording on an actual successful
+    write, not just "no fallback" - a Redis outage shouldn't leave a
+    semantic pointer aimed at a cache key that was never written."""
+    semantic_cache = _FakeSemanticQueryCache()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(fail_set=True), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        semantic_cache=cast(SemanticQueryCache, semantic_cache),
+        semantic_cache_enabled=True,
+    )
+
+    service.answer("q", top_k=1)
+
+    assert semantic_cache.record_calls == []
+
+
+def test_cache_key_includes_candidate_pool_size_when_reranking_enabled() -> None:
+    """Widening reranker_initial_top_k (20 -> 50) can change which chunk
+    the reranker ends up promoting even though top_k and the reranker
+    itself are unchanged - the candidate pool size must be part of the
+    cache key, or a stale narrower-pool answer gets served forever."""
+    chunks = [RetrievedChunk(text=f"t{i}", source=f"s{i}.pdf", score=0.5) for i in range(30)]
+    narrow, _, _ = _service_with_reranker(chunks, reranking_enabled=True, reranker_initial_top_k=10)
+    wide, _, _ = _service_with_reranker(chunks, reranking_enabled=True, reranker_initial_top_k=25)
+
+    narrow_response = narrow.answer("q", top_k=5)
+    wide_response = wide.answer("q", top_k=5)
+
+    # Two independent services never share a cache, so this only proves
+    # the key computation itself differs: same question/top_k/reranker,
+    # different candidate pool -> neither would ever hit the other's
+    # entry if they did share one. Verified directly via the private key
+    # builder, which is the actual unit under test here.
+    narrow_key = narrow._cache_key("q", 5, "dense:v1:reranker:fake-reranker:v1:candidates=10")
+    wide_key = wide._cache_key("q", 5, "dense:v1:reranker:fake-reranker:v1:candidates=25")
+    assert narrow_key != wide_key
+    assert narrow_response.cache_hit is False
+    assert wide_response.cache_hit is False
+
+
+def test_per_call_reranking_override_enables_reranking_for_a_single_request() -> None:
+    """reranking_enabled=True on a single answer() call must engage the
+    reranker even when the instance default (from
+    RAGFeatureSettings.reranking_enabled_by_default) is off - this is
+    what lets the eval harness compare reranked vs. non-reranked runs
+    through one RAGService instance (see app.eval.invokers)."""
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, _, reranker = _service_with_reranker(chunks, reranking_enabled=False)
+
+    without_override = service.answer("q1", top_k=1)
+    assert without_override.metadata.reranking.enabled is False
+    assert len(reranker.calls) == 0
+
+    with_override = service.answer("q2", top_k=1, reranking_enabled=True)
+    assert with_override.metadata.reranking.enabled is True
+    assert len(reranker.calls) == 1
+
+
+def test_per_call_reranking_override_disables_reranking_for_a_single_request() -> None:
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, _, reranker = _service_with_reranker(chunks, reranking_enabled=True)
+
+    response = service.answer("q", top_k=1, reranking_enabled=False)
+
+    assert response.metadata.reranking.enabled is False
+    assert reranker.calls == []

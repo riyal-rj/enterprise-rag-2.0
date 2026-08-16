@@ -18,11 +18,18 @@ class _FakeQueryResponse:
     points: list[_FakeScoredPoint]
 
 
+@dataclass
+class _FakeCountResult:
+    count: int
+
+
 class _FakeQdrantClient:
-    def __init__(self, existing_collections: list[str] | None = None) -> None:
+    def __init__(self, existing_collections: list[str] | None = None, point_count: int = 0) -> None:
         self._existing = set(existing_collections or [])
+        self._point_count = point_count
         self.created_collections: list[dict[str, object]] = []
         self.created_payload_indexes: list[dict[str, object]] = []
+        self.deleted_collections: list[str] = []
         self.upsert_calls: list[dict[str, object]] = []
         self.query_points_calls: list[dict[str, object]] = []
         self.query_response: _FakeQueryResponse = _FakeQueryResponse(points=[])
@@ -43,6 +50,14 @@ class _FakeQdrantClient:
     def query_points(self, **kwargs: object) -> _FakeQueryResponse:
         self.query_points_calls.append(kwargs)
         return self.query_response
+
+    def count(self, collection_name: str) -> _FakeCountResult:
+        return _FakeCountResult(count=self._point_count)
+
+    def delete_collection(self, collection_name: str) -> None:
+        self.deleted_collections.append(collection_name)
+        self._existing.discard(collection_name)
+        self._point_count = 0
 
 
 def _cache(client: _FakeQdrantClient, *, threshold: float = 0.95) -> QdrantSemanticQueryCache:
@@ -83,63 +98,82 @@ def test_constructor_rejects_threshold_outside_zero_to_one() -> None:
         _cache(client, threshold=-0.1)
 
 
-def test_find_similar_returns_none_when_no_points_match() -> None:
+def test_find_candidates_returns_empty_list_when_no_points_match() -> None:
     client = _FakeQdrantClient()
     client.query_response = _FakeQueryResponse(points=[])
     cache = _cache(client)
 
-    result = cache.find_similar(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
-    assert result is None
+    assert result == []
 
 
-def test_find_similar_returns_none_when_best_score_is_below_threshold() -> None:
+def test_find_candidates_excludes_points_below_threshold() -> None:
     client = _FakeQdrantClient()
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.80)]
     )
     cache = _cache(client, threshold=0.95)
 
-    result = cache.find_similar(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
-    assert result is None
+    assert result == []
 
 
-def test_find_similar_returns_the_cache_key_when_score_clears_threshold() -> None:
+def test_find_candidates_returns_the_cache_key_when_score_clears_threshold() -> None:
     client = _FakeQdrantClient()
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc123"}, score=0.97)]
     )
     cache = _cache(client, threshold=0.95)
 
-    result = cache.find_similar(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
-    assert result == "abc123"
+    assert result == ["abc123"]
 
 
-def test_find_similar_score_exactly_at_threshold_counts_as_a_match() -> None:
+def test_find_candidates_score_exactly_at_threshold_counts_as_a_match() -> None:
     client = _FakeQdrantClient()
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.95)]
     )
     cache = _cache(client, threshold=0.95)
 
-    result = cache.find_similar(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
-    assert result == "abc"
+    assert result == ["abc"]
 
 
-def test_find_similar_filters_by_cache_namespace_and_top_k() -> None:
+def test_find_candidates_returns_multiple_matches_nearest_first_and_stops_at_threshold() -> None:
+    """Regression: only checking the single nearest point means a stale
+    pointer masks a perfectly good second-nearest match. find_candidates
+    must surface every match above threshold, in score order, so the
+    caller (RAGService) can fall through to the next one."""
+    client = _FakeQdrantClient()
+    client.query_response = _FakeQueryResponse(
+        points=[
+            _FakeScoredPoint(payload={"cache_key": "nearest"}, score=0.99),
+            _FakeScoredPoint(payload={"cache_key": "second"}, score=0.96),
+            _FakeScoredPoint(payload={"cache_key": "below-threshold"}, score=0.80),
+        ]
+    )
+    cache = _cache(client, threshold=0.95)
+
+    result = cache.find_candidates(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5)
+
+    assert result == ["nearest", "second"]
+
+
+def test_find_candidates_filters_by_cache_namespace_and_top_k() -> None:
     client = _FakeQdrantClient()
     cache = _cache(client)
 
-    cache.find_similar(query_embedding=[0.1], cache_namespace="hybrid:v2", top_k=8)
+    cache.find_candidates(query_embedding=[0.1], cache_namespace="hybrid:v2", top_k=8)
 
     call = client.query_points_calls[0]
     query_filter = call["query_filter"]
     conditions = {c.key: c.match.value for c in query_filter.must}
     assert conditions == {"cache_namespace": "hybrid:v2", "top_k": 8}
-    assert call["limit"] == 1
 
 
 def test_record_upserts_a_point_with_the_embedding_and_pointer_payload() -> None:
@@ -159,3 +193,16 @@ def test_record_upserts_a_point_with_the_embedding_and_pointer_payload() -> None
     point = points[0]
     assert point.vector == [0.1, 0.2, 0.3]
     assert point.payload == {"cache_namespace": "dense:v1", "top_k": 5, "cache_key": "deadbeef"}
+
+
+def test_clear_deletes_and_recreates_the_collection_returning_prior_count() -> None:
+    client = _FakeQdrantClient(existing_collections=["rag_query_cache"], point_count=7)
+    cache = _cache(client)
+
+    removed = cache.clear()
+
+    assert removed == 7
+    assert client.deleted_collections == ["rag_query_cache"]
+    # Recreated afterwards, ready for new points again.
+    assert client.collection_exists("rag_query_cache")
+    assert len(client.created_collections) == 1

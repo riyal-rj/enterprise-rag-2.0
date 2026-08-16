@@ -26,12 +26,42 @@ class ChatRequest(BaseModel):
 
 
 class RetrievedChunkPreview(BaseModel):
-    """A chunk as surfaced back to the caller, alongside the answer."""
+    """A chunk as surfaced back to the caller, alongside the answer.
+
+    ``score`` is always the retrieval-stage score (dense cosine similarity,
+    RRF-derived for hybrid, or BM25 for sparse) - reranking never mutates
+    it, only reorders the list. ``rerank_score``/``original_rank`` are
+    ``None`` unless reranking actually ran; when they're set,
+    ``original_rank`` is this chunk's 1-based position in the
+    pre-reranking retrieval order, so a caller can tell e.g. "the
+    reranker promoted the candidate retrieval ranked #8 to position #1."
+    """
 
     text: str
     source: str
     score: float
     page_number: int | None = None
+    rerank_score: float | None = None
+    original_rank: int | None = None
+
+
+class RerankingMetadata(BaseModel):
+    """Diagnostic detail about the reranking stage specifically.
+
+    Always present so a caller can distinguish "reranking is off"
+    (``enabled=False``) from "reranking is on but degraded to retrieval
+    order" (``enabled=True, applied=False, fallback=True``) - the same
+    distinction ``FailOpenReranker``/``ReRankOutcome`` already carry
+    internally (see ``app.rag_services.reranker``), now surfaced instead
+    of being discarded at the API boundary.
+    """
+
+    enabled: bool
+    applied: bool = False
+    fallback: bool = False
+    backend: str
+    candidate_count: int = 0
+    usage_tokens: int | None = None
 
 
 class ResponseMetadata(BaseModel):
@@ -44,7 +74,7 @@ class ResponseMetadata(BaseModel):
 
     route: str
     retrieval_mode:str = "dense"
-    reranked: bool = False
+    reranking: RerankingMetadata
     retrieved_chunks: list[RetrievedChunkPreview]
     flagged_claims: list[str] = Field(default_factory=list)
 

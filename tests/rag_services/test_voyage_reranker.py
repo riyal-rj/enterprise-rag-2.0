@@ -2,26 +2,34 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
+import voyageai
 
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.voyage_reranker import VoyageReranker
 
 
 class _FakeClient:
-    def __init__(self, results: list[SimpleNamespace], usage_tokens: int | None = None) -> None:
+    """Mirrors the real ``voyageai.Client.rerank`` signature and return
+    shape exactly - see ``test_rerank_call_is_compatible_with_the_installed_sdk``
+    for the autospecced version that fails the build the moment this drifts
+    from the real SDK again (as happened when ``truncate``/``usage_tokens``
+    were used instead of ``truncation``/``total_tokens``)."""
+
+    def __init__(self, results: list[SimpleNamespace], total_tokens: int | None = None) -> None:
         self._results = results
-        self._usage_tokens = usage_tokens
+        self._total_tokens = total_tokens
         self.rerank_calls: list[dict[str, object]] = []
 
-    def rerank(self, *, query, documents, model, top_k, truncate):
+    def rerank(self, query, documents, model, top_k=None, truncation=True):
         self.rerank_calls.append(
             {"query": query, "documents": documents, "model": model, "top_k": top_k}
         )
         response = SimpleNamespace(results=self._results)
-        if self._usage_tokens is not None:
-            response.usage_tokens = self._usage_tokens
+        if self._total_tokens is not None:
+            response.total_tokens = self._total_tokens
         return response
 
 
@@ -31,6 +39,26 @@ def _chunks(n: int) -> list[RetrievedChunk]:
 
 def _result(index: int, score: float) -> SimpleNamespace:
     return SimpleNamespace(index=index, relevance_score=score)
+
+
+def test_rerank_call_is_compatible_with_the_installed_sdks_signature() -> None:
+    """Contract test: binds our call site against the actual installed
+    ``voyageai.Client.rerank`` signature via autospec, so a real SDK
+    parameter rename (e.g. truncate -> truncation) fails this test
+    immediately instead of only being caught by a hand-rolled fake that
+    silently drifted out of sync with the real contract."""
+    autospec_client = create_autospec(voyageai.Client, instance=True)
+    autospec_client.rerank.return_value = SimpleNamespace(
+        results=[_result(0, 0.9)], total_tokens=10
+    )
+    reranker = VoyageReranker(api_key="key", model_name="rerank-2.5", client=autospec_client)
+
+    reranker.rerank(query="q", candidates=_chunks(1), top_k=1)
+
+    autospec_client.rerank.assert_called_once()
+    call_kwargs = autospec_client.rerank.call_args.kwargs
+    assert call_kwargs["truncation"] is True
+    assert "truncate" not in call_kwargs
 
 
 def test_rerank_with_more_than_one_result_does_not_raise() -> None:
@@ -72,8 +100,8 @@ def test_rerank_passes_limited_top_k_and_documents_to_client() -> None:
     assert call["model"] == "rerank-2.5"
 
 
-def test_rerank_surfaces_usage_tokens_when_present() -> None:
-    client = _FakeClient([_result(0, 0.9)], usage_tokens=42)
+def test_rerank_surfaces_total_tokens_when_present() -> None:
+    client = _FakeClient([_result(0, 0.9)], total_tokens=42)
     reranker = VoyageReranker(api_key="key", model_name="m", client=client)
 
     outcome = reranker.rerank(query="q", candidates=_chunks(1), top_k=1)
@@ -81,7 +109,7 @@ def test_rerank_surfaces_usage_tokens_when_present() -> None:
     assert outcome.usage_tokens == 42
 
 
-def test_rerank_defaults_usage_tokens_to_none_when_absent() -> None:
+def test_rerank_defaults_usage_tokens_to_none_when_total_tokens_absent() -> None:
     client = _FakeClient([_result(0, 0.9)])
     reranker = VoyageReranker(api_key="key", model_name="m", client=client)
 

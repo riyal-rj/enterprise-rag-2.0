@@ -25,11 +25,13 @@ is cleanly skipped with a clear reason rather than erroring partway
 through a real call.
 
 ``_call_pipeline`` calls the real :class:`~app.rag_services.rag_service.RAGService`,
-via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override -
-dense/sparse/hybrid all run for real. Reranking/HyDE/CRAG/self-reflective
-profiles skip cleanly instead: none of those exist in the pipeline yet
-(see ``app.rag_services.rag_service``'s module docstring), so silently
-ignoring the flag would produce misleading pass/fail results.
+via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override and
+``PipelineProfile.enable_rerank`` as a per-call ``reranking_enabled``
+override (see ``RAGService.answer``) - dense/sparse/hybrid and reranking
+all run for real. HyDE/CRAG/self-reflective profiles still skip cleanly:
+none of those exist in the pipeline yet (see
+``app.rag_services.rag_service``'s module docstring), so silently
+ignoring those flags would produce misleading pass/fail results.
 """
 
 from __future__ import annotations
@@ -116,10 +118,12 @@ class ServiceInvoker:
             get_default_retrieval_mode,
             get_embedding_client,
             get_llm_client,
+            get_reranker,
             get_retrieval_strategies,
         )
         from app.services.query_cache_service import NoOpCacheBackend, QueryCacheService
 
+        rag_settings = get_settings().rag
         return RAGService(
             embedding_client=get_embedding_client(),
             retrieval_strategies=get_retrieval_strategies(),
@@ -127,6 +131,14 @@ class ServiceInvoker:
             cache=QueryCacheService(NoOpCacheBackend(), get_settings().cache),
             default_retrieval_mode=get_default_retrieval_mode(),
             allowed_retrieval_modes=None,
+            # Built with the same production reranker config regardless of
+            # RAGFeatureSettings.reranking_enabled_by_default - flags.enable_rerank
+            # (a per-call override, see _call_pipeline) is what actually
+            # switches it on/off per case, so hybrid+rerank profiles get a
+            # real reranker to compare against, not a silent NoOpReranker
+            # that would make "ran with reranking on" a no-op in practice.
+            reranker=get_reranker(),
+            reranker_initial_top_k=rag_settings.reranker_initial_top_k,
         )
 
     def invoke(
@@ -144,14 +156,17 @@ class ServiceInvoker:
     def _call_pipeline(
         self, question: str, flags: PipelineProfile
     ) -> tuple[InvokeResponse, list[RetrievedChunk]]:
-        if flags.enable_hyde or flags.enable_rerank or flags.enable_crag or flags.enable_self_reflective:
+        if flags.enable_hyde or flags.enable_crag or flags.enable_self_reflective:
             raise SkippedIntent(
-                f"{flags.name}: HyDE/reranking/CRAG/self-reflective aren't implemented "
-                "in the pipeline yet, only search_mode (dense/sparse/hybrid) is wired"
+                f"{flags.name}: HyDE/CRAG/self-reflective aren't implemented "
+                "in the pipeline yet, only search_mode and reranking are wired"
             )
 
         response = self._rag_service.answer(
-            question, top_k=flags.top_k, retrieval_mode=flags.search_mode
+            question,
+            top_k=flags.top_k,
+            retrieval_mode=flags.search_mode,
+            reranking_enabled=flags.enable_rerank,
         )
         chunks = [
             RetrievedChunk(text=c.text, source=c.source) for c in response.metadata.retrieved_chunks

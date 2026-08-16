@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.cache import CacheClearResponse, CacheStatsResponse, CacheTierStats
 from app.schemas.health import HealthCheckResponse
 from app.schemas.policy import PolicyListResponse, PolicyUploadResponse
@@ -24,10 +25,12 @@ class AdminController:
     def __init__(self,
                  health_check_service: HealthCheckService,
                  query_cache: QueryCacheService,
-                 policy_ingestion_service: PolicyIngestionService) -> None:
+                 policy_ingestion_service: PolicyIngestionService,
+                 semantic_query_cache: SemanticQueryCache | None = None) -> None:
         self._health_check_service = health_check_service
         self._query_cache = query_cache
         self._policy_ingestion_service = policy_ingestion_service
+        self._semantic_query_cache = semantic_query_cache
 
     async def health(self) -> HealthCheckResponse:
         results = await self._health_check_service.run()
@@ -44,6 +47,8 @@ class AdminController:
 
     def cache_clear(self) -> CacheClearResponse:
         cleared = self._query_cache.clear()
+        if self._semantic_query_cache is not None:
+            cleared["semantic"] = self._semantic_query_cache.clear()
         return CacheClearResponse(status="ok", cleared=cleared)
 
     def list_policies(self) -> PolicyListResponse:
