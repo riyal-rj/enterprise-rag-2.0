@@ -19,6 +19,7 @@ simply stale and the caller should try the next-nearest candidate (see
 
 from __future__ import annotations
 
+import threading
 import uuid
 from typing import Protocol
 
@@ -46,14 +47,6 @@ _VECTOR_SIZE = 1536
 # setting - this is an implementation deepening of the recall guarantee,
 # not something a deployment should need to tune.
 _CANDIDATE_LIMIT = 5
-
-
-class _LookupMetricsRecorder(Protocol):
-    """Narrow collaborator - satisfied by ``app.services.rag_metrics_service.RagMetricsService``
-    without this module needing to import it (avoids a repository -> service
-    layering dependency for what's really just an optional counter hook)."""
-
-    def record_semantic_cache_lookup(self, *, hit: bool) -> None: ...
 
 
 class SemanticQueryCache(Protocol):
@@ -105,6 +98,14 @@ class QdrantSemanticQueryCache:
     documents collection (``QdrantVectorRepository``) - different lifecycle
     (grows/shrinks with query traffic, not ingestion) and a different
     partitioning key (``cache_namespace``/``top_k``, not ``source``).
+
+    The collection is created lazily, on the first real operation
+    (``find_candidates``/``record``/``clear``), not at construction time.
+    ``app.api.deps.get_rag_service`` always constructs this class regardless
+    of whether semantic caching is currently enabled (so an admin can flip
+    it on later without a cold-construction cost) - eagerly ensuring the
+    Qdrant collection in ``__init__`` would reintroduce a hard Qdrant
+    dependency for deployments that keep semantic caching disabled.
     """
 
     def __init__(
@@ -112,15 +113,14 @@ class QdrantSemanticQueryCache:
         client: QdrantClient,
         collection_name: str,
         similarity_threshold: float,
-        metrics: _LookupMetricsRecorder | None = None,
     ) -> None:
         if not 0.0 <= similarity_threshold <= 1.0:
             raise ValueError("similarity_threshold must be between 0.0 and 1.0")
         self._client = client
         self._collection_name = collection_name
         self._similarity_threshold = similarity_threshold
-        self._metrics = metrics
-        self._ensure_collection()
+        self._collection_ready = False
+        self._collection_ready_lock = threading.Lock()
 
     def set_similarity_threshold(self, threshold: float) -> None:
         if not 0.0 <= threshold <= 1.0:
@@ -130,6 +130,7 @@ class QdrantSemanticQueryCache:
     def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
     ) -> list[str]:
+        self._ensure_collection_ready()
         results = self._client.query_points(
             collection_name=self._collection_name,
             query=query_embedding,
@@ -147,19 +148,18 @@ class QdrantSemanticQueryCache:
             if cache_key is not None:
                 candidates.append(str(cache_key))
 
-        # "Hit" here means the embedding search found a clearing match, not
-        # that the exact-match Redis entry it points at is confirmed still
-        # live (RAGService tries each candidate and falls through on a
-        # stale one) - a reasonable, much cheaper proxy for the panel's
-        # semantic-cache hit rate that doesn't require wiring this
-        # repository's caller back into the metrics service too.
-        if self._metrics is not None:
-            self._metrics.record_semantic_cache_lookup(hit=bool(candidates))
+        # Recording a "hit"/"miss" metric here would only mean "the
+        # embedding search found a clearing match", not that the exact-match
+        # Redis entry it points at is confirmed still live - RAGService
+        # tries each candidate and falls through on a stale one, so it's the
+        # one place that knows the real, confirmed outcome. See
+        # ``RAGService._check_semantic_cache``.
         return candidates
 
     def record(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int, cache_key: str
     ) -> None:
+        self._ensure_collection_ready()
         point = PointStruct(
             id=str(uuid.uuid4()),
             vector=query_embedding,
@@ -172,6 +172,7 @@ class QdrantSemanticQueryCache:
         self._client.upsert(collection_name=self._collection_name, points=[point])
 
     def clear(self) -> int:
+        self._ensure_collection_ready()
         count = self._client.count(collection_name=self._collection_name).count
         self._client.delete_collection(collection_name=self._collection_name)
         self._ensure_collection()
@@ -184,6 +185,20 @@ class QdrantSemanticQueryCache:
                 FieldCondition(key="top_k", match=MatchValue(value=top_k)),
             ]
         )
+
+    def _ensure_collection_ready(self) -> None:
+        """Thread-safe, run-once gate in front of ``_ensure_collection`` -
+        concurrent requests can both reach the first real operation on a
+        freshly enabled cache before either has created the collection, and
+        ``_ensure_collection``'s existence-check-then-create isn't atomic
+        against that race."""
+        if self._collection_ready:
+            return
+        with self._collection_ready_lock:
+            if self._collection_ready:
+                return
+            self._ensure_collection()
+            self._collection_ready = True
 
     def _ensure_collection(self) -> None:
         if self._client.collection_exists(self._collection_name):

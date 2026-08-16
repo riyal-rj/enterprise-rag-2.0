@@ -62,7 +62,19 @@ class AdminController:
         return self._policy_ingestion_service.list_policies()
 
     def upload_policy(self, filename: str, content: bytes, actor: str) -> PolicyUploadResponse:
+        """Ingest ``filename`` and, if it succeeded, bump ``corpus_version``
+        and clear both cache layers.
+
+        Without this, ``RAGService``'s exact-match cache key and the
+        semantic-cache's Qdrant pointers don't fold in ``corpus_version``
+        at all, so a replaced policy's stale pre-upload answers would keep
+        being served from Redis (and from semantic pointers resolving back
+        to those same Redis entries) until they happen to expire on their
+        own TTL - the operations panel would show the new corpus version
+        while the runtime kept answering from the old one.
+        """
         response = self._policy_ingestion_service.ingest(filename, content)
         if self._rag_ops_repository is not None:
             self._rag_ops_repository.bump_corpus_version(actor=actor, source=filename)
+            self.cache_clear()
         return response

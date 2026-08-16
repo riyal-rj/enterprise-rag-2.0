@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.deps import get_db_pool
+from app.api.rag_ops_sync import RagOpsConfigPoller
 from app.api.routes.admin_routes import router as admin_router
 from app.api.routes.auth_routes import router as auth_router
 from app.api.routes.chat_routes import router as chat_router
@@ -20,9 +21,16 @@ from app.core.exception_handlers import register_exception_handlers
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     get_settings()  # fail fast on invalid/missing config at startup
-    yield
-    if get_db_pool.cache_info().currsize:
-        get_db_pool().close()
+    # Keeps this worker's RAG ops config in sync with config changes made
+    # via another worker - see app.api.rag_ops_sync.
+    poller = RagOpsConfigPoller()
+    poller.start()
+    try:
+        yield
+    finally:
+        await poller.stop()
+        if get_db_pool.cache_info().currsize:
+            get_db_pool().close()
 
 
 def create_app() -> FastAPI:

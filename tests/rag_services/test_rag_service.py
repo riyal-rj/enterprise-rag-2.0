@@ -203,6 +203,14 @@ class _FakeSemanticQueryCache:
             raise RuntimeError("boom")
 
 
+class _FakeMetricsRecorder:
+    def __init__(self) -> None:
+        self.semantic_lookup_calls: list[bool] = []
+
+    def record_semantic_cache_lookup(self, *, hit: bool) -> None:
+        self.semantic_lookup_calls.append(hit)
+
+
 def _service(
     results: list[RetrievedChunk] | None = None,
     answer: str = "the answer",
@@ -681,6 +689,7 @@ def _service_with_semantic_cache(
     semantic_cache: _FakeSemanticQueryCache,
     semantic_cache_enabled: bool = True,
     llm_client: _FakeLLMClient | None = None,
+    metrics: _FakeMetricsRecorder | None = None,
 ) -> tuple[RAGService, _FakeLLMClient]:
     vector_repository = _FakeVectorRepository(results)
     llm_client = llm_client or _FakeLLMClient()
@@ -695,6 +704,7 @@ def _service_with_semantic_cache(
         default_retrieval_mode=dense_strategy.name,
         semantic_cache=cast(SemanticQueryCache, semantic_cache),
         semantic_cache_enabled=semantic_cache_enabled,
+        metrics=metrics,
     )
     return service, llm_client
 
@@ -781,6 +791,59 @@ def test_semantic_cache_all_candidates_stale_falls_through_to_fresh_generation()
 
     assert len(llm_client.calls) == 1
     assert response.cache_hit is False
+
+
+def test_semantic_cache_confirmed_hit_records_a_metrics_hit() -> None:
+    semantic_cache = _FakeSemanticQueryCache()
+    metrics = _FakeMetricsRecorder()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, _ = _service_with_semantic_cache(
+        chunks,
+        semantic_cache=semantic_cache,
+        llm_client=_FakeLLMClient("first answer"),
+        metrics=metrics,
+    )
+
+    service.answer("q1", top_k=3)
+    semantic_cache.candidate_keys = [semantic_cache.record_calls[0]["cache_key"]]
+    service.answer("q2", top_k=3)
+
+    # First call: no candidates yet -> miss. Second call: a confirmed live
+    # candidate -> hit.
+    assert metrics.semantic_lookup_calls == [False, True]
+
+
+def test_semantic_cache_stale_candidate_records_a_metrics_miss_not_a_hit() -> None:
+    """Regression: Qdrant returning a similarity-clearing candidate is not
+    the same as a confirmed cache hit - if the candidate's Redis entry has
+    expired, the outcome is a miss (the request still falls through to a
+    fresh LLM generation), and the metric must reflect that, not the raw
+    "Qdrant found something" signal."""
+    semantic_cache = _FakeSemanticQueryCache(candidate_keys=["never-cached-a", "never-cached-b"])
+    metrics = _FakeMetricsRecorder()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, llm_client = _service_with_semantic_cache(
+        chunks, semantic_cache=semantic_cache, metrics=metrics
+    )
+
+    response = service.answer("q", top_k=3)
+
+    assert len(llm_client.calls) == 1
+    assert response.cache_hit is False
+    assert metrics.semantic_lookup_calls == [False]
+
+
+def test_semantic_cache_disabled_never_records_metrics() -> None:
+    semantic_cache = _FakeSemanticQueryCache()
+    metrics = _FakeMetricsRecorder()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    service, _ = _service_with_semantic_cache(
+        chunks, semantic_cache=semantic_cache, semantic_cache_enabled=False, metrics=metrics
+    )
+
+    service.answer("q", top_k=3)
+
+    assert metrics.semantic_lookup_calls == []
 
 
 def test_semantic_cache_is_skipped_for_strategies_without_dense_embedding() -> None:

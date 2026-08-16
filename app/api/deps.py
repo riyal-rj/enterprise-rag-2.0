@@ -246,19 +246,21 @@ def get_dynamic_reranker() -> DynamicReranker:
 
 @lru_cache(maxsize=1)
 def get_semantic_query_cache() -> SemanticQueryCache:
-    """Process-wide paraphrase-aware query cache (its own Qdrant
-    collection, ensured to exist at construction time - same lazy-singleton
-    shape as ``get_vector_repository``). ``similarity_threshold`` seeds
-    from the centralized RAG ops config (not ``RAGFeatureSettings``
-    directly) so an admin's threshold change - pushed via
-    ``set_similarity_threshold`` - is live without a restart."""
+    """Process-wide paraphrase-aware query cache (lazy-singleton shape as
+    ``get_vector_repository``, but its Qdrant collection is only ensured to
+    exist on first real use, not at construction time - see
+    ``QdrantSemanticQueryCache``'s docstring - since this is always
+    constructed regardless of whether semantic caching is currently
+    enabled). ``similarity_threshold`` seeds from the centralized RAG ops
+    config (not ``RAGFeatureSettings`` directly) so an admin's threshold
+    change - pushed via ``set_similarity_threshold`` - is live without a
+    restart."""
     settings = get_settings().rag
     config = get_rag_ops_repository().get_config()
     return QdrantSemanticQueryCache(
         client=get_qdrant_client(),
         collection_name=settings.semantic_cache_collection,
         similarity_threshold=config.semantic_cache_threshold,
-        metrics=get_rag_metrics_service(),
     )
 
 
@@ -303,6 +305,7 @@ def get_rag_service() -> RAGService:
         reranking_enabled=config.reranking_enabled and not config.emergency_disabled,
         semantic_cache=get_semantic_query_cache(),
         semantic_cache_enabled=config.semantic_cache_enabled and not config.emergency_disabled,
+        metrics=get_rag_metrics_service(),
     )
 
 

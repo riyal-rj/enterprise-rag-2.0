@@ -68,10 +68,24 @@ def _cache(client: _FakeQdrantClient, *, threshold: float = 0.95) -> QdrantSeman
     )
 
 
-def test_construction_creates_the_collection_and_payload_indexes_if_missing() -> None:
+def test_construction_does_not_touch_qdrant_at_all() -> None:
+    """Regression: the collection must not be ensured at construction time -
+    ``get_rag_service``/``get_semantic_query_cache`` always build this class
+    regardless of whether semantic caching is enabled, so a disabled
+    deployment must not depend on Qdrant just to boot."""
     client = _FakeQdrantClient()
 
     _cache(client)
+
+    assert client.created_collections == []
+    assert client.created_payload_indexes == []
+
+
+def test_first_find_candidates_call_creates_the_collection_and_payload_indexes_if_missing() -> None:
+    client = _FakeQdrantClient()
+    cache = _cache(client)
+
+    cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
     assert len(client.created_collections) == 1
     assert client.created_collections[0]["collection_name"] == "rag_query_cache"
@@ -79,13 +93,24 @@ def test_construction_creates_the_collection_and_payload_indexes_if_missing() ->
     assert indexed_fields == {"cache_namespace", "top_k"}
 
 
-def test_construction_does_not_recreate_an_existing_collection() -> None:
+def test_first_use_does_not_recreate_an_existing_collection() -> None:
     client = _FakeQdrantClient(existing_collections=["rag_query_cache"])
+    cache = _cache(client)
 
-    _cache(client)
+    cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
 
     assert client.created_collections == []
     assert client.created_payload_indexes == []
+
+
+def test_collection_is_only_ensured_once_across_multiple_calls() -> None:
+    client = _FakeQdrantClient()
+    cache = _cache(client)
+
+    cache.find_candidates(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5)
+    cache.record(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, cache_key="k")
+
+    assert len(client.created_collections) == 1
 
 
 def test_constructor_rejects_threshold_outside_zero_to_one() -> None:

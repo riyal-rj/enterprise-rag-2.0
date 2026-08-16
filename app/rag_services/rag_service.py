@@ -21,6 +21,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Mapping
+from typing import Protocol
 
 from app.core.exceptions import HybridRetrievalDisabledError
 from app.core.llm.chat_client import LLMClient
@@ -40,6 +41,18 @@ from app.schemas.chat import (
 from app.services.query_cache_service import CacheTier, QueryCacheService
 
 logger = logging.getLogger(__name__)
+
+
+class _SemanticCacheMetricsRecorder(Protocol):
+    """Narrow collaborator - satisfied by ``app.services.rag_metrics_service.RagMetricsService``
+    without this module needing to import it. Recording lives here, not in
+    ``QdrantSemanticQueryCache.find_candidates``, because only this class
+    knows the *confirmed* outcome: whether a candidate's exact-match Redis
+    entry actually still exists, not just whether Qdrant found a
+    similarity-clearing embedding match (see ``_check_semantic_cache``)."""
+
+    def record_semantic_cache_lookup(self, *, hit: bool) -> None: ...
+
 
 _SYSTEM_PROMPT = """
 You are an enterprise banking-policy RAG assistant. Answer exclusively from the supplied policy context.
@@ -134,6 +147,7 @@ class RAGService:
         reranking_enabled: bool = False,
         semantic_cache: SemanticQueryCache | None = None,
         semantic_cache_enabled: bool = False,
+        metrics: _SemanticCacheMetricsRecorder | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -162,6 +176,7 @@ class RAGService:
         self._reranking_enabled = reranking_enabled
         self._semantic_cache = semantic_cache
         self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
+        self._metrics = metrics
 
     def set_reranking_enabled(self, enabled: bool) -> None:
         """Live-toggle the instance-level reranking default (see
@@ -232,15 +247,9 @@ class RAGService:
         )
 
         if self._semantic_cache_enabled and query_embedding is not None:
-            for candidate_key in self._find_semantic_cache_candidates(
-                query_embedding, cache_namespace, top_k
-            ):
-                cached = self._get_cached(candidate_key)
-                if cached is not None:
-                    return cached.model_copy(update={"cache_hit": True})
-                # This candidate's answer expired/was cleared from Redis
-                # since it was indexed - try the next-nearest match rather
-                # than immediately falling through to a fresh generation.
+            semantic_hit = self._check_semantic_cache(query_embedding, cache_namespace, top_k)
+            if semantic_hit is not None:
+                return semantic_hit.model_copy(update={"cache_hit": True})
 
         chunks = strategy.retrieve(
             query_text=question,
@@ -414,6 +423,30 @@ class RAGService:
         except Exception as exc:  # noqa: BLE001 - cache is an optimization, not a correctness requirement
             logger.warning("rag.cache_write_failed", extra={"error": str(exc)})
             return False
+
+    def _check_semantic_cache(
+        self, query_embedding: list[float], cache_namespace: str, top_k: int
+    ) -> ChatResponse | None:
+        """Try each semantic-cache candidate, nearest-first, until one's
+        exact-match Redis entry is confirmed still live. Records the
+        semantic-cache hit-rate metric exactly once per call, using that
+        *confirmed* outcome - not whether Qdrant merely returned a
+        similarity-clearing candidate, which can still be a stale pointer
+        (see ``QdrantSemanticQueryCache.find_candidates``)."""
+        hit: ChatResponse | None = None
+        for candidate_key in self._find_semantic_cache_candidates(
+            query_embedding, cache_namespace, top_k
+        ):
+            cached = self._get_cached(candidate_key)
+            if cached is not None:
+                hit = cached
+                break
+            # This candidate's answer expired/was cleared from Redis
+            # since it was indexed - try the next-nearest match rather
+            # than immediately falling through to a fresh generation.
+        if self._metrics is not None:
+            self._metrics.record_semantic_cache_lookup(hit=hit is not None)
+        return hit
 
     def _find_semantic_cache_candidates(
         self, query_embedding: list[float], cache_namespace: str, top_k: int

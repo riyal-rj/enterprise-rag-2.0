@@ -5,10 +5,21 @@ Every mutating method both persists to the centralized config store
 (``RagOpsRepository`` - Postgres-backed, survives a restart) and pushes the
 new value into the live singletons (``RAGService``, ``DynamicReranker``,
 ``SemanticQueryCache``) so the change takes effect on the very next request
-with no process restart or settings reload - see
-``app.rag_services.dynamic_reranker``'s module docstring for why mutating
-those singletons in place (rather than rebuilding them from a config
-snapshot) is the mechanism that makes that possible.
+*on the worker that handled the admin request* with no process restart or
+settings reload - see ``app.rag_services.dynamic_reranker``'s module
+docstring for why mutating those singletons in place (rather than
+rebuilding them from a config snapshot) is the mechanism that makes that
+possible.
+
+Under multiple Uvicorn/Gunicorn workers, every *other* worker's singletons
+are untouched by that push - they keep serving whatever config they last
+observed until they happen to handle an admin request themselves (or
+restart). ``app.api.rag_ops_sync.RagOpsConfigPoller`` closes that gap: each
+worker runs its own background task that periodically re-reads the config
+row and applies it via :func:`apply_rag_ops_config` below - the same
+function this controller's ``_apply`` uses - so a config change (in
+particular the emergency kill switch) reaches every worker within one poll
+interval instead of only the worker an admin happened to hit.
 """
 
 from __future__ import annotations
@@ -30,6 +41,34 @@ from app.schemas.rag_ops import (
     SemanticCacheMetrics,
 )
 from app.services.rag_metrics_service import RagMetricsService
+
+
+def apply_rag_ops_config(
+    config: RagOpsConfig,
+    *,
+    rag_service: RAGService,
+    reranker: DynamicReranker,
+    semantic_query_cache: SemanticQueryCache,
+) -> None:
+    """Push ``config`` into every live singleton that needs to observe it
+    immediately. Emergency disable forces reranking and semantic caching
+    off regardless of their individually stored "enabled" flags - it's
+    meant to revert to the safe baseline retrieve-then-generate pipeline,
+    not just gate the reranker.
+
+    Shared by :meth:`RagOpsController._apply` (the worker that handled the
+    admin request) and ``app.api.rag_ops_sync.RagOpsConfigPoller`` (every
+    other worker, on its next poll tick) so both apply a config change
+    identically - see module docstring.
+    """
+    rag_service.set_reranking_enabled(config.reranking_enabled and not config.emergency_disabled)
+    rag_service.set_semantic_cache_enabled(
+        config.semantic_cache_enabled and not config.emergency_disabled
+    )
+    reranker.set_backend(config.reranker_backend)  # type: ignore[arg-type]
+    reranker.set_rollout_percentage(config.reranker_rollout_percentage)
+    reranker.set_emergency_disabled(config.emergency_disabled)
+    semantic_query_cache.set_similarity_threshold(config.semantic_cache_threshold)
 
 
 class RagOpsController:
@@ -103,22 +142,15 @@ class RagOpsController:
         )
 
     def _apply(self, config: RagOpsConfig) -> None:
-        """Push the newly-persisted config into every live singleton that
-        needs to observe it immediately (see module docstring). Emergency
-        disable forces reranking and semantic caching off regardless of
-        their individually stored "enabled" flags - it's meant to revert
-        to the safe baseline retrieve-then-generate pipeline, not just gate
-        the reranker."""
-        self._rag_service.set_reranking_enabled(
-            config.reranking_enabled and not config.emergency_disabled
+        """Push the newly-persisted config into this worker's live
+        singletons immediately (see module docstring for the cross-worker
+        story)."""
+        apply_rag_ops_config(
+            config,
+            rag_service=self._rag_service,
+            reranker=self._reranker,
+            semantic_query_cache=self._semantic_query_cache,
         )
-        self._rag_service.set_semantic_cache_enabled(
-            config.semantic_cache_enabled and not config.emergency_disabled
-        )
-        self._reranker.set_backend(config.reranker_backend)  # type: ignore[arg-type]
-        self._reranker.set_rollout_percentage(config.reranker_rollout_percentage)
-        self._reranker.set_emergency_disabled(config.emergency_disabled)
-        self._semantic_query_cache.set_similarity_threshold(config.semantic_cache_threshold)
 
     def _to_status(self, config: RagOpsConfig) -> RagOpsStatusResponse:
         rerank_snapshot = self._metrics.rerank_stats()
