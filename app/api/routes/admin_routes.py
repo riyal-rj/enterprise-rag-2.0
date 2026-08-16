@@ -51,7 +51,7 @@ def list_policies(
 @router.post("/policies", response_model=PolicyUploadResponse)
 def upload_policy(
     file: UploadFile = File(...),
-    _: AuthenticatedUser = Depends(require_admin),
+    user: AuthenticatedUser = Depends(require_admin),
     controller: AdminController = Depends(get_admin_controller),
 ) -> PolicyUploadResponse:
     """Chunk, embed, and store an uploaded policy document. Admin-only.
@@ -62,4 +62,4 @@ def upload_policy(
     stall the event loop.
     """
     content = file.file.read()
-    return controller.upload_policy(file.filename or "", content)
+    return controller.upload_policy(file.filename or "", content, user.username)

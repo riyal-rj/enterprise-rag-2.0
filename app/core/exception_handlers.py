@@ -18,6 +18,7 @@ from app.core.exceptions import (
     FileTooLargeError,
     HybridRetrievalDisabledError,
     InvalidCredentialsError,
+    InvalidRagOpsConfigError,
     InvalidTokenError,
     PermissionDeniedError,
     RateLimitExceededError,
@@ -35,6 +36,7 @@ _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     FileTooLargeError: status.HTTP_413_CONTENT_TOO_LARGE,
     ConversationNotFoundError: status.HTTP_404_NOT_FOUND,
     HybridRetrievalDisabledError: status.HTTP_400_BAD_REQUEST,
+    InvalidRagOpsConfigError: status.HTTP_400_BAD_REQUEST,
 }
 
 

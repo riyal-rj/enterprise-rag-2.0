@@ -163,6 +163,20 @@ class RAGService:
         self._semantic_cache = semantic_cache
         self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
 
+    def set_reranking_enabled(self, enabled: bool) -> None:
+        """Live-toggle the instance-level reranking default (see
+        ``__init__``'s ``reranking_enabled``) by mutating this
+        already-constructed (``lru_cache``'d) singleton in place, so an
+        admin's RAG Operations panel change reaches the very next request
+        without a process restart. See ``app.controllers.rag_ops_controller``."""
+        self._reranking_enabled = enabled
+
+    def set_semantic_cache_enabled(self, enabled: bool) -> None:
+        """Same live-toggle as :meth:`set_reranking_enabled`, for the
+        semantic (paraphrase) cache. Still gated on a real cache instance
+        having been supplied at construction time, same as ``__init__``."""
+        self._semantic_cache_enabled = enabled and self._semantic_cache is not None
+
     def answer(
         self,
         question: str,

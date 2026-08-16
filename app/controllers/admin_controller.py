@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.repositories.rag_ops_repository import RagOpsRepository
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.cache import CacheClearResponse, CacheStatsResponse, CacheTierStats
 from app.schemas.health import HealthCheckResponse
@@ -28,11 +29,13 @@ class AdminController:
         query_cache: QueryCacheService,
         policy_ingestion_service: PolicyIngestionService,
         semantic_query_cache: SemanticQueryCache | None = None,
+        rag_ops_repository: RagOpsRepository | None = None,
     ) -> None:
         self._health_check_service = health_check_service
         self._query_cache = query_cache
         self._policy_ingestion_service = policy_ingestion_service
         self._semantic_query_cache = semantic_query_cache
+        self._rag_ops_repository = rag_ops_repository
 
     async def health(self) -> HealthCheckResponse:
         results = await self._health_check_service.run()
@@ -51,10 +54,15 @@ class AdminController:
         cleared = self._query_cache.clear()
         if self._semantic_query_cache is not None:
             cleared["semantic"] = self._semantic_query_cache.clear()
+        if self._rag_ops_repository is not None:
+            self._rag_ops_repository.record_cache_invalidation()
         return CacheClearResponse(status="ok", cleared=cleared)
 
     def list_policies(self) -> PolicyListResponse:
         return self._policy_ingestion_service.list_policies()
 
-    def upload_policy(self, filename: str, content: bytes) -> PolicyUploadResponse:
-        return self._policy_ingestion_service.ingest(filename, content)
+    def upload_policy(self, filename: str, content: bytes, actor: str) -> PolicyUploadResponse:
+        response = self._policy_ingestion_service.ingest(filename, content)
+        if self._rag_ops_repository is not None:
+            self._rag_ops_repository.bump_corpus_version(actor=actor, source=filename)
+        return response

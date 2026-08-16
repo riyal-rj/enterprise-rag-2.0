@@ -91,6 +91,15 @@ class ConversationNotFoundError(AppError):
         self.conversation_id = conversation_id
 
 
+class InvalidRagOpsConfigError(AppError):
+    """Raised when a RAG Operations panel config change would put the
+    pipeline in an invalid state (e.g. switching to the Voyage reranker
+    backend with no API key configured for this deployment)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class HybridRetrievalDisabledError(AppError):
     """Raised when a request asks for a retrieval mode the rollout flag
     (``RAGFeatureSettings.hybrid_search_enabled``) currently disallows.

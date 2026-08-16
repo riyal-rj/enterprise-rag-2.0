@@ -48,6 +48,14 @@ _VECTOR_SIZE = 1536
 _CANDIDATE_LIMIT = 5
 
 
+class _LookupMetricsRecorder(Protocol):
+    """Narrow collaborator - satisfied by ``app.services.rag_metrics_service.RagMetricsService``
+    without this module needing to import it (avoids a repository -> service
+    layering dependency for what's really just an optional counter hook)."""
+
+    def record_semantic_cache_lookup(self, *, hit: bool) -> None: ...
+
+
 class SemanticQueryCache(Protocol):
     """Paraphrase-aware cache lookup: previously-answered questions by
     embedding similarity, within the same retrieval-mode/reranker/top_k
@@ -82,6 +90,13 @@ class SemanticQueryCache(Protocol):
         """
         ...
 
+    def set_similarity_threshold(self, threshold: float) -> None:
+        """Live-update the match threshold - lets an admin's RAG
+        Operations panel change take effect on the very next lookup
+        without rebuilding this (``lru_cache``'d) singleton. See
+        ``app.controllers.rag_ops_controller``."""
+        ...
+
 
 class QdrantSemanticQueryCache:
     """:class:`SemanticQueryCache` backed by a dedicated Qdrant collection.
@@ -97,13 +112,20 @@ class QdrantSemanticQueryCache:
         client: QdrantClient,
         collection_name: str,
         similarity_threshold: float,
+        metrics: _LookupMetricsRecorder | None = None,
     ) -> None:
         if not 0.0 <= similarity_threshold <= 1.0:
             raise ValueError("similarity_threshold must be between 0.0 and 1.0")
         self._client = client
         self._collection_name = collection_name
         self._similarity_threshold = similarity_threshold
+        self._metrics = metrics
         self._ensure_collection()
+
+    def set_similarity_threshold(self, threshold: float) -> None:
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
+        self._similarity_threshold = threshold
 
     def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
@@ -124,6 +146,15 @@ class QdrantSemanticQueryCache:
             cache_key = payload.get("cache_key")
             if cache_key is not None:
                 candidates.append(str(cache_key))
+
+        # "Hit" here means the embedding search found a clearing match, not
+        # that the exact-match Redis entry it points at is confirmed still
+        # live (RAGService tries each candidate and falls through on a
+        # stale one) - a reasonable, much cheaper proxy for the panel's
+        # semantic-cache hit rate that doesn't require wiring this
+        # repository's caller back into the metrics service too.
+        if self._metrics is not None:
+            self._metrics.record_semantic_cache_lookup(hit=bool(candidates))
         return candidates
 
     def record(
