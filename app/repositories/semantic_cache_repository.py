@@ -34,6 +34,8 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
+
 # Must match the output dimensionality of LLMSettings.embedding_model
 # (text-embedding-3-small) - same invariant as
 # app.repositories.vector_repository._VECTOR_SIZE, since both index the
@@ -83,13 +85,6 @@ class SemanticQueryCache(Protocol):
         """
         ...
 
-    def set_similarity_threshold(self, threshold: float) -> None:
-        """Live-update the match threshold - lets an admin's RAG
-        Operations panel change take effect on the very next lookup
-        without rebuilding this (``lru_cache``'d) singleton. See
-        ``app.controllers.rag_ops_controller``."""
-        ...
-
 
 class QdrantSemanticQueryCache:
     """:class:`SemanticQueryCache` backed by a dedicated Qdrant collection.
@@ -106,31 +101,31 @@ class QdrantSemanticQueryCache:
     it on later without a cold-construction cost) - eagerly ensuring the
     Qdrant collection in ``__init__`` would reintroduce a hard Qdrant
     dependency for deployments that keep semantic caching disabled.
+
+    ``similarity_threshold`` is read from a shared ``RagRuntimeConfigStore``
+    (see ``app.rag_services.rag_runtime_config``) instead of an independently
+    mutable instance field, so an admin's threshold change is applied via
+    the exact same atomic snapshot swap ``RAGService``/``DynamicReranker``
+    observe - not a fourth, separately-timed mutation.
     """
 
     def __init__(
         self,
         client: QdrantClient,
         collection_name: str,
-        similarity_threshold: float,
+        config_store: RagRuntimeConfigStore,
     ) -> None:
-        if not 0.0 <= similarity_threshold <= 1.0:
-            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
         self._client = client
         self._collection_name = collection_name
-        self._similarity_threshold = similarity_threshold
+        self._config_store = config_store
         self._collection_ready = False
         self._collection_ready_lock = threading.Lock()
-
-    def set_similarity_threshold(self, threshold: float) -> None:
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
-        self._similarity_threshold = threshold
 
     def find_candidates(
         self, *, query_embedding: list[float], cache_namespace: str, top_k: int
     ) -> list[str]:
         self._ensure_collection_ready()
+        similarity_threshold = self._config_store.current.semantic_cache_threshold
         results = self._client.query_points(
             collection_name=self._collection_name,
             query=query_embedding,
@@ -141,7 +136,7 @@ class QdrantSemanticQueryCache:
 
         candidates: list[str] = []
         for point in results:
-            if point.score < self._similarity_threshold:
+            if point.score < similarity_threshold:
                 break  # results are score-sorted descending; nothing after this clears it either
             payload = point.payload or {}
             cache_key = payload.get("cache_key")

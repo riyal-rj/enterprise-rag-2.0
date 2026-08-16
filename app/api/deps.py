@@ -37,6 +37,7 @@ from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRate
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
 from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
 from app.rag_services.dynamic_reranker import DynamicReranker
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
 from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker
 from app.rag_services.retrieval_strategy import (
@@ -218,6 +219,29 @@ def get_reranker() -> ReRanker:
 
 
 @lru_cache(maxsize=1)
+def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
+    """Process-wide, atomically-swapped snapshot of the admin-mutable RAG
+    Ops fields (see ``app.rag_services.rag_runtime_config``) - the single
+    shared source ``get_rag_service``/``get_dynamic_reranker``/
+    ``get_semantic_query_cache`` all read from below, so an admin's config
+    update (or ``RagOpsConfigPoller``'s cross-worker sync - see
+    ``app.api.rag_ops_sync``) is applied to all three in one atomic swap
+    instead of via each object's own independently-timed mutations."""
+    config = get_rag_ops_repository().get_config()
+    return RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=config.reranking_enabled and not config.emergency_disabled,
+            reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
+            reranker_rollout_percentage=config.reranker_rollout_percentage,
+            reranker_emergency_disabled=config.emergency_disabled,
+            semantic_cache_enabled=config.semantic_cache_enabled and not config.emergency_disabled,
+            semantic_cache_threshold=config.semantic_cache_threshold,
+            corpus_version=config.corpus_version,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
 def get_dynamic_reranker() -> DynamicReranker:
     """The reranker that actually serves real ``/chat`` traffic - admin-
     mutable (backend/rollout%/emergency-disable) via the RAG Operations
@@ -226,7 +250,6 @@ def get_dynamic_reranker() -> DynamicReranker:
     an admin can flip ``reranker_backend`` at any time without a cold
     construction cost on the next request."""
     settings = get_settings().rag
-    config = get_rag_ops_repository().get_config()
     local: ReRanker = LocalCrossEncoderReranker(model_name=settings.reranker_model)
     voyage: ReRanker | None = None
     if settings.voyage_api_key.get_secret_value():
@@ -238,9 +261,7 @@ def get_dynamic_reranker() -> DynamicReranker:
         local=local,
         voyage=voyage,
         metrics=get_rag_metrics_service(),
-        backend=config.reranker_backend,  # type: ignore[arg-type]
-        rollout_percentage=config.reranker_rollout_percentage,
-        emergency_disabled=config.emergency_disabled,
+        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -251,16 +272,14 @@ def get_semantic_query_cache() -> SemanticQueryCache:
     exist on first real use, not at construction time - see
     ``QdrantSemanticQueryCache``'s docstring - since this is always
     constructed regardless of whether semantic caching is currently
-    enabled). ``similarity_threshold`` seeds from the centralized RAG ops
-    config (not ``RAGFeatureSettings`` directly) so an admin's threshold
-    change - pushed via ``set_similarity_threshold`` - is live without a
-    restart."""
+    enabled). ``similarity_threshold`` is read live from the shared
+    ``RagRuntimeConfigStore`` (not ``RAGFeatureSettings`` directly), so an
+    admin's threshold change is live without a restart."""
     settings = get_settings().rag
-    config = get_rag_ops_repository().get_config()
     return QdrantSemanticQueryCache(
         client=get_qdrant_client(),
         collection_name=settings.semantic_cache_collection,
-        similarity_threshold=config.semantic_cache_threshold,
+        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -284,15 +303,15 @@ def get_allowed_retrieval_modes() -> frozenset[str]:
 def get_rag_service() -> RAGService:
     """The RAGService that serves real ``/chat`` traffic.
 
-    ``reranking_enabled``/``semantic_cache_enabled`` seed from the
-    centralized RAG ops config, not ``RAGFeatureSettings`` directly - and
-    the semantic cache instance is always passed in (regardless of whether
-    it starts enabled), since an admin can flip ``semantic_cache_enabled``
-    on later via ``RAGService.set_semantic_cache_enabled``, which is a
-    no-op unless a real cache was supplied at construction time.
+    ``reranking_enabled``/``semantic_cache_enabled``/``corpus_version`` are
+    read live from the shared ``RagRuntimeConfigStore`` (not
+    ``RAGFeatureSettings`` directly) - and the semantic cache instance is
+    always passed in (regardless of whether it starts enabled), since an
+    admin can flip ``semantic_cache_enabled`` on later via that same store,
+    which ``RAGService.answer`` additionally gates on a real cache instance
+    having been supplied here at construction time.
     """
     settings = get_settings().rag
-    config = get_rag_ops_repository().get_config()
     return RAGService(
         embedding_client=get_embedding_client(),
         retrieval_strategies=get_retrieval_strategies(),
@@ -302,10 +321,9 @@ def get_rag_service() -> RAGService:
         allowed_retrieval_modes=get_allowed_retrieval_modes(),
         reranker=get_dynamic_reranker(),
         reranker_initial_top_k=settings.reranker_initial_top_k,
-        reranking_enabled=config.reranking_enabled and not config.emergency_disabled,
         semantic_cache=get_semantic_query_cache(),
-        semantic_cache_enabled=config.semantic_cache_enabled and not config.emergency_disabled,
         metrics=get_rag_metrics_service(),
+        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -450,9 +468,8 @@ def get_admin_controller(
 
 def get_rag_ops_controller(
     repository: RagOpsRepository = Depends(get_rag_ops_repository),
-    rag_service: RAGService = Depends(get_rag_service),
+    config_store: RagRuntimeConfigStore = Depends(get_rag_runtime_config_store),
     reranker: DynamicReranker = Depends(get_dynamic_reranker),
-    semantic_query_cache: SemanticQueryCache = Depends(get_semantic_query_cache),
     metrics: RagMetricsService = Depends(get_rag_metrics_service),
 ) -> RagOpsController:
-    return RagOpsController(repository, rag_service, reranker, semantic_query_cache, metrics)
+    return RagOpsController(repository, config_store, reranker, metrics)

@@ -7,6 +7,7 @@ from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.cache import CacheClearResponse, CacheStatsResponse, CacheTierStats
 from app.schemas.health import HealthCheckResponse
 from app.schemas.policy import PolicyListResponse, PolicyUploadResponse
+from app.services.corpus_cache_invalidation_service import invalidate_corpus_caches
 from app.services.health_checks import HealthCheckService
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import CacheTier, QueryCacheService
@@ -63,18 +64,24 @@ class AdminController:
 
     def upload_policy(self, filename: str, content: bytes, actor: str) -> PolicyUploadResponse:
         """Ingest ``filename`` and, if it succeeded, bump ``corpus_version``
-        and clear both cache layers.
+        and invalidate the RAG-answer caches (see
+        ``app.services.corpus_cache_invalidation_service`` - targeted, not
+        the full ``cache_clear()`` wipe: an unrelated embedding/SQL/intent
+        cold start isn't warranted by a policy upload).
 
-        Without this, ``RAGService``'s exact-match cache key and the
-        semantic-cache's Qdrant pointers don't fold in ``corpus_version``
-        at all, so a replaced policy's stale pre-upload answers would keep
-        being served from Redis (and from semantic pointers resolving back
-        to those same Redis entries) until they happen to expire on their
-        own TTL - the operations panel would show the new corpus version
-        while the runtime kept answering from the old one.
+        Without this, a replaced policy's stale pre-upload answers would
+        keep being served from Redis (and from semantic pointers resolving
+        back to those same Redis entries) until they happen to expire on
+        their own TTL - the operations panel would show the new corpus
+        version while the runtime kept answering from the old one.
         """
         response = self._policy_ingestion_service.ingest(filename, content)
         if self._rag_ops_repository is not None:
-            self._rag_ops_repository.bump_corpus_version(actor=actor, source=filename)
-            self.cache_clear()
+            invalidate_corpus_caches(
+                rag_ops_repository=self._rag_ops_repository,
+                query_cache=self._query_cache,
+                semantic_query_cache=self._semantic_query_cache,
+                actor=actor,
+                source=filename,
+            )
         return response

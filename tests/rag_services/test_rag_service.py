@@ -14,6 +14,7 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
 from app.rag_services.reranker import ReRankedChunk, ReRankOutcome
 from app.rag_services.retrieval_strategy import (
@@ -732,10 +733,10 @@ def test_semantic_cache_miss_generates_normally_and_records_afterwards() -> None
     assert len(llm_client.calls) == 1
     assert response.cache_hit is False
     assert len(semantic_cache.find_candidates_calls) == 1
-    assert semantic_cache.find_candidates_calls[0]["cache_namespace"] == "dense:v1"
+    assert semantic_cache.find_candidates_calls[0]["cache_namespace"] == "dense:v1:corpus=1"
     assert semantic_cache.find_candidates_calls[0]["top_k"] == 3
     assert len(semantic_cache.record_calls) == 1
-    assert semantic_cache.record_calls[0]["cache_namespace"] == "dense:v1"
+    assert semantic_cache.record_calls[0]["cache_namespace"] == "dense:v1:corpus=1"
     assert semantic_cache.record_calls[0]["top_k"] == 3
 
 
@@ -933,7 +934,7 @@ def test_semantic_cache_partitions_by_reranking_cache_namespace() -> None:
 
     service.answer("q", top_k=3)
 
-    expected_namespace = "dense:v1:reranker:my-reranker:v1:candidates=20"
+    expected_namespace = "dense:v1:corpus=1:reranker:my-reranker:v1:candidates=20"
     assert semantic_cache.find_candidates_calls[0]["cache_namespace"] == expected_namespace
     assert semantic_cache.record_calls[0]["cache_namespace"] == expected_namespace
 
@@ -1026,6 +1027,64 @@ def test_cache_key_includes_candidate_pool_size_when_reranking_enabled() -> None
     assert narrow_key != wide_key
     assert narrow_response.cache_hit is False
     assert wide_response.cache_hit is False
+
+
+def _config_store(*, corpus_version: int = 1) -> RagRuntimeConfigStore:
+    return RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            reranker_emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=corpus_version,
+        )
+    )
+
+
+def test_corpus_version_bump_makes_a_previously_cached_answer_unreachable() -> None:
+    """Full end-to-end version of the namespace test above: the exact same
+    question, against the exact same cache backend, must regenerate after
+    the shared config_store's corpus_version moves forward - proving a
+    corpus mutation invalidates cached answers even without relying on the
+    explicit Redis clear() succeeding."""
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    shared_cache = QueryCacheService(_InMemoryCacheBackend(), CacheSettings())
+    llm_client = _FakeLLMClient()
+    store = _config_store(corpus_version=1)
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, llm_client),
+        cache=shared_cache,
+        default_retrieval_mode=dense_strategy.name,
+        config_store=store,
+    )
+
+    first = service.answer("q", top_k=1)
+    second = service.answer("q", top_k=1)
+    assert first.cache_hit is False
+    assert second.cache_hit is True  # same corpus_version - normal cache hit
+
+    store.replace(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            reranker_emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=2,
+        )
+    )
+    after_bump = service.answer("q", top_k=1)
+
+    assert after_bump.cache_hit is False
 
 
 def test_per_call_reranking_override_enables_reranking_for_a_single_request() -> None:

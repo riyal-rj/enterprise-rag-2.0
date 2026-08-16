@@ -77,9 +77,11 @@ class _FakeRagOpsRepository:
 class _FakeQueryCacheService:
     def __init__(self) -> None:
         self.clear_calls = 0
+        self.clear_tiers_calls: list[set] = []
 
-    def clear(self) -> dict[str, int]:
+    def clear_tiers(self, tiers: set) -> dict[str, int]:
         self.clear_calls += 1
+        self.clear_tiers_calls.append(tiers)
         return {}
 
 

@@ -10,6 +10,7 @@ Redis here), so the backend can change without touching call sites.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypedDict
@@ -147,9 +148,19 @@ class QueryCacheService:
 
     def clear(self) -> dict[str, int]:
         """Clear every tier's stored entries and reset its counters."""
+        return self.clear_tiers(CacheTier)
+
+    def clear_tiers(self, tiers: Iterable[CacheTier]) -> dict[str, int]:
+        """Clear only ``tiers``' stored entries and reset their counters -
+        narrower than :meth:`clear`, for a caller that knows exactly which
+        tier(s) a change actually invalidates. A corpus change, for
+        instance, only invalidates ``CacheTier.RAG_ANSWER`` - clearing the
+        embedding/SQL-gen/SQL-result/intent tiers too would force an
+        unrelated, unnecessary cold start across the rest of the app (see
+        ``app.services.corpus_cache_invalidation_service``)."""
         cleared: dict[str, int] = {}
         with self._lock:
-            for tier in CacheTier:
+            for tier in tiers:
                 cleared[tier.value] = self._backend.delete_prefix(f"{tier.value}:")
                 self._counters[tier] = _TierCounters()
         return cleared

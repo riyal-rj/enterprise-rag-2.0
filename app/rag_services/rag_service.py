@@ -29,6 +29,7 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.reranker import NoOpReranker, ReRankedChunk, ReRanker
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
@@ -148,6 +149,7 @@ class RAGService:
         semantic_cache: SemanticQueryCache | None = None,
         semantic_cache_enabled: bool = False,
         metrics: _SemanticCacheMetricsRecorder | None = None,
+        config_store: RagRuntimeConfigStore | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -173,24 +175,27 @@ class RAGService:
         self._allowed_retrieval_modes = allowed_retrieval_modes
         self._reranker = reranker or NoOpReranker()
         self._reranker_initial_top_k = reranker_initial_top_k
-        self._reranking_enabled = reranking_enabled
         self._semantic_cache = semantic_cache
-        self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
         self._metrics = metrics
-
-    def set_reranking_enabled(self, enabled: bool) -> None:
-        """Live-toggle the instance-level reranking default (see
-        ``__init__``'s ``reranking_enabled``) by mutating this
-        already-constructed (``lru_cache``'d) singleton in place, so an
-        admin's RAG Operations panel change reaches the very next request
-        without a process restart. See ``app.controllers.rag_ops_controller``."""
-        self._reranking_enabled = enabled
-
-    def set_semantic_cache_enabled(self, enabled: bool) -> None:
-        """Same live-toggle as :meth:`set_reranking_enabled`, for the
-        semantic (paraphrase) cache. Still gated on a real cache instance
-        having been supplied at construction time, same as ``__init__``."""
-        self._semantic_cache_enabled = enabled and self._semantic_cache is not None
+        # A caller that cares about atomic cross-object config application
+        # (app.api.deps.get_rag_service) passes the same config_store this
+        # process's DynamicReranker/QdrantSemanticQueryCache read from (see
+        # app.rag_services.rag_runtime_config). Callers that don't (mostly
+        # tests, and the eval harness's standalone service instance) get a
+        # private store seeded from the reranking_enabled/
+        # semantic_cache_enabled kwargs, preserving the old constructor-arg
+        # ergonomics for a service instance nothing else needs to observe.
+        self._config_store = config_store or RagRuntimeConfigStore(
+            RagRuntimeConfig(
+                reranking_enabled=reranking_enabled,
+                reranker_backend="local",
+                reranker_rollout_percentage=100,
+                reranker_emergency_disabled=False,
+                semantic_cache_enabled=semantic_cache_enabled,
+                semantic_cache_threshold=0.95,
+                corpus_version=1,
+            )
+        )
 
     def answer(
         self,
@@ -202,8 +207,8 @@ class RAGService:
     ) -> ChatResponse:
         """Answer ``question``.
 
-        ``reranking_enabled`` overrides the instance-level default
-        (``self._reranking_enabled``, set from
+        ``reranking_enabled`` overrides the instance-level default (from the
+        config snapshot captured below, seeded from
         ``RAGFeatureSettings.reranking_enabled_by_default`` in production)
         for this call only - ``None`` (the default) defers to the
         instance. This is what lets the eval harness exercise both the
@@ -211,8 +216,14 @@ class RAGService:
         instance/config (see ``app.eval.invokers.ServiceInvoker``) instead
         of needing a second, separately-wired ``RAGService``.
         """
+        # Captured once, up front: reranking_enabled, semantic_cache_enabled
+        # and corpus_version below must all come from the same snapshot, or
+        # an admin's config update landing mid-request could compute a
+        # cache_namespace for one corpus_version while deciding whether to
+        # rerank based on another. See app.rag_services.rag_runtime_config.
+        config = self._config_store.current
         effective_reranking_enabled = (
-            self._reranking_enabled if reranking_enabled is None else reranking_enabled
+            config.reranking_enabled if reranking_enabled is None else reranking_enabled
         )
 
         mode = retrieval_mode or self._default_retrieval_mode
@@ -224,7 +235,15 @@ class RAGService:
             strategy = self._retrieval_strategies[self._default_retrieval_mode]
 
         candidate_top_k = top_k
-        cache_namespace = strategy.cache_namespace
+        # corpus_version is folded in here - not just an audit-trail number
+        # - so a replaced/re-seeded corpus makes every previously-cached
+        # exact-match answer and semantic-cache pointer (both partitioned by
+        # this same cache_namespace) unreachable the moment the version
+        # bumps, even if the explicit Redis/Qdrant clear() calls that
+        # accompany a corpus mutation (see
+        # app.services.corpus_cache_invalidation_service) fail or are
+        # skipped.
+        cache_namespace = f"{strategy.cache_namespace}:corpus={config.corpus_version}"
         if effective_reranking_enabled:
             candidate_top_k = max(top_k, self._reranker_initial_top_k)
             # candidates=N is part of the key, not just top_k/reranker
@@ -246,7 +265,8 @@ class RAGService:
             else None
         )
 
-        if self._semantic_cache_enabled and query_embedding is not None:
+        semantic_cache_enabled = config.semantic_cache_enabled and self._semantic_cache is not None
+        if semantic_cache_enabled and query_embedding is not None:
             semantic_hit = self._check_semantic_cache(query_embedding, cache_namespace, top_k)
             if semantic_hit is not None:
                 return semantic_hit.model_copy(update={"cache_hit": True})
@@ -351,7 +371,7 @@ class RAGService:
         # fallback response at all, exact-match or semantic.
         if not fallback_occurred:
             cache_written = self._set_cached(cache_key, response)
-            if cache_written and self._semantic_cache_enabled and query_embedding is not None:
+            if cache_written and semantic_cache_enabled and query_embedding is not None:
                 self._record_semantic_cache(query_embedding, cache_namespace, top_k, cache_key)
         return response
 

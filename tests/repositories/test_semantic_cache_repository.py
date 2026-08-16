@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import pytest
-
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache
 
 
@@ -60,11 +59,25 @@ class _FakeQdrantClient:
         self._point_count = 0
 
 
+def _config_store(*, threshold: float = 0.95) -> RagRuntimeConfigStore:
+    return RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            reranker_emergency_disabled=False,
+            semantic_cache_enabled=True,
+            semantic_cache_threshold=threshold,
+            corpus_version=1,
+        )
+    )
+
+
 def _cache(client: _FakeQdrantClient, *, threshold: float = 0.95) -> QdrantSemanticQueryCache:
     return QdrantSemanticQueryCache(
         client=client,  # type: ignore[arg-type]
         collection_name="rag_query_cache",
-        similarity_threshold=threshold,
+        config_store=_config_store(threshold=threshold),
     )
 
 
@@ -113,14 +126,41 @@ def test_collection_is_only_ensured_once_across_multiple_calls() -> None:
     assert len(client.created_collections) == 1
 
 
-def test_constructor_rejects_threshold_outside_zero_to_one() -> None:
+def test_find_candidates_reads_the_threshold_live_from_the_shared_store() -> None:
+    """An admin's threshold change (RagOpsController._apply /
+    RagOpsConfigPoller replacing the shared store's snapshot) must take
+    effect on the very next lookup without rebuilding this instance."""
     client = _FakeQdrantClient()
+    client.query_response = _FakeQueryResponse(
+        points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.90)]
+    )
+    store = _config_store(threshold=0.95)
+    cache = QdrantSemanticQueryCache(
+        client=client,
+        collection_name="rag_query_cache",
+        config_store=store,  # type: ignore[arg-type]
+    )
 
-    with pytest.raises(ValueError):
-        _cache(client, threshold=1.5)
+    below_threshold = cache.find_candidates(
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5
+    )
+    store.replace(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            reranker_emergency_disabled=False,
+            semantic_cache_enabled=True,
+            semantic_cache_threshold=0.80,
+            corpus_version=1,
+        )
+    )
+    now_clears_threshold = cache.find_candidates(
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5
+    )
 
-    with pytest.raises(ValueError):
-        _cache(client, threshold=-0.1)
+    assert below_threshold == []
+    assert now_clears_threshold == ["abc"]
 
 
 def test_find_candidates_returns_empty_list_when_no_points_match() -> None:

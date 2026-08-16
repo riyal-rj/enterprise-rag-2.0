@@ -29,6 +29,7 @@ from app.api.deps import (
 from app.core.config import get_settings
 from app.core.ingestion.document_processor import SUPPORTED_SUFFIXES
 from app.repositories.vector_repository import VectorRepository
+from app.services.corpus_cache_invalidation_service import invalidate_corpus_caches
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +98,13 @@ def seed_docs(
     When ``vector_repository`` is left at its default (``None``), this
     writes into the same live collection the running app reads from -
     exactly like ``AdminController.upload_policy``, so on any success it
-    bumps ``corpus_version`` and clears both cache layers the same way
-    (see ``_invalidate_caches_after_seed``), or a freshly (re)seeded
-    corpus would keep serving pre-seed answers out of Redis/the semantic
-    cache. An explicit ``vector_repository`` (``scripts/migrate_qdrant_hybrid.py``
-    staging a not-yet-cut-over collection) skips this - that content isn't
-    visible to the running app yet.
+    invalidates the corpus caches the same way (see
+    ``app.services.corpus_cache_invalidation_service``), or a freshly
+    (re)seeded corpus would keep serving pre-seed answers out of Redis/the
+    semantic cache. An explicit ``vector_repository``
+    (``scripts/migrate_qdrant_hybrid.py`` staging a not-yet-cut-over
+    collection) skips this - that content isn't visible to the running app
+    yet until its own cutover step invalidates caches.
     """
     is_live_collection = vector_repository is None
     processor = get_document_processor()
@@ -156,23 +158,14 @@ def seed_docs(
         sources=frozenset(sources),
     )
     if is_live_collection and succeeded_files > 0:
-        _invalidate_caches_after_seed(report)
+        invalidate_corpus_caches(
+            rag_ops_repository=get_rag_ops_repository(),
+            query_cache=get_query_cache_service(),
+            semantic_query_cache=get_semantic_query_cache(),
+            actor="seed_script",
+            source=f"seed_docs ({succeeded_files} file(s))",
+        )
     return report
-
-
-def _invalidate_caches_after_seed(report: SeedReport) -> None:
-    """Mirrors ``AdminController.upload_policy``'s post-ingest invalidation
-    (see ``app.controllers.admin_controller``): bump ``corpus_version`` and
-    clear both the Redis exact-match cache and the Qdrant semantic-cache
-    pointers, so a freshly (re)seeded corpus can't keep serving answers
-    generated from the documents it just replaced."""
-    rag_ops_repository = get_rag_ops_repository()
-    rag_ops_repository.bump_corpus_version(
-        actor="seed_script", source=f"seed_docs ({report.succeeded_files} file(s))"
-    )
-    get_query_cache_service().clear()
-    get_semantic_query_cache().clear()
-    rag_ops_repository.record_cache_invalidation()
 
 
 if __name__ == "__main__":
