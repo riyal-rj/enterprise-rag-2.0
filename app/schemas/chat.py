@@ -44,6 +44,7 @@ class ResponseMetadata(BaseModel):
 
     route: str
     retrieval_mode:str = "dense"
+    reranked: bool = False
     retrieved_chunks: list[RetrievedChunkPreview]
     flagged_claims: list[str] = Field(default_factory=list)
 

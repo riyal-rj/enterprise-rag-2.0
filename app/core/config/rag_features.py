@@ -22,7 +22,7 @@ class RAGFeatureSettings(EnvBaseSettings):
 
     hyde_num_hypotheses: int = Field(default=3, gt=0)
     hyde_enabled_by_default: bool = Field(default=False)
-    
+
     hybrid_candidate_top_k: int = Field(default=20, gt=0)
     hybrid_search_enabled: bool = Field(default=True)
     rrf_k: int = Field(default=60, gt=0)
@@ -33,6 +33,16 @@ class RAGFeatureSettings(EnvBaseSettings):
     voyage_model: str = Field(default="rerank-2.5")
     reranker_initial_top_k: int = Field(default=20, gt=0)
     reranking_enabled_by_default: bool = Field(default=True)
+
+    # Embedding-similarity ("semantic") cache: matches a new question
+    # against previously-answered paraphrases instead of only exact text,
+    # so two differently-worded questions with the same meaning can still
+    # hit the cache. Conservative default threshold - a false-positive
+    # match would silently serve a subtly wrong policy answer, which
+    # matters more than the extra cache misses a stricter threshold costs.
+    semantic_cache_enabled: bool = Field(default=True)
+    semantic_cache_similarity_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
+    semantic_cache_collection: str = Field(default="rag_query_cache")
 
     crag_relevance_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     crag_ambiguous_threshold: float = Field(default=0.5, ge=0.0, le=1.0)

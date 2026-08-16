@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Mapping
 
 from app.core.exceptions import HybridRetrievalDisabledError
@@ -27,7 +28,9 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.reranker import NoOpReranker, ReRanker
 from app.rag_services.retrieval_strategy import RetrievalStrategy
+from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import ChatResponse, ResponseMetadata, RetrievedChunkPreview
 from app.services.query_cache_service import CacheTier, QueryCacheService
 
@@ -121,6 +124,11 @@ class RAGService:
         cache: QueryCacheService,
         default_retrieval_mode: str,
         allowed_retrieval_modes: frozenset[str] | None = None,
+        reranker: ReRanker | None = None,
+        reranker_initial_top_k: int = 20,
+        reranking_enabled: bool = False,
+        semantic_cache: SemanticQueryCache | None = None,
+        semantic_cache_enabled: bool = False,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -144,6 +152,11 @@ class RAGService:
         self._cache = cache
         self._default_retrieval_mode = default_retrieval_mode
         self._allowed_retrieval_modes = allowed_retrieval_modes
+        self._reranker = reranker or NoOpReranker()
+        self._reranker_initial_top_k = reranker_initial_top_k
+        self._reranking_enabled = reranking_enabled
+        self._semantic_cache = semantic_cache
+        self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
 
     def answer(
         self, question: str, top_k: int = 5, retrieval_mode: str | None = None
@@ -156,7 +169,10 @@ class RAGService:
         else:
             strategy = self._retrieval_strategies[self._default_retrieval_mode]
 
-        cache_key = self._cache_key(question, top_k, strategy.cache_namespace)
+        cache_namespace = strategy.cache_namespace
+        if self._reranking_enabled:
+            cache_namespace = f"{cache_namespace}:{self._reranker.cache_namespace}"
+        cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached.model_copy(update={"cache_hit": True})
@@ -166,11 +182,49 @@ class RAGService:
             if strategy.requires_dense_embedding
             else None
         )
+
+        if self._semantic_cache_enabled and query_embedding is not None:
+            semantic_match_key = self._find_semantic_cache_match(
+                query_embedding, cache_namespace, top_k
+            )
+            if semantic_match_key is not None:
+                cached = self._get_cached(semantic_match_key)
+                if cached is not None:
+                    return cached.model_copy(update={"cache_hit": True})
+                # The matched question's answer expired/was cleared from
+                # Redis since it was indexed - a stale pointer, not a
+                # correctness issue. Fall through and generate fresh.
+
+        candidate_top_k = (
+            max(top_k, self._reranker_initial_top_k) if self._reranking_enabled else top_k
+        )
         chunks = strategy.retrieve(
             query_text=question,
             query_embedding=query_embedding,
-            top_k=top_k,
+            top_k=candidate_top_k,
         )
+
+        reranked = False
+        if self._reranking_enabled and chunks:
+            candidate_count = len(chunks)
+            rerank_started = time.perf_counter()
+            outcome = self._reranker.rerank(query=question, candidates=chunks, top_k=top_k)
+            duration_ms = (time.perf_counter() - rerank_started) * 1000
+            chunks = [item.chunk for item in outcome.items]
+            reranked = outcome.applied
+
+            log_fields = {
+                "backend": outcome.backend,
+                "applied": outcome.applied,
+                "fallback": outcome.fallback,
+                "candidate_count": candidate_count,
+                "result_count": len(chunks),
+                "duration_ms": round(duration_ms, 2),
+            }
+            if outcome.fallback:
+                logger.warning("rag.reranking_fallback", extra=log_fields)
+            else:
+                logger.debug("rag.reranking_applied", extra=log_fields)
 
         user_message = f"{self._build_context(chunks)}\n\nQuestion: {question}"
         llm_response = self._llm_client.generate(_SYSTEM_PROMPT, user_message)
@@ -204,6 +258,7 @@ class RAGService:
             metadata=ResponseMetadata(
                 route="rag",
                 retrieval_mode=strategy.name,
+                reranked=reranked,
                 retrieved_chunks=[
                     RetrievedChunkPreview(
                         text=c.text, source=c.source, score=c.score, page_number=c.page_number
@@ -214,6 +269,8 @@ class RAGService:
             ),
         )
         self._set_cached(cache_key, response)
+        if self._semantic_cache_enabled and query_embedding is not None:
+            self._record_semantic_cache(query_embedding, cache_namespace, top_k, cache_key)
         return response
 
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
@@ -257,3 +314,29 @@ class RAGService:
             self._cache.set(CacheTier.RAG_ANSWER, key, response.model_dump_json())
         except Exception as exc:  # noqa: BLE001 - cache is an optimization, not a correctness requirement
             logger.warning("rag.cache_write_failed", extra={"error": str(exc)})
+
+    def _find_semantic_cache_match(
+        self, query_embedding: list[float], cache_namespace: str, top_k: int
+    ) -> str | None:
+        assert self._semantic_cache is not None  # guarded by _semantic_cache_enabled
+        try:
+            return self._semantic_cache.find_similar(
+                query_embedding=query_embedding, cache_namespace=cache_namespace, top_k=top_k
+            )
+        except Exception as exc:  # noqa: BLE001 - cache is an optimization, not a correctness requirement
+            logger.warning("rag.semantic_cache_read_failed", extra={"error": str(exc)})
+            return None
+
+    def _record_semantic_cache(
+        self, query_embedding: list[float], cache_namespace: str, top_k: int, cache_key: str
+    ) -> None:
+        assert self._semantic_cache is not None  # guarded by _semantic_cache_enabled
+        try:
+            self._semantic_cache.record(
+                query_embedding=query_embedding,
+                cache_namespace=cache_namespace,
+                top_k=top_k,
+                cache_key=cache_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - cache is an optimization, not a correctness requirement
+            logger.warning("rag.semantic_cache_write_failed", extra={"error": str(exc)})

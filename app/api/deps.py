@@ -34,13 +34,16 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
 from app.rag_services.rag_service import RAGService
+from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,
     RetrievalStrategy,
     SparseRetrievalStrategy,
 )
+from app.rag_services.voyage_reranker import VoyageReranker
 from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
     PostgresChatHistoryRepository,
@@ -49,6 +52,7 @@ from app.repositories.conversation_repository import (
     ConversationRepository,
     PostgresConversationRepository,
 )
+from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache, SemanticQueryCache
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -164,6 +168,37 @@ def get_retrieval_strategies() -> dict[str, RetrievalStrategy]:
     return {dense.name: dense, sparse.name: sparse, hybrid.name: hybrid}
 
 
+@lru_cache(maxsize=1)
+def get_reranker() -> ReRanker:
+    """Process-wide reranker backend (lazily created - the local
+    cross-encoder loads model weights on first use, cached like the other
+    model-backed clients here). Wrapped in ``FailOpenReranker`` so a
+    reranker failure degrades to retrieval ordering instead of a 5xx."""
+    settings = get_settings().rag
+    delegate: ReRanker
+    if settings.reranker_backend == "voyage":
+        delegate = VoyageReranker(
+            api_key=settings.voyage_api_key.get_secret_value(),
+            model_name=settings.voyage_model,
+        )
+    else:
+        delegate = LocalCrossEncoderReranker(model_name=settings.reranker_model)
+    return FailOpenReranker(delegate=delegate, fallback=NoOpReranker())
+
+
+@lru_cache(maxsize=1)
+def get_semantic_query_cache() -> SemanticQueryCache:
+    """Process-wide paraphrase-aware query cache (its own Qdrant
+    collection, ensured to exist at construction time - same lazy-singleton
+    shape as ``get_vector_repository``)."""
+    settings = get_settings().rag
+    return QdrantSemanticQueryCache(
+        client=get_qdrant_client(),
+        collection_name=settings.semantic_cache_collection,
+        similarity_threshold=settings.semantic_cache_similarity_threshold,
+    )
+
+
 def get_default_retrieval_mode() -> str:
     return "hybrid" if get_settings().rag.hybrid_search_enabled else "dense"
 
@@ -182,6 +217,7 @@ def get_allowed_retrieval_modes() -> frozenset[str]:
 
 @lru_cache(maxsize=1)
 def get_rag_service() -> RAGService:
+    settings = get_settings().rag
     return RAGService(
         embedding_client=get_embedding_client(),
         retrieval_strategies=get_retrieval_strategies(),
@@ -189,6 +225,11 @@ def get_rag_service() -> RAGService:
         cache=get_query_cache_service(),
         default_retrieval_mode=get_default_retrieval_mode(),
         allowed_retrieval_modes=get_allowed_retrieval_modes(),
+        reranker=get_reranker(),
+        reranker_initial_top_k=settings.reranker_initial_top_k,
+        reranking_enabled=settings.reranking_enabled_by_default,
+        semantic_cache=get_semantic_query_cache(),
+        semantic_cache_enabled=settings.semantic_cache_enabled,
     )
 
 
