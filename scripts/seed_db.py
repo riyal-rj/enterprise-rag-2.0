@@ -20,6 +20,9 @@ import psycopg2
 from app.api.deps import (
     get_document_processor,
     get_embedding_client,
+    get_query_cache_service,
+    get_rag_ops_repository,
+    get_semantic_query_cache,
     get_sparse_embedding_client,
     get_vector_repository,
 )
@@ -90,7 +93,18 @@ def seed_docs(
     caller that needs a *complete* corpus (unlike local dev iteration,
     which can tolerate a partial one) can refuse to proceed on anything
     less than 100% success - see ``scripts/migrate_qdrant_hybrid.py``.
+
+    When ``vector_repository`` is left at its default (``None``), this
+    writes into the same live collection the running app reads from -
+    exactly like ``AdminController.upload_policy``, so on any success it
+    bumps ``corpus_version`` and clears both cache layers the same way
+    (see ``_invalidate_caches_after_seed``), or a freshly (re)seeded
+    corpus would keep serving pre-seed answers out of Redis/the semantic
+    cache. An explicit ``vector_repository`` (``scripts/migrate_qdrant_hybrid.py``
+    staging a not-yet-cut-over collection) skips this - that content isn't
+    visible to the running app yet.
     """
+    is_live_collection = vector_repository is None
     processor = get_document_processor()
     embedder = get_embedding_client()
     sparse_embedder = get_sparse_embedding_client()
@@ -134,13 +148,31 @@ def seed_docs(
         len(failed_files),
         total_chunks,
     )
-    return SeedReport(
+    report = SeedReport(
         discovered_files=len(files),
         succeeded_files=succeeded_files,
         failed_files=failed_files,
         chunks_written=total_chunks,
         sources=frozenset(sources),
     )
+    if is_live_collection and succeeded_files > 0:
+        _invalidate_caches_after_seed(report)
+    return report
+
+
+def _invalidate_caches_after_seed(report: SeedReport) -> None:
+    """Mirrors ``AdminController.upload_policy``'s post-ingest invalidation
+    (see ``app.controllers.admin_controller``): bump ``corpus_version`` and
+    clear both the Redis exact-match cache and the Qdrant semantic-cache
+    pointers, so a freshly (re)seeded corpus can't keep serving answers
+    generated from the documents it just replaced."""
+    rag_ops_repository = get_rag_ops_repository()
+    rag_ops_repository.bump_corpus_version(
+        actor="seed_script", source=f"seed_docs ({report.succeeded_files} file(s))"
+    )
+    get_query_cache_service().clear()
+    get_semantic_query_cache().clear()
+    rag_ops_repository.record_cache_invalidation()
 
 
 if __name__ == "__main__":

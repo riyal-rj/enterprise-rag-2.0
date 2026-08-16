@@ -62,6 +62,36 @@ class _FakeRepo:
         raise NotImplementedError
 
 
+class _FakeRagOpsRepository:
+    def __init__(self) -> None:
+        self.bump_calls: list[dict[str, object]] = []
+        self.invalidation_calls = 0
+
+    def bump_corpus_version(self, *, actor: str, source: str):
+        self.bump_calls.append({"actor": actor, "source": source})
+
+    def record_cache_invalidation(self):
+        self.invalidation_calls += 1
+
+
+class _FakeQueryCacheService:
+    def __init__(self) -> None:
+        self.clear_calls = 0
+
+    def clear(self) -> dict[str, int]:
+        self.clear_calls += 1
+        return {}
+
+
+class _FakeLiveSemanticQueryCache:
+    def __init__(self) -> None:
+        self.clear_calls = 0
+
+    def clear(self) -> int:
+        self.clear_calls += 1
+        return 0
+
+
 def _patch_di(monkeypatch, processor: _FakeProcessor) -> None:
     monkeypatch.setattr(seed_db, "get_document_processor", lambda: processor)
     monkeypatch.setattr(seed_db, "get_embedding_client", lambda: _FakeEmbedder())
@@ -137,3 +167,72 @@ def test_seed_docs_reports_zero_discovered_files_on_an_empty_directory(
     assert report.discovered_files == 0
     assert report.succeeded_files == 0
     assert report.failed_files == []
+
+
+def test_seed_docs_against_the_live_collection_bumps_corpus_version_and_clears_caches(
+    monkeypatch, tmp_path
+) -> None:
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    processor = _FakeProcessor({"a.pdf": [DocumentChunk(text="a1", source="a.pdf")]})
+    _patch_di(monkeypatch, processor)
+    live_repo = _FakeRepo()
+    rag_ops_repository = _FakeRagOpsRepository()
+    query_cache = _FakeQueryCacheService()
+    semantic_cache = _FakeLiveSemanticQueryCache()
+    monkeypatch.setattr(seed_db, "get_vector_repository", lambda: live_repo)
+    monkeypatch.setattr(seed_db, "get_rag_ops_repository", lambda: rag_ops_repository)
+    monkeypatch.setattr(seed_db, "get_query_cache_service", lambda: query_cache)
+    monkeypatch.setattr(seed_db, "get_semantic_query_cache", lambda: semantic_cache)
+
+    report = seed_db.seed_docs(policy_dir=tmp_path)
+
+    assert report.succeeded_files == 1
+    assert len(rag_ops_repository.bump_calls) == 1
+    assert query_cache.clear_calls == 1
+    assert semantic_cache.clear_calls == 1
+    assert rag_ops_repository.invalidation_calls == 1
+
+
+def test_seed_docs_against_the_live_collection_skips_invalidation_when_nothing_succeeded(
+    monkeypatch, tmp_path
+) -> None:
+    (tmp_path / "empty.pdf").write_bytes(b"x")
+    processor = _FakeProcessor({"empty.pdf": []})
+    _patch_di(monkeypatch, processor)
+    live_repo = _FakeRepo()
+    rag_ops_repository = _FakeRagOpsRepository()
+    query_cache = _FakeQueryCacheService()
+    semantic_cache = _FakeLiveSemanticQueryCache()
+    monkeypatch.setattr(seed_db, "get_vector_repository", lambda: live_repo)
+    monkeypatch.setattr(seed_db, "get_rag_ops_repository", lambda: rag_ops_repository)
+    monkeypatch.setattr(seed_db, "get_query_cache_service", lambda: query_cache)
+    monkeypatch.setattr(seed_db, "get_semantic_query_cache", lambda: semantic_cache)
+
+    report = seed_db.seed_docs(policy_dir=tmp_path)
+
+    assert report.succeeded_files == 0
+    assert rag_ops_repository.bump_calls == []
+    assert query_cache.clear_calls == 0
+    assert semantic_cache.clear_calls == 0
+
+
+def test_seed_docs_with_an_explicit_repository_never_bumps_corpus_version(
+    monkeypatch, tmp_path
+) -> None:
+    """Regression: scripts/migrate_qdrant_hybrid.py stages a new physical
+    collection under an explicit vector_repository before any alias
+    cutover - that content isn't visible to the running app yet, so
+    corpus_version/caches must be untouched even though ingestion succeeds."""
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    processor = _FakeProcessor({"a.pdf": [DocumentChunk(text="a1", source="a.pdf")]})
+    _patch_di(monkeypatch, processor)
+    staging_repo = _FakeRepo()
+    rag_ops_repository = _FakeRagOpsRepository()
+    monkeypatch.setattr(seed_db, "get_rag_ops_repository", lambda: rag_ops_repository)
+
+    report = seed_db.seed_docs(
+        policy_dir=tmp_path, vector_repository=cast(VectorRepository, staging_repo)
+    )
+
+    assert report.succeeded_files == 1
+    assert rag_ops_repository.bump_calls == []

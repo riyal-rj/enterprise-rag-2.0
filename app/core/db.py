@@ -15,16 +15,22 @@ from psycopg2.extensions import connection as PgConnection
 
 
 class PostgresConnectionPool:
-    """Thin wrapper around ``psycopg2.pool.SimpleConnectionPool``."""
+    """Thin wrapper around ``psycopg2.pool.ThreadedConnectionPool``.
 
-    def __init__(self, 
-                 dsn: str, 
-                 minconn: int = 1, 
-                 maxconn: int = 10) -> None:
-        self._pool: pg_pool.SimpleConnectionPool = pg_pool.SimpleConnectionPool(
-            minconn, 
-            maxconn, 
-            dsn
+    Not ``SimpleConnectionPool``: this process hands out the pool to
+    concurrent callers on more than one thread - FastAPI's sync (non-
+    ``async def``) routes each run in the AnyIO threadpool, and
+    ``app.api.rag_ops_sync.RagOpsConfigPoller`` additionally polls
+    ``RagOpsRepository.get_config()`` from its own background thread via
+    ``asyncio.to_thread``. ``SimpleConnectionPool``'s ``getconn``/``putconn``
+    aren't safe under concurrent access from multiple threads (only
+    ``ThreadedConnectionPool`` locks around them), so two callers racing
+    for a connection could corrupt the pool's internal bookkeeping.
+    """
+
+    def __init__(self, dsn: str, minconn: int = 1, maxconn: int = 10) -> None:
+        self._pool: pg_pool.ThreadedConnectionPool = pg_pool.ThreadedConnectionPool(
+            minconn, maxconn, dsn
         )
 
     @contextmanager
