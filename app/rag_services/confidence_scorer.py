@@ -118,13 +118,28 @@ class ConfidenceBreakdown:
     total: float
 
 
-def compute_confidence(chunks: list[RetrievedChunk], answer: str, *, retrieval_mode: str = "dense") -> float:
+def compute_confidence(
+    chunks: list[RetrievedChunk],
+    answer: str,
+    *,
+    retrieval_mode: str = "dense",
+    retrieval_ordered_chunks: list[RetrievedChunk] | None = None,
+) -> float:
     """Composite, explainable confidence in ``[0.0, 1.0]``."""
-    return compute_confidence_breakdown(chunks, answer, retrieval_mode=retrieval_mode).total
+    return compute_confidence_breakdown(
+        chunks,
+        answer,
+        retrieval_mode=retrieval_mode,
+        retrieval_ordered_chunks=retrieval_ordered_chunks,
+    ).total
 
 
 def compute_confidence_breakdown(
-    chunks: list[RetrievedChunk], answer: str, *, retrieval_mode: str = "dense"
+    chunks: list[RetrievedChunk],
+    answer: str,
+    *,
+    retrieval_mode: str = "dense",
+    retrieval_ordered_chunks: list[RetrievedChunk] | None = None,
 ) -> ConfidenceBreakdown:
     """Same score as :func:`compute_confidence`, with each component exposed.
 
@@ -136,10 +151,21 @@ def compute_confidence_breakdown(
     on a cosine-similarity scale ``_RELEVANCE_FLOOR`` was calibrated for
     (see the module docstring). Any other mode uses a neutral treatment
     for the two components that assume that scale.
+
+    ``chunks`` is assumed to be in retrieval-score order for
+    ``_retrieval_strength``'s "top score and margin over the rest" read -
+    true unless a reranker reordered it by a different (rerank) score
+    while leaving ``.score`` (the original retrieval score) untouched, in
+    which case position 0 is no longer the strongest retrieval hit. Pass
+    the pre-rerank list separately as ``retrieval_ordered_chunks`` so
+    retrieval strength still reflects the underlying candidate pool's
+    quality rather than the reranker's (uncalibrated) pick for position 0;
+    ``chunks`` itself still drives coverage/faithfulness/citations/
+    answerability, since those must reflect what the LLM actually saw.
     """
     coverage = _evidence_coverage(chunks, retrieval_mode)
     faithfulness = _faithfulness(chunks, answer)
-    retrieval_strength = _retrieval_strength(chunks, retrieval_mode)
+    retrieval_strength = _retrieval_strength(retrieval_ordered_chunks or chunks, retrieval_mode)
     citation_precision = _citation_precision(chunks, answer)
     answerability = _answerability(chunks, answer)
 
