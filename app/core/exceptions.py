@@ -100,6 +100,18 @@ class InvalidRagOpsConfigError(AppError):
         super().__init__(message)
 
 
+class EvaluationPipelineError(AppError):
+    """Raised when the offline eval harness detects that the system under
+    test didn't actually do what a case's ``PipelineProfile`` asked for
+    (e.g. HyDE was requested but bypassed/fell back) - lets a case fail
+    loudly instead of silently scoring degraded/baseline output as if it
+    were the feature under test. See ``app.eval.invokers.ServiceInvoker``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class HybridRetrievalDisabledError(AppError):
     """Raised when a request asks for a retrieval mode the rollout flag
     (``RAGFeatureSettings.hybrid_search_enabled``) currently disallows.

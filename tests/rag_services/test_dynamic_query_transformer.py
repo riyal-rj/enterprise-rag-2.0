@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
 from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.query_transformer import QueryTransformOutcome
+from app.rag_services.rag_runtime_config import RagRuntimeConfig
 from app.rag_services.reranker import ReRankOutcome
 from app.services.rag_metrics_service import RagMetricsService
 
@@ -42,44 +43,68 @@ class _FakeDelegate:
         if self._raise_error:
             raise RuntimeError("boom")
         return QueryTransformOutcome(
-            retrieval_texts=("a hypothetical passage",), backend="hyde", applied=True,
+            retrieval_texts=("a hypothetical passage",),
+            backend="hyde",
+            applied=True,
             usage_tokens=7,
         )
 
 
-def test_zero_percent_rollout_never_calls_the_delegate() -> None:
-    delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=RagMetricsService(), rollout_percentage=0
+def _config(*, rollout_percentage: int = 100, emergency_disabled: bool = False) -> RagRuntimeConfig:
+    return RagRuntimeConfig(
+        reranking_enabled=False,
+        reranker_backend="local",
+        reranker_rollout_percentage=100,
+        emergency_disabled=emergency_disabled,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        corpus_version=1,
+        hyde_enabled=True,
+        hyde_rollout_percentage=rollout_percentage,
     )
 
-    outcome = transformer.transform("any question")
 
+def test_plan_is_disabled_cohort_when_not_enabled() -> None:
+    transformer = DynamicQueryTransformer(delegate=_FakeDelegate())
+
+    plan = transformer.plan("any question", _config(), enabled=False)
+
+    assert plan.cohort == "disabled"
+    assert plan.bypass_reason == "disabled"
+
+
+def test_zero_percent_rollout_is_control_cohort_and_never_calls_the_delegate() -> None:
+    delegate = _FakeDelegate()
+    transformer = DynamicQueryTransformer(delegate=delegate)
+
+    plan = transformer.plan("any question", _config(rollout_percentage=0), enabled=True)
+    outcome = transformer.execute("any question", plan)
+
+    assert plan.cohort == "control"
+    assert plan.bypass_reason == "rollout"
     assert outcome.applied is False
     assert outcome.bypass_reason == "rollout"
     assert delegate.calls == []
 
 
-def test_hundred_percent_rollout_always_calls_the_delegate() -> None:
+def test_hundred_percent_rollout_is_always_treatment_and_calls_the_delegate() -> None:
     delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=RagMetricsService(), rollout_percentage=100
-    )
+    transformer = DynamicQueryTransformer(delegate=delegate)
+    config = _config(rollout_percentage=100)
 
     for question in ["a", "b", "c", "d", "e"]:
-        transformer.transform(question)
+        plan = transformer.plan(question, config, enabled=True)
+        transformer.execute(question, plan)
 
     assert delegate.calls == ["a", "b", "c", "d", "e"]
 
 
 def test_rollout_sampling_is_deterministic_for_the_same_normalized_query() -> None:
-    delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=RagMetricsService(), rollout_percentage=50
-    )
+    transformer = DynamicQueryTransformer(delegate=_FakeDelegate())
+    config = _config(rollout_percentage=50)
 
-    first_run = [transformer.transform(f"question {i}").applied for i in range(20)]
-    second_run = [transformer.transform(f"question {i}").applied for i in range(20)]
+    first_run = [transformer.plan(f"question {i}", config, enabled=True).cohort for i in range(20)]
+    second_run = [transformer.plan(f"question {i}", config, enabled=True).cohort for i in range(20)]
 
     assert first_run == second_run
 
@@ -88,17 +113,27 @@ def test_hyde_and_reranker_cohorts_are_not_forced_identical_by_a_shared_salt() -
     """Both use the same underlying sampled_in() hashing, but with
     feature-specific salts - so the same rollout_percentage on the same
     question set doesn't have to select the exact same population."""
-    hyde = DynamicQueryTransformer(
-        delegate=_FakeDelegate(), metrics=RagMetricsService(), rollout_percentage=50
-    )
-    reranker = DynamicReranker(
-        local=_FakeReranker(), voyage=None, metrics=RagMetricsService(), rollout_percentage=50
+    hyde = DynamicQueryTransformer(delegate=_FakeDelegate())
+    reranker = DynamicReranker(local=_FakeReranker(), voyage=None, metrics=RagMetricsService())
+
+    hyde_config = RagRuntimeConfig(
+        reranking_enabled=True,
+        reranker_backend="local",
+        reranker_rollout_percentage=50,
+        emergency_disabled=False,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        corpus_version=1,
+        hyde_enabled=True,
+        hyde_rollout_percentage=50,
     )
 
     questions = [f"question {i}" for i in range(50)]
-    hyde_sampled_in = {q for q in questions if hyde.transform(q).applied}
+    hyde_sampled_in = {
+        q for q in questions if hyde.plan(q, hyde_config, enabled=True).cohort == "treatment"
+    }
     reranker_sampled_in = {
-        q for q in questions if reranker.rerank(query=q, candidates=[], top_k=1).applied
+        q for q in questions if reranker.plan(q, hyde_config, enabled=True).cohort == "treatment"
     }
 
     assert hyde_sampled_in != reranker_sampled_in
@@ -106,104 +141,87 @@ def test_hyde_and_reranker_cohorts_are_not_forced_identical_by_a_shared_salt() -
 
 def test_emergency_disabled_bypasses_the_delegate_entirely() -> None:
     delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate,
-        metrics=RagMetricsService(),
-        rollout_percentage=100,
-        emergency_disabled=True,
+    transformer = DynamicQueryTransformer(delegate=delegate)
+
+    plan = transformer.plan(
+        "q", _config(rollout_percentage=100, emergency_disabled=True), enabled=True
     )
+    outcome = transformer.execute("q", plan)
 
-    outcome = transformer.transform("q")
-
+    assert plan.cohort == "disabled"
+    assert plan.bypass_reason == "emergency_disabled"
     assert outcome.applied is False
     assert outcome.bypass_reason == "emergency_disabled"
     assert delegate.calls == []
 
 
-def test_configure_swaps_rollout_and_emergency_as_one_atomic_state() -> None:
-    delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=RagMetricsService(), rollout_percentage=0
+def test_delegate_failure_fails_open() -> None:
+    """DynamicQueryTransformer wraps its delegate in FailOpenQueryTransformer
+    internally - a raw provider/schema error must never propagate out of
+    execute() and must never produce a 5xx (see RAGService.answer)."""
+    delegate = _FakeDelegate(raise_error=True)
+    transformer = DynamicQueryTransformer(delegate=delegate)
+
+    plan = transformer.plan("q", _config(rollout_percentage=100), enabled=True)
+    outcome = transformer.execute("q", plan)
+
+    assert plan.cohort == "treatment"
+    assert outcome.applied is False
+    assert outcome.fallback is True
+
+
+def test_cache_namespace_isolates_control_and_treatment_cohorts() -> None:
+    """Regression: the cache namespace used to only encode the *configured*
+    rollout percentage (e.g. "rollout=50:emergency=0"), not which cohort a
+    specific query actually landed in - so a control-cohort query and a
+    treatment-cohort query under the same 50% rollout would share one cache
+    namespace, letting a semantic-cache hit serve one query an answer
+    generated under the other's (different) retrieval vector. plan()'s
+    cache_namespace must instead encode the *resolved* cohort."""
+    transformer = DynamicQueryTransformer(delegate=_FakeDelegate())
+    config = _config(rollout_percentage=50)
+
+    control_query = next(
+        q
+        for q in (f"q{i}" for i in range(50))
+        if transformer.plan(q, config, enabled=True).cohort == "control"
+    )
+    treatment_query = next(
+        q
+        for q in (f"q{i}" for i in range(50))
+        if transformer.plan(q, config, enabled=True).cohort == "treatment"
     )
 
-    transformer.configure(rollout_percentage=100, emergency_disabled=False)
-    outcome = transformer.transform("q")
+    control_plan = transformer.plan(control_query, config, enabled=True)
+    treatment_plan = transformer.plan(treatment_query, config, enabled=True)
+
+    assert control_plan.cache_namespace != treatment_plan.cache_namespace
+
+
+def test_cache_namespace_differs_for_disabled_vs_emergency_vs_rollout_bypass() -> None:
+    transformer = DynamicQueryTransformer(delegate=_FakeDelegate())
+
+    disabled = transformer.plan("q", _config(), enabled=False)
+    emergency = transformer.plan("q", _config(emergency_disabled=True), enabled=True)
+    rollout = transformer.plan("q", _config(rollout_percentage=0), enabled=True)
+
+    namespaces = {disabled.cache_namespace, emergency.cache_namespace, rollout.cache_namespace}
+    assert len(namespaces) == 3
+
+
+def test_execute_is_driven_entirely_by_the_plan_not_by_a_later_config_change() -> None:
+    """DynamicQueryTransformer holds no config reference of its own - plan()
+    takes an explicit snapshot and execute() only ever consults the plan it
+    was given, so a config change happening between the two calls can't
+    affect an execute() already in flight."""
+    delegate = _FakeDelegate()
+    transformer = DynamicQueryTransformer(delegate=delegate)
+
+    plan = transformer.plan("q", _config(rollout_percentage=100), enabled=True)
+    later_config = _config(rollout_percentage=0, emergency_disabled=True)
+    assert later_config.hyde_rollout_percentage == 0  # sanity: genuinely different
+
+    outcome = transformer.execute("q", plan)
 
     assert outcome.applied is True
     assert delegate.calls == ["q"]
-
-
-def test_configure_emergency_disable_overrides_rollout() -> None:
-    delegate = _FakeDelegate()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=RagMetricsService(), rollout_percentage=100
-    )
-
-    transformer.configure(rollout_percentage=100, emergency_disabled=True)
-    outcome = transformer.transform("q")
-
-    assert outcome.applied is False
-    assert outcome.bypass_reason == "emergency_disabled"
-
-
-def test_delegate_failure_fails_open_and_is_recorded_as_an_attempt_not_a_bypass() -> None:
-    """DynamicQueryTransformer wraps its delegate in FailOpenQueryTransformer
-    internally - a raw provider/schema error must never propagate out of
-    transform() and must never produce a 5xx (see RAGService.answer)."""
-    delegate = _FakeDelegate(raise_error=True)
-    metrics = RagMetricsService()
-    transformer = DynamicQueryTransformer(
-        delegate=delegate, metrics=metrics, rollout_percentage=100
-    )
-
-    outcome = transformer.transform("q")
-
-    assert outcome.applied is False
-    assert outcome.fallback is True
-    stats = metrics.hyde_stats()
-    assert stats.sample_count == 1
-    assert stats.fallback_rate == 1.0
-    assert stats.rollout_bypasses == 0
-    assert stats.emergency_bypasses == 0
-
-
-def test_attempt_and_bypass_metrics_are_recorded_exactly_once_each() -> None:
-    metrics = RagMetricsService()
-    transformer = DynamicQueryTransformer(
-        delegate=_FakeDelegate(), metrics=metrics, rollout_percentage=100
-    )
-
-    transformer.transform("attempted")
-
-    stats = metrics.hyde_stats()
-    assert stats.sample_count == 1
-    assert stats.usage_tokens_total == 7
-
-    transformer.configure(rollout_percentage=0, emergency_disabled=False)
-    transformer.transform("bypassed by rollout")
-
-    stats = metrics.hyde_stats()
-    assert stats.sample_count == 1  # unchanged - a bypass is not an attempt
-    assert stats.rollout_bypasses == 1
-
-    transformer.configure(rollout_percentage=100, emergency_disabled=True)
-    transformer.transform("bypassed by emergency")
-
-    stats = metrics.hyde_stats()
-    assert stats.sample_count == 1
-    assert stats.emergency_bypasses == 1
-
-
-def test_cache_namespace_changes_when_rollout_or_emergency_state_changes() -> None:
-    transformer = DynamicQueryTransformer(
-        delegate=_FakeDelegate(), metrics=RagMetricsService(), rollout_percentage=0
-    )
-
-    baseline = transformer.cache_namespace
-    transformer.configure(rollout_percentage=50, emergency_disabled=False)
-    after_rollout_change = transformer.cache_namespace
-    transformer.configure(rollout_percentage=50, emergency_disabled=True)
-    after_emergency_change = transformer.cache_namespace
-
-    assert baseline != after_rollout_change
-    assert after_rollout_change != after_emergency_change

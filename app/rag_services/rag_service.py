@@ -1,14 +1,27 @@
 """Basic RAG answer generation: embed, dense-search, generate, cache.
 
 The full pipeline this is meant to grow into - CRAG relevance grading,
-self-reflective answer refinement, reranking, hybrid/sparse search, SQL
-intent routing, prompt-injection spotlighting - layers on top of this.
-HyDE query expansion is wired (see the ``query_transformer``/``hyde_enabled``
-constructor args and ``answer()``'s HyDE stage): it only ever replaces the
-*dense retrieval vector*, never the sparse query, reranker query, or
-answer-LLM question, and it fails open to the original-query embedding on
-any LLM/schema/embedding/fusion error. No relevance grading, no answer
-refinement loop, and no prompt-injection defense yet.
+self-reflective answer refinement, hybrid/sparse search, SQL intent
+routing, prompt-injection spotlighting - layers on top of this. HyDE query
+expansion and reranking are wired (see ``answer()``'s reranking/HyDE
+stages): HyDE only ever replaces the *dense retrieval vector*, never the
+sparse query, reranker query, or answer-LLM question, and it fails open to
+the original-query embedding on any LLM/schema/embedding/fusion error. No
+relevance grading, no answer refinement loop, and no prompt-injection
+defense yet.
+
+Both reranking and HyDE are driven by a ``PlannedReranker``/
+``PlannedQueryTransformer`` pair (see ``app.rag_services.reranker`` /
+``app.rag_services.query_transformer``): ``answer()`` captures exactly one
+``RagRuntimeConfig`` snapshot per request (see
+``app.rag_services.rag_runtime_config``) and calls each collaborator's
+``plan()`` once, up front, to decide that request's cohort
+(disabled/control/treatment) before any cache lookup - then threads the
+same plan through cache-namespace construction, execution, and metrics.
+This is what makes a concurrent admin config update unable to split one
+request across two cohorts, and what keeps the semantic (paraphrase) cache
+from ever serving a control-cohort query an answer generated under a
+different query's treatment-cohort retrieval, or vice versa.
 
 Caching follows the same cache-aside shape as
 ``app.core.llm.embedding_client``: check the cache first, compute and
@@ -23,6 +36,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Protocol
 
 from app.core.exceptions import HybridRetrievalDisabledError
@@ -34,10 +48,12 @@ from app.rag_services.confidence_scorer import compute_confidence_breakdown
 from app.rag_services.embedding_fusion import mean_pool_and_normalize
 from app.rag_services.query_transformer import (
     NoOpQueryTransformer,
-    QueryTransformer,
+    PlannedNoOpQueryTransformer,
+    PlannedQueryTransformer,
     QueryTransformOutcome,
 )
-from app.rag_services.reranker import NoOpReranker, ReRankedChunk, ReRanker
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
+from app.rag_services.reranker import PlannedNoOpReranker, PlannedReranker, ReRankedChunk
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import (
@@ -52,15 +68,38 @@ from app.services.query_cache_service import CacheTier, QueryCacheService
 logger = logging.getLogger(__name__)
 
 
-class _SemanticCacheMetricsRecorder(Protocol):
+class _RagServiceMetricsRecorder(Protocol):
     """Narrow collaborator - satisfied by ``app.services.rag_metrics_service.RagMetricsService``
-    without this module needing to import it. Recording lives here, not in
-    ``QdrantSemanticQueryCache.find_candidates``, because only this class
-    knows the *confirmed* outcome: whether a candidate's exact-match Redis
-    entry actually still exists, not just whether Qdrant found a
-    similarity-clearing embedding match (see ``_check_semantic_cache``)."""
+    without this module needing to import it. Semantic-cache-lookup recording
+    lives here, not in ``QdrantSemanticQueryCache.find_candidates``, because
+    only this class knows the *confirmed* outcome: whether a candidate's
+    exact-match Redis entry actually still exists, not just whether Qdrant
+    found a similarity-clearing embedding match (see
+    ``_check_semantic_cache``). HyDE-attempt recording lives here rather
+    than in ``DynamicQueryTransformer`` because only ``RAGService`` observes
+    the *complete* generation-embedding-fusion pipeline - see ``answer()``'s
+    HyDE stage."""
 
     def record_semantic_cache_lookup(self, *, hit: bool) -> None: ...
+    def record_hyde_attempt(
+        self, *, duration_ms: float, fallback: bool, usage_tokens: int
+    ) -> None: ...
+    def record_hyde_bypass(self, *, reason: str) -> None: ...
+
+
+class _NoOpRagServiceMetrics:
+    """Default when no metrics collaborator is supplied (e.g. the eval
+    harness, which doesn't inject production metrics) - lets every call site
+    record unconditionally instead of guarding on ``self._metrics is not None``."""
+
+    def record_semantic_cache_lookup(self, *, hit: bool) -> None:
+        pass
+
+    def record_hyde_attempt(self, *, duration_ms: float, fallback: bool, usage_tokens: int) -> None:
+        pass
+
+    def record_hyde_bypass(self, *, reason: str) -> None:
+        pass
 
 
 _SYSTEM_PROMPT = """
@@ -151,14 +190,15 @@ class RAGService:
         cache: QueryCacheService,
         default_retrieval_mode: str,
         allowed_retrieval_modes: frozenset[str] | None = None,
-        reranker: ReRanker | None = None,
+        reranker: PlannedReranker | None = None,
         reranker_initial_top_k: int = 20,
         reranking_enabled: bool = False,
         semantic_cache: SemanticQueryCache | None = None,
         semantic_cache_enabled: bool = False,
-        metrics: _SemanticCacheMetricsRecorder | None = None,
-        query_transformer: QueryTransformer | None = None,
+        metrics: _RagServiceMetricsRecorder | None = None,
+        query_transformer: PlannedQueryTransformer | None = None,
         hyde_enabled: bool = False,
+        config_store: RagRuntimeConfigStore | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -182,33 +222,33 @@ class RAGService:
         self._cache = cache
         self._default_retrieval_mode = default_retrieval_mode
         self._allowed_retrieval_modes = allowed_retrieval_modes
-        self._reranker = reranker or NoOpReranker()
+        self._reranker = reranker or PlannedNoOpReranker()
         self._reranker_initial_top_k = reranker_initial_top_k
-        self._reranking_enabled = reranking_enabled
         self._semantic_cache = semantic_cache
-        self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
-        self._metrics = metrics
-        self._query_transformer = query_transformer or NoOpQueryTransformer()
-        self._hyde_enabled = hyde_enabled
-
-    def set_reranking_enabled(self, enabled: bool) -> None:
-        """Live-toggle the instance-level reranking default (see
-        ``__init__``'s ``reranking_enabled``) by mutating this
-        already-constructed (``lru_cache``'d) singleton in place, so an
-        admin's RAG Operations panel change reaches the very next request
-        without a process restart. See ``app.controllers.rag_ops_controller``."""
-        self._reranking_enabled = enabled
-
-    def set_semantic_cache_enabled(self, enabled: bool) -> None:
-        """Same live-toggle as :meth:`set_reranking_enabled`, for the
-        semantic (paraphrase) cache. Still gated on a real cache instance
-        having been supplied at construction time, same as ``__init__``."""
-        self._semantic_cache_enabled = enabled and self._semantic_cache is not None
-
-    def set_hyde_enabled(self, enabled: bool) -> None:
-        """Same live-toggle as :meth:`set_reranking_enabled`, for HyDE
-        query transformation."""
-        self._hyde_enabled = enabled
+        self._metrics = metrics or _NoOpRagServiceMetrics()
+        self._query_transformer = query_transformer or PlannedNoOpQueryTransformer()
+        # A caller that cares about atomic cross-object config application
+        # (app.api.deps.get_rag_service) passes the same config_store this
+        # process's DynamicReranker/DynamicQueryTransformer read from (see
+        # app.rag_services.rag_runtime_config). Callers that don't (mostly
+        # tests, and the eval harness's standalone service instance) get a
+        # private store seeded from the reranking_enabled/
+        # semantic_cache_enabled/hyde_enabled kwargs, preserving the old
+        # constructor-arg ergonomics for a service instance nothing else
+        # needs to observe.
+        self._config_store = config_store or RagRuntimeConfigStore(
+            RagRuntimeConfig(
+                reranking_enabled=reranking_enabled,
+                reranker_backend="local",
+                reranker_rollout_percentage=100,
+                emergency_disabled=False,
+                semantic_cache_enabled=semantic_cache_enabled,
+                semantic_cache_threshold=0.95,
+                corpus_version=1,
+                hyde_enabled=hyde_enabled,
+                hyde_rollout_percentage=100,
+            )
+        )
 
     def answer(
         self,
@@ -222,18 +262,25 @@ class RAGService:
         """Answer ``question``.
 
         ``reranking_enabled``/``hyde_enabled`` override the instance-level
-        defaults (``self._reranking_enabled``/``self._hyde_enabled``, set
-        from the centralized RAG ops config in production) for this call
-        only - ``None`` (the default) defers to the instance. This is what
-        lets the eval harness exercise the pipeline with any combination of
+        defaults (from the config snapshot captured below, seeded from the
+        centralized RAG ops config in production) for this call only -
+        ``None`` (the default) defers to the instance. This is what lets
+        the eval harness exercise the pipeline with any combination of
         flags through the same service instance/config (see
         ``app.eval.invokers.ServiceInvoker``) instead of needing a
         separately-wired ``RAGService`` per combination.
         """
+        # Captured once, up front - the ONLY read of the shared store in
+        # this whole call. Every cohort decision (reranking, HyDE), the
+        # cache namespace, and the semantic-cache threshold below all
+        # derive from this one snapshot, so a config update landing
+        # mid-request can't split this request across two generations of
+        # config. See app.rag_services.rag_runtime_config.
+        config = self._config_store.current
         effective_reranking_enabled = (
-            self._reranking_enabled if reranking_enabled is None else reranking_enabled
+            config.reranking_enabled if reranking_enabled is None else reranking_enabled
         )
-        effective_hyde_enabled = self._hyde_enabled if hyde_enabled is None else hyde_enabled
+        effective_hyde_enabled = config.hyde_enabled if hyde_enabled is None else hyde_enabled
 
         mode = retrieval_mode or self._default_retrieval_mode
         if mode in self._retrieval_strategies:
@@ -244,21 +291,49 @@ class RAGService:
             strategy = self._retrieval_strategies[self._default_retrieval_mode]
 
         candidate_top_k = top_k
-        cache_namespace = strategy.cache_namespace
+        # corpus_version is folded in here - not just an audit-trail number
+        # - so a replaced/re-seeded corpus makes every previously-cached
+        # exact-match answer and semantic-cache pointer (both partitioned by
+        # this same cache_namespace) unreachable the moment the version
+        # bumps, even if the explicit Redis/Qdrant clear() calls that
+        # accompany a corpus mutation (see
+        # app.services.corpus_cache_invalidation_service) fail or are
+        # skipped.
+        cache_namespace = f"{strategy.cache_namespace}:corpus={config.corpus_version}"
+
+        # Reranking/HyDE cohorts are decided once, here, from the single
+        # `config` snapshot above and the query text - before any cache
+        # lookup - so a control-cohort query and a treatment-cohort query
+        # under the same rollout percentage can never share a cache
+        # namespace (a plain "rollout=30%" segment would collide the two;
+        # rerank_plan.cache_namespace/hyde_plan.cache_namespace instead
+        # encode which cohort *this* query actually landed in). Both plans
+        # are always computed (cheap, no I/O), but their segment is only
+        # folded into cache_namespace when the feature is actually enabled -
+        # when it's off entirely there's no cohort ambiguity to disambiguate
+        # (every request behaves identically), so the namespace stays
+        # exactly what it was before either feature existed.
+        rerank_plan = self._reranker.plan(question, config, enabled=effective_reranking_enabled)
         if effective_reranking_enabled:
-            candidate_top_k = max(top_k, self._reranker_initial_top_k)
-            # candidates=N is part of the key, not just top_k/reranker
-            # name: widening the candidate pool (e.g. 20 -> 50) can change
-            # which chunk the reranker picks first even though top_k and
-            # the reranker itself are unchanged, so a stale narrower-pool
-            # answer must not be served under the new configuration.
-            cache_namespace = (
-                f"{cache_namespace}:{self._reranker.cache_namespace}:candidates={candidate_top_k}"
-            )
+            cache_namespace = f"{cache_namespace}:{rerank_plan.cache_namespace}"
+            if rerank_plan.cohort == "treatment":
+                # Only the treatment cohort ever widens the pool - a
+                # control-cohort query (rollout-bypassed) must retrieve
+                # exactly `top_k`, same as if reranking were off entirely,
+                # or it would pay retrieval cost for a wider pool a reranker
+                # that never runs has no use for. candidates=N is part of
+                # the key, not just top_k/reranker name: widening the pool
+                # (e.g. 20 -> 50) can change which chunk the reranker picks
+                # first even though top_k and the reranker itself are
+                # unchanged, so a stale narrower-pool answer must not be
+                # served under the new configuration.
+                candidate_top_k = max(top_k, self._reranker_initial_top_k)
+                cache_namespace = f"{cache_namespace}:candidates={candidate_top_k}"
 
         hyde_can_run = effective_hyde_enabled and strategy.requires_dense_embedding
+        hyde_plan = self._query_transformer.plan(question, config, enabled=hyde_can_run)
         if hyde_can_run:
-            cache_namespace = f"{cache_namespace}:{self._query_transformer.cache_namespace}"
+            cache_namespace = f"{cache_namespace}:{hyde_plan.cache_namespace}"
 
         cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
@@ -267,22 +342,32 @@ class RAGService:
 
         # The original embedding is the semantic-cache identity - computing
         # it before HyDE lets a semantic hit avoid all HyDE LLM and
-        # hypothesis-embedding cost.
+        # hypothesis-embedding cost. `similarity_threshold` comes from the
+        # same captured `config`, not a second, independent store read
+        # inside the semantic-cache repository - see
+        # app.repositories.semantic_cache_repository.
         original_query_embedding: list[float] | None = None
-        if strategy.requires_dense_embedding and self._semantic_cache_enabled:
+        if (
+            strategy.requires_dense_embedding
+            and config.semantic_cache_enabled
+            and self._semantic_cache is not None
+        ):
             original_query_embedding = self._embedding_client.embed_texts([question])[0]
             semantic_hit = self._check_semantic_cache(
-                original_query_embedding, cache_namespace, top_k
+                original_query_embedding, cache_namespace, top_k, config.semantic_cache_threshold
             )
             if semantic_hit is not None:
                 return semantic_hit.model_copy(update={"cache_hit": True})
 
-        hyde_outcome = NoOpQueryTransformer(reason="disabled").transform(question)
+        hyde_outcome = NoOpQueryTransformer(reason=hyde_plan.bypass_reason or "disabled").transform(
+            question
+        )
         query_embedding: list[float] | None = None
 
         if strategy.requires_dense_embedding:
-            if hyde_can_run:
-                hyde_outcome = self._query_transformer.transform(question)
+            if hyde_plan.cohort == "treatment":
+                hyde_started = time.perf_counter()
+                hyde_outcome = self._query_transformer.execute(question, hyde_plan)
                 if hyde_outcome.applied:
                     try:
                         hypothesis_embeddings = self._embedding_client.embed_texts(
@@ -303,6 +388,26 @@ class RAGService:
                             usage_tokens=hyde_outcome.usage_tokens,
                             duration_ms=hyde_outcome.duration_ms,
                         )
+                # Total stage latency - generation (execute) + hypothesis
+                # embedding + fusion - recorded once, after the complete
+                # pipeline: the delegate itself never sets duration_ms, and
+                # recording the metric right after generation (before
+                # embedding/fusion could still fail) would misreport an
+                # embedding/fusion failure as a successful HyDE attempt.
+                hyde_outcome = replace(
+                    hyde_outcome, duration_ms=(time.perf_counter() - hyde_started) * 1000
+                )
+                self._metrics.record_hyde_attempt(
+                    duration_ms=hyde_outcome.duration_ms,
+                    fallback=hyde_outcome.fallback,
+                    usage_tokens=hyde_outcome.usage_tokens,
+                )
+            elif hyde_plan.bypass_reason in ("rollout", "emergency_disabled"):
+                # "disabled" (feature toggle fully off) isn't a canary
+                # bucket worth counting - only rollout-control and
+                # emergency bypasses are, matching HyDEMetricsSnapshot's
+                # two named counters (see app.services.rag_metrics_service).
+                self._metrics.record_hyde_bypass(reason=hyde_plan.bypass_reason)
 
             if query_embedding is None:
                 if original_query_embedding is None:
@@ -310,7 +415,7 @@ class RAGService:
                 query_embedding = original_query_embedding
 
         chunks = strategy.retrieve(
-            query_text=question,             # always original - hybrid's sparse branch uses this
+            query_text=question,  # always original - hybrid's sparse branch uses this
             query_embedding=query_embedding,
             top_k=candidate_top_k,
         )
@@ -324,13 +429,15 @@ class RAGService:
         reranked = False
         fallback_occurred = False
         rerank_candidate_count = 0
-        rerank_backend = self._reranker.name
+        rerank_backend = rerank_plan.reported_backend
         rerank_usage_tokens: int | None = None
         rerank_items: tuple[ReRankedChunk, ...] | None = None
-        if effective_reranking_enabled and chunks:
+        if rerank_plan.cohort == "treatment" and chunks:
             rerank_candidate_count = len(chunks)
             rerank_started = time.perf_counter()
-            outcome = self._reranker.rerank(query=question, candidates=chunks, top_k=top_k)
+            outcome = self._reranker.execute(
+                rerank_plan, query=question, candidates=chunks, top_k=top_k
+            )
             duration_ms = (time.perf_counter() - rerank_started) * 1000
             chunks = [item.chunk for item in outcome.items]
             rerank_items = outcome.items
@@ -424,7 +531,8 @@ class RAGService:
             cache_written = self._set_cached(cache_key, response)
             if (
                 cache_written
-                and self._semantic_cache_enabled
+                and config.semantic_cache_enabled
+                and self._semantic_cache is not None
                 and original_query_embedding is not None
             ):
                 self._record_semantic_cache(
@@ -473,12 +581,14 @@ class RAGService:
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
         normalized_question = " ".join(question.split())
 
-        # v4: cache_namespace now folds in the HyDE transformer's identity
-        # (model/prompt/N/rollout/emergency state) and the response schema
-        # gained the ``hyde`` metadata field - bumped so a v3 key computed
-        # before HyDE existed can't collide with or mask a v4 key for the
-        # same question/config.
-        raw_key = f"rag:v4:{cache_namespace}:{top_k}:{normalized_question}"
+        # v5: cache_namespace now folds in per-query cohort isolation for
+        # both reranking and HyDE (control vs. treatment, decided from
+        # DynamicReranker.plan/DynamicQueryTransformer.plan - not just the
+        # configured rollout percentage), on top of v3's candidate-pool-size
+        # versioning and v4's HyDE identity - bumped so a v3 or v4 key
+        # computed under either narrower format can't collide with or mask
+        # a v5 key for the same question/config.
+        raw_key = f"rag:v5:{cache_namespace}:{top_k}:{normalized_question}"
 
         return hashlib.sha256(raw_key.encode()).hexdigest()
 
@@ -503,7 +613,11 @@ class RAGService:
             return False
 
     def _check_semantic_cache(
-        self, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> ChatResponse | None:
         """Try each semantic-cache candidate, nearest-first, until one's
         exact-match Redis entry is confirmed still live. Records the
@@ -513,7 +627,7 @@ class RAGService:
         (see ``QdrantSemanticQueryCache.find_candidates``)."""
         hit: ChatResponse | None = None
         for candidate_key in self._find_semantic_cache_candidates(
-            query_embedding, cache_namespace, top_k
+            query_embedding, cache_namespace, top_k, similarity_threshold
         ):
             cached = self._get_cached(candidate_key)
             if cached is not None:
@@ -522,17 +636,23 @@ class RAGService:
             # This candidate's answer expired/was cleared from Redis
             # since it was indexed - try the next-nearest match rather
             # than immediately falling through to a fresh generation.
-        if self._metrics is not None:
-            self._metrics.record_semantic_cache_lookup(hit=hit is not None)
+        self._metrics.record_semantic_cache_lookup(hit=hit is not None)
         return hit
 
     def _find_semantic_cache_candidates(
-        self, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
-        assert self._semantic_cache is not None  # guarded by _semantic_cache_enabled
+        assert self._semantic_cache is not None  # guarded by caller
         try:
             return self._semantic_cache.find_candidates(
-                query_embedding=query_embedding, cache_namespace=cache_namespace, top_k=top_k
+                query_embedding=query_embedding,
+                cache_namespace=cache_namespace,
+                top_k=top_k,
+                similarity_threshold=similarity_threshold,
             )
         except Exception as exc:  # noqa: BLE001 - cache is an optimization, not a correctness requirement
             logger.warning("rag.semantic_cache_read_failed", extra={"error": str(exc)})
@@ -541,7 +661,7 @@ class RAGService:
     def _record_semantic_cache(
         self, query_embedding: list[float], cache_namespace: str, top_k: int, cache_key: str
     ) -> None:
-        assert self._semantic_cache is not None  # guarded by _semantic_cache_enabled
+        assert self._semantic_cache is not None  # guarded by caller
         try:
             self._semantic_cache.record(
                 query_embedding=query_embedding,

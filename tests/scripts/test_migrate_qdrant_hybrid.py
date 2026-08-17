@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from qdrant_client.models import CreateAliasOperation, DeleteAliasOperation
 
+import scripts.migrate_qdrant_hybrid as migrate_qdrant_hybrid
 from scripts.migrate_qdrant_hybrid import (
     _LIVE_ALIAS_SUFFIX,
     _cutover_alias,
@@ -142,3 +143,95 @@ def test_require_complete_corpus_rejects_an_empty_corpus() -> None:
 
     with pytest.raises(RuntimeError, match="0 files"):
         _require_complete_corpus(report)
+
+
+def test_blue_green_migrate_invalidates_caches_after_a_successful_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: an alias cutover used to leave RAGService's caches
+    pointed at the pre-migration corpus - stale answers/semantic pointers
+    would keep being served after the alias already resolved to the newly
+    (re)ingested collection. blue_green_migrate() must invalidate the
+    corpus caches (see app.services.corpus_cache_invalidation_service) as
+    its very last step, after the cutover has actually succeeded."""
+    client = _FakeQdrantClient()
+    client.count = lambda name: SimpleNamespace(count=3)  # type: ignore[method-assign]
+
+    class _FakeNewRepository:
+        def scroll_all_chunks(self):
+            return [{"source": "a.pdf"}]
+
+    report = SeedReport(
+        discovered_files=1,
+        succeeded_files=1,
+        failed_files=[],
+        chunks_written=3,
+        sources=frozenset({"a.pdf"}),
+    )
+
+    invalidate_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid,
+        "get_settings",
+        lambda: SimpleNamespace(qdrant=SimpleNamespace(qdrant_collection="policy_documents")),
+    )
+    monkeypatch.setattr(migrate_qdrant_hybrid, "get_qdrant_client", lambda: client)
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid,
+        "QdrantVectorRepository",
+        lambda client, collection_name: _FakeNewRepository(),
+    )
+    monkeypatch.setattr(migrate_qdrant_hybrid, "seed_docs", lambda vector_repository: report)
+    monkeypatch.setattr(migrate_qdrant_hybrid, "get_rag_ops_repository", lambda: "repo")
+    monkeypatch.setattr(migrate_qdrant_hybrid, "get_query_cache_service", lambda: "cache")
+    monkeypatch.setattr(migrate_qdrant_hybrid, "get_semantic_query_cache", lambda: "semantic")
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid,
+        "invalidate_corpus_caches",
+        lambda **kwargs: invalidate_calls.append(kwargs),
+    )
+
+    migrate_qdrant_hybrid.blue_green_migrate()
+
+    assert client._aliases["policy_documents"] == "policy_documents_v2"
+    assert len(invalidate_calls) == 1
+    call = invalidate_calls[0]
+    assert call["rag_ops_repository"] == "repo"
+    assert call["query_cache"] == "cache"
+    assert call["semantic_query_cache"] == "semantic"
+    assert call["actor"] == "qdrant_migration"
+    assert call["source"] == "policy_documents->policy_documents_v2"
+
+
+def test_blue_green_migrate_does_not_invalidate_caches_on_an_incomplete_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial/failed ingest must abort before ever touching the alias or
+    the caches - _require_complete_corpus's RuntimeError is the guard."""
+    client = _FakeQdrantClient()
+    report = SeedReport(discovered_files=2, succeeded_files=1, failed_files=["b.pdf"])
+
+    invalidate_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid,
+        "get_settings",
+        lambda: SimpleNamespace(qdrant=SimpleNamespace(qdrant_collection="policy_documents")),
+    )
+    monkeypatch.setattr(migrate_qdrant_hybrid, "get_qdrant_client", lambda: client)
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid, "QdrantVectorRepository", lambda client, collection_name: object()
+    )
+    monkeypatch.setattr(migrate_qdrant_hybrid, "seed_docs", lambda vector_repository: report)
+    monkeypatch.setattr(
+        migrate_qdrant_hybrid,
+        "invalidate_corpus_caches",
+        lambda **kwargs: invalidate_calls.append(kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="b.pdf"):
+        migrate_qdrant_hybrid.blue_green_migrate()
+
+    assert invalidate_calls == []
+    assert client.update_calls == []

@@ -21,7 +21,18 @@ import time
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
@@ -31,7 +42,38 @@ _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2.0
 _REQUEST_TIMEOUT_SECONDS = 60.0
 
-StructuredModel=TypeVar("StructuredModel", bound=BaseModel)
+# Only these are worth a retry: connection drops, timeouts, rate limits,
+# and 5xx (the server's problem, plausibly transient). Everything else -
+# bad auth, no permission, a malformed request, an unsupported
+# schema/model - will fail identically on every attempt, so retrying it
+# just burns _MAX_ATTEMPTS * _RETRY_BACKOFF_SECONDS of latency before
+# surfacing the same error the first attempt already had.
+_TRANSIENT_ERROR_TYPES: tuple[type[Exception], ...] = (
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+)
+
+# Explicit allowlist for retry, not an allowlist for immediate failure: an
+# exception type we haven't classified either way also fails fast (see
+# _is_transient) rather than being silently retried - a bug in our own
+# code shouldn't get 3 attempts to reproduce itself before surfacing.
+_PERMANENT_ERROR_TYPES: tuple[type[Exception], ...] = (
+    AuthenticationError,
+    PermissionDeniedError,
+    BadRequestError,
+    NotFoundError,
+    UnprocessableEntityError,
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    return isinstance(exc, _TRANSIENT_ERROR_TYPES) and not isinstance(exc, _PERMANENT_ERROR_TYPES)
+
+
+StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
+
 
 class TokenUsage(BaseModel):
     prompt_tokens: int = 0
@@ -43,10 +85,12 @@ class LLMResponse(BaseModel):
     text: str
     usage: TokenUsage
 
+
 @dataclass(frozen=True)
 class StructuredLLMResponse(Generic[StructuredModel]):
     value: StructuredModel
     usage: TokenUsage
+
 
 class LLMClient(Protocol):
     """Contract for a chat-completion provider."""
@@ -69,7 +113,6 @@ class LLMClient(Protocol):
         temperature: float = 0.0,
     ) -> LLMResponse: ...
 
-
     def generate_structured(
         self,
         system_prompt: str,
@@ -85,6 +128,12 @@ class LLMClient(Protocol):
 
 
 def build_openai_client(api_key: str, timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS) -> OpenAI:
+    # max_retries=0: the SDK's own retry loop is disabled deliberately -
+    # _create_with_retries below is the one place that retries, so it can
+    # apply this module's transient/permanent classification instead of the
+    # SDK's blunter "retry on 429/5xx" default, and so a permanent error
+    # fails after exactly one real HTTP call, not the SDK's retries nested
+    # inside our own.
     if not api_key:
         raise ValueError("OpenAI API key must not be empty")
     return OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
@@ -172,42 +221,37 @@ class OpenAILLMClient:
             ),
         )
 
-    def generate_structured(self,
-                            system_prompt: str,
-                            user_message: str,
-                            *,
-                            response_model: type[StructuredModel],
-                            model: str | None = None,
-                            temperature: float = 0.0,
-                            max_completion_tokens: int = 1_000,
-                            timeout_seconds: float = 30.0,
-                            max_attempts: int = 2,
-                            ) -> StructuredLLMResponse[StructuredModel]:
-        resolved_model=model or self._default_grader_model
-        schema_name=response_model.__name__.lower()
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        response_model: type[StructuredModel],
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_completion_tokens: int = 1_000,
+        timeout_seconds: float = 30.0,
+        max_attempts: int = 2,
+    ) -> StructuredLLMResponse[StructuredModel]:
+        resolved_model = model or self._default_grader_model
+        schema_name = response_model.__name__.lower()
         kwargs: dict[str, object] = {
-            "model":resolved_model,
-            "messages":[
-                {
-                    "role":"system",
-                    "content": system_prompt
-                },
-                {
-                    "role":"user",
-                    "content":user_message
-                }
+            "model": resolved_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
             ],
-            "temperature":temperature,
-            "max_completion_tokens":max_completion_tokens,
-            "timeout":timeout_seconds,
-            "response_format":{
-                "type":"json_schema",
-                "json_schema":{
-                    "name":schema_name,
-                    "strict":True,
-                    "schema":response_model.model_json_schema()
-                }
-            }
+            "temperature": temperature,
+            "max_completion_tokens": max_completion_tokens,
+            "timeout": timeout_seconds,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": response_model.model_json_schema(),
+                },
+            },
         }
 
         response = self._create_with_retries(
@@ -216,15 +260,15 @@ class OpenAILLMClient:
             max_attempts=max_attempts,
         )
 
-        message= response.choices[0].message
-        refusal=getattr(message, "refusal", None)
+        message = response.choices[0].message
+        refusal = getattr(message, "refusal", None)
         if refusal:
             raise RuntimeError(f"structured output refused by model {resolved_model}")
         if not message.content:
             raise ValueError("structured output was empty")
 
-        usage=response.usage
-        parsed=response_model.model_validate_json(message.content)
+        usage = response.usage
+        parsed = response_model.model_validate_json(message.content)
         return StructuredLLMResponse(
             value=parsed,
             usage=TokenUsage(
@@ -234,8 +278,12 @@ class OpenAILLMClient:
             ),
         )
 
+    def _create_with_retries(
+        self, model: str, kwargs: dict[str, object], max_attempts: int = _MAX_ATTEMPTS
+    ) -> ChatCompletion:
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
 
-    def _create_with_retries(self, model: str, kwargs: dict[str, object], max_attempts: int = _MAX_ATTEMPTS) -> ChatCompletion:
         last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -243,15 +291,25 @@ class OpenAILLMClient:
                 # OpenAI's heavily-overloaded signature can't be statically
                 # matched against a dict, even though the shape is valid.
                 return self._client.chat.completions.create(**kwargs)  # type: ignore[call-overload]
-            except Exception as exc:  # noqa: BLE001 - retry any transient API failure
+            except Exception as exc:  # noqa: BLE001 - classified below; permanent failures re-raise immediately
                 last_error = exc
+                if not _is_transient(exc):
+                    logger.warning(
+                        "llm.completion_failed_permanent",
+                        extra={
+                            "model": model,
+                            "attempt": attempt,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise
                 logger.warning(
                     "llm.completion_retry",
                     extra={
                         "model": model,
                         "attempt": attempt,
                         "max_attempts": max_attempts,
-                        "error": str(exc),
+                        "error_type": type(exc).__name__,
                     },
                 )
                 if attempt < max_attempts:

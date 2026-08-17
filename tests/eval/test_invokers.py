@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+from app.core.exceptions import EvaluationPipelineError
 from app.core.llm.chat_client import LLMResponse, TokenUsage
 from app.eval import invokers
 from app.eval.invokers import RetrievedChunk, ServiceInvoker, SkippedIntent
@@ -66,7 +67,7 @@ class _FakeRAGService:
         return self._response
 
 
-def _response(answer: str = "the answer") -> ChatResponse:
+def _response(answer: str = "the answer", *, hyde: HyDEMetadata | None = None) -> ChatResponse:
     return ChatResponse(
         answer=answer,
         sources=["a.pdf"],
@@ -74,13 +75,26 @@ def _response(answer: str = "the answer") -> ChatResponse:
         metadata=ResponseMetadata(
             route="rag",
             retrieval_mode="dense",
-            hyde=HyDEMetadata(enabled=False, backend="none"),
+            hyde=hyde or HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
         ),
         conversation_id=1,
+    )
+
+
+def _hyde_applied_response(answer: str = "the answer") -> ChatResponse:
+    """A response shaped like a real, successfully-applied HyDE run - used
+    by tests that pass ``enable_hyde=True`` and must clear
+    ServiceInvoker._call_pipeline's EvaluationPipelineError check (see
+    app.eval.invokers)."""
+    return _response(
+        answer,
+        hyde=HyDEMetadata(
+            enabled=True, applied=True, fallback=False, backend="hyde", hypothesis_count=2
+        ),
     )
 
 
@@ -155,7 +169,7 @@ def test_service_invoker_passes_enable_hyde_as_a_per_call_override() -> None:
     a baseline-vs-HyDE RAGAS comparison possible. HyDE is no longer in the
     unimplemented-features skip list - see
     test_service_invoker_skips_profiles_requesting_unimplemented_features."""
-    fake_rag_service = _FakeRAGService(_response())
+    fake_rag_service = _FakeRAGService(_hyde_applied_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
 
     invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
@@ -163,6 +177,50 @@ def test_service_invoker_passes_enable_hyde_as_a_per_call_override() -> None:
     assert fake_rag_service.calls[0]["hyde_enabled"] is True
     assert fake_rag_service.calls[0]["reranking_enabled"] is True
     assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
+
+
+def test_hyde_fallback_raises_evaluation_pipeline_error_instead_of_scoring_baseline() -> None:
+    """A HyDE case that silently fell back (LLM/embedding/fusion failure)
+    must fail loudly, not be scored as if HyDE ran - see
+    app.core.exceptions.EvaluationPipelineError."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=True, applied=False, fallback=True, backend="hyde")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError, match="hybrid\\+rerank\\+hyde"):
+        invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+
+def test_hyde_bypass_reason_raises_evaluation_pipeline_error() -> None:
+    """applied=False with a bypass_reason (even without fallback=True) is
+    still "HyDE did not run" - the eval harness's StaticPlannedQueryTransformer
+    never bypasses for rollout/emergency reasons in practice, but the check
+    itself doesn't assume that; it rejects any non-treatment outcome."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=True, applied=False, fallback=False, bypass_reason="rollout")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError):
+        invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+
+def test_non_hyde_profile_ignores_hyde_metadata_entirely() -> None:
+    """A profile with enable_hyde=False must never trigger the HyDE
+    integrity check, regardless of what the response's hyde metadata says -
+    that field is meaningless when HyDE wasn't even requested."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=False, applied=False, fallback=True, bypass_reason="disabled")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["naive"], Intent.RAG)
+
+    assert result.answer == response.answer
 
 
 @pytest.mark.parametrize("profile_name", ["hybrid+rerank+crag", "all"])

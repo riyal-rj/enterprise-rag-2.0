@@ -44,9 +44,12 @@ from functools import cached_property
 from typing import Protocol
 
 from app.core.config import get_settings
+from app.core.exceptions import EvaluationPipelineError
 from app.eval.profiles import PipelineProfile
 from app.eval.schemas import Intent
+from app.rag_services.query_transformer import StaticPlannedQueryTransformer
 from app.rag_services.rag_service import RAGService
+from app.rag_services.reranker import StaticPlannedReranker
 
 
 class SkippedIntent(Exception):
@@ -141,15 +144,21 @@ class ServiceInvoker:
             # switches it on/off per case, so hybrid+rerank profiles get a
             # real reranker to compare against, not a silent NoOpReranker
             # that would make "ran with reranking on" a no-op in practice.
-            reranker=get_reranker(),
+            # Wrapped in StaticPlannedReranker so RAGService's plan()/
+            # execute() calls work uniformly whether it holds this eval
+            # reranker or production's DynamicReranker - always reranks for
+            # real when flags.enable_rerank is on, ignoring admin
+            # rollout%/emergency-disable state (see StaticPlannedReranker's
+            # docstring in app.rag_services.reranker).
+            reranker=StaticPlannedReranker(get_reranker()),
             reranker_initial_top_k=rag_settings.reranker_initial_top_k,
             # Same reasoning as the reranker above, for HyDE: the eval-only
             # transformer (never the admin-rollout-controlled production
-            # one), always constructed regardless of
-            # RAGFeatureSettings.hyde_enabled_by_default - flags.enable_hyde
-            # (a per-call override, see _call_pipeline) is what switches it
-            # on/off per case.
-            query_transformer=get_eval_hyde_transformer(),
+            # one), wrapped in StaticPlannedQueryTransformer so it always
+            # attempts HyDE for real when flags.enable_hyde (a per-call
+            # override, see _call_pipeline) is on - never inheriting an
+            # admin's live rollout percentage or emergency-disable state.
+            query_transformer=StaticPlannedQueryTransformer(get_eval_hyde_transformer()),
             hyde_enabled=False,
         )
 
@@ -181,6 +190,22 @@ class ServiceInvoker:
             reranking_enabled=flags.enable_rerank,
             hyde_enabled=flags.enable_hyde,
         )
+
+        if flags.enable_hyde:
+            hyde = response.metadata.hyde
+            if not hyde.applied or hyde.fallback or hyde.bypass_reason is not None:
+                # A case that asked for HyDE and silently got baseline
+                # (non-HyDE) output would score as if HyDE were under test
+                # when it never actually ran - fail the case instead of
+                # quietly measuring the wrong pipeline. StaticPlannedQueryTransformer
+                # ignores rollout/emergency state, so bypass_reason here can
+                # only mean a real generation/embedding/fusion failure.
+                raise EvaluationPipelineError(
+                    f"{flags.name}: HyDE was requested but not applied "
+                    f"(applied={hyde.applied}, fallback={hyde.fallback}, "
+                    f"bypass_reason={hyde.bypass_reason!r})"
+                )
+
         chunks = [
             RetrievedChunk(text=c.text, source=c.source) for c in response.metadata.retrieved_chunks
         ]

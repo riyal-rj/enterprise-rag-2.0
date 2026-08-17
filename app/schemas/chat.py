@@ -67,9 +67,17 @@ class RerankingMetadata(BaseModel):
 class HyDEMetadata(BaseModel):
     """Diagnostic detail about the HyDE query-transformation stage.
 
-    ``enabled`` reflects whether this request was eligible to run HyDE
-    (feature on + sampled into rollout), independent of whether it actually
-    ``applied`` - the same disabled/bypass/applied/fallback distinction
+    ``enabled=True`` only means the HyDE feature toggle was on and the
+    resolved retrieval strategy uses dense embeddings for this request - it
+    does **not** imply the query was sampled into the rollout treatment
+    cohort. A query can have ``enabled=True`` and still show
+    ``applied=False, bypass_reason="rollout"`` (sampled into the control
+    cohort) or ``bypass_reason="emergency_disabled"`` (kill switch active) -
+    see ``DynamicQueryTransformer.plan`` in
+    ``app.rag_services.dynamic_query_transformer`` for how the
+    disabled/control/treatment cohort is actually decided. ``bypass_reason``
+    is the field that distinguishes those cases; ``enabled`` alone does not.
+    This mirrors the disabled/bypass/applied/fallback distinction
     ``RerankingMetadata`` carries for reranking. Hypothetical passage text
     itself is never included here - it's a retrieval probe, not evidence,
     and must not leak into the response, logs, or cache (see

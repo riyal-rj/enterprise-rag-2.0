@@ -6,6 +6,16 @@ these fakes are HyDE-specific (an embedding client that returns a
 distinguishable vector for hypothesis text vs. the original question, so
 tests can prove *which* vector actually reached retrieval/the semantic
 cache).
+
+Uses the real ``DynamicQueryTransformer`` (production adapter) wrapped
+around a raw fake delegate, rather than a hand-rolled ``PlannedQueryTransformer``
+fake - the private fallback config store RAGService builds when no
+``config_store`` is passed seeds ``hyde_rollout_percentage=100``, which
+makes ``DynamicQueryTransformer.plan`` deterministically resolve to the
+"treatment" cohort for every query, so these tests don't need to think
+about rollout sampling at all while still exercising the real
+plan()/execute() contract (see test_dynamic_query_transformer.py for the
+cohort-decision unit tests themselves).
 """
 
 from __future__ import annotations
@@ -19,13 +29,10 @@ from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.query_transformer import (
-    FailOpenQueryTransformer,
-    QueryTransformer,
-    QueryTransformOutcome,
-)
+from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
+from app.rag_services.query_transformer import QueryTransformer, QueryTransformOutcome
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import ReRankedChunk, ReRanker, ReRankOutcome
+from app.rag_services.reranker import PlannedReranker, ReRankedChunk, ReRankOutcome, RerankPlan
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,
@@ -154,24 +161,26 @@ class _FakeLLMClient:
 
 
 class _FakeReranker:
+    """PlannedReranker fake, always "treatment" when enabled - see the
+    identical pattern in test_rag_service.py."""
+
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    @property
-    def name(self) -> str:
-        return "fake-reranker"
+    def plan(self, query: str, config, *, enabled: bool) -> RerankPlan:
+        if not enabled:
+            return RerankPlan("disabled", None, "none", "disabled", "rerank:none:reason=disabled")
+        return RerankPlan("treatment", None, "fake-reranker", None, "reranker:fake-reranker:v1")
 
-    @property
-    def cache_namespace(self) -> str:
-        return "reranker:fake-reranker:v1"
-
-    def rerank(self, *, query: str, candidates: list[RetrievedChunk], top_k: int) -> ReRankOutcome:
+    def execute(
+        self, plan: RerankPlan, *, query: str, candidates: list[RetrievedChunk], top_k: int
+    ) -> ReRankOutcome:
         self.calls.append({"query": query, "top_k": top_k})
         items = tuple(
             ReRankedChunk(chunk=c, original_rank=i + 1, rerank_score=1.0)
             for i, c in enumerate(candidates[:top_k])
         )
-        return ReRankOutcome(items=items, backend=self.name, applied=True)
+        return ReRankOutcome(items=items, backend="fake-reranker", applied=True)
 
 
 class _FakeSemanticQueryCache:
@@ -181,10 +190,20 @@ class _FakeSemanticQueryCache:
         self.record_calls: list[dict[str, object]] = []
 
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         self.find_candidates_calls.append(
-            {"query_embedding": query_embedding, "cache_namespace": cache_namespace, "top_k": top_k}
+            {
+                "query_embedding": query_embedding,
+                "cache_namespace": cache_namespace,
+                "top_k": top_k,
+                "similarity_threshold": similarity_threshold,
+            }
         )
         return self.candidate_keys
 
@@ -204,12 +223,16 @@ class _FakeSemanticQueryCache:
 class _FakeQueryTransformer:
     """Two hypotheses by default (text prefixed "hyp" so
     _FakeEmbeddingClient can recognize them); pass ``outcome_factory`` or
-    ``raise_error`` to simulate bypass/fallback/error outcomes."""
+    ``raise_error`` to simulate bypass/fallback/error outcomes. Implements
+    the *delegate*-level QueryTransformer Protocol (name/cache_namespace/
+    transform) - _hyde_service wraps this in the real
+    DynamicQueryTransformer, same as production."""
 
     def __init__(self, *, raise_error: bool = False, outcome_factory=None) -> None:  # type: ignore[no-untyped-def]
         self._raise_error = raise_error
         self._outcome_factory = outcome_factory
         self.calls: list[str] = []
+        self.cache_namespace_value = "hyde:fake:v1"
 
     @property
     def name(self) -> str:
@@ -217,7 +240,7 @@ class _FakeQueryTransformer:
 
     @property
     def cache_namespace(self) -> str:
-        return "hyde:fake:v1"
+        return self.cache_namespace_value
 
     def transform(self, query: str) -> QueryTransformOutcome:
         self.calls.append(query)
@@ -237,7 +260,7 @@ def _hyde_service(
     *,
     hyde_enabled: bool = True,
     llm_client: _FakeLLMClient | None = None,
-    reranker: _FakeReranker | None = None,
+    reranker: PlannedReranker | None = None,
     reranking_enabled: bool = False,
     semantic_cache: _FakeSemanticQueryCache | None = None,
     semantic_cache_enabled: bool = False,
@@ -258,18 +281,26 @@ def _hyde_service(
             sparse_embedding_client=cast(SparseEmbeddingClient, sparse_client),
         )
     else:
-        strategy = DenseRetrievalStrategy(vector_repository=cast(VectorRepository, vector_repository))
+        strategy = DenseRetrievalStrategy(
+            vector_repository=cast(VectorRepository, vector_repository)
+        )
     service = RAGService(
         embedding_client=cast(EmbeddingClient, embedding_client),
         retrieval_strategies={strategy.name: strategy},
         llm_client=cast(LLMClient, llm_client or _FakeLLMClient()),
         cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
         default_retrieval_mode=strategy.name,
-        reranker=cast("ReRanker | None", reranker),
+        reranker=reranker,
         reranking_enabled=reranking_enabled,
         semantic_cache=cast(SemanticQueryCache, semantic_cache) if semantic_cache else None,
         semantic_cache_enabled=semantic_cache_enabled,
-        query_transformer=cast(QueryTransformer, query_transformer),
+        # hyde_rollout_percentage=100 is the private fallback store's
+        # default (see RAGService.__init__) - DynamicQueryTransformer.plan
+        # therefore always resolves "treatment" here whenever hyde_enabled
+        # is true, with no rollout sampling for these tests to reason about.
+        query_transformer=DynamicQueryTransformer(
+            delegate=cast(QueryTransformer, query_transformer)
+        ),
         hyde_enabled=hyde_enabled,
     )
     return service, vector_repository
@@ -335,7 +366,11 @@ def test_hybrid_retrieval_uses_fused_hyde_vector_and_original_sparse_text() -> N
     transformer = _FakeQueryTransformer()
     sparse_client = _RecordingSparseEmbeddingClient()
     service, vector_repository = _hyde_service(
-        chunks, embedding_client, transformer, strategy_name="hybrid", sparse_embedding_client=sparse_client
+        chunks,
+        embedding_client,
+        transformer,
+        strategy_name="hybrid",
+        sparse_embedding_client=sparse_client,
     )
 
     service.answer("original question text", top_k=1)
@@ -390,9 +425,9 @@ def test_hyde_transform_failure_falls_back_to_original_vector_and_does_not_cache
     chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
     embedding_client = _FakeEmbeddingClient()
     raising = _FakeQueryTransformer(raise_error=True)
-    service, vector_repository = _hyde_service(
-        chunks, embedding_client, FailOpenQueryTransformer(cast(QueryTransformer, raising))
-    )
+    # DynamicQueryTransformer wraps its delegate in FailOpenQueryTransformer
+    # internally (see _hyde_service) - no need to pre-wrap here.
+    service, vector_repository = _hyde_service(chunks, embedding_client, raising)
 
     first = service.answer("q", top_k=1)
     second = service.answer("q", top_k=1)
@@ -403,10 +438,14 @@ def test_hyde_transform_failure_falls_back_to_original_vector_and_does_not_cache
     assert second.cache_hit is False
 
 
-def test_hyde_embedding_or_fusion_failure_falls_back_to_original_vector_and_does_not_cache() -> None:
+def test_hyde_embedding_or_fusion_failure_falls_back_to_original_vector_and_does_not_cache() -> (
+    None
+):
     chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
     embedding_client = _FailingHyDEEmbeddingClient()
-    transformer = _FakeQueryTransformer()  # applied=True, 2 hypotheses -> the batch embed call fails
+    transformer = (
+        _FakeQueryTransformer()
+    )  # applied=True, 2 hypotheses -> the batch embed call fails
     service, vector_repository = _hyde_service(chunks, embedding_client, transformer)
 
     first = service.answer("q", top_k=1)
@@ -448,12 +487,9 @@ def test_cache_key_changes_when_the_hyde_transformer_namespace_changes() -> None
     into cache_namespace via the transformer's own cache_namespace."""
     service_a, _ = _hyde_service([], _FakeEmbeddingClient(), _FakeQueryTransformer())
 
-    class _OtherNamespaceTransformer(_FakeQueryTransformer):
-        @property
-        def cache_namespace(self) -> str:
-            return "hyde:fake:v2"
-
-    service_b, _ = _hyde_service([], _FakeEmbeddingClient(), _OtherNamespaceTransformer())
+    other = _FakeQueryTransformer()
+    other.cache_namespace_value = "hyde:fake:v2"
+    service_b, _ = _hyde_service([], _FakeEmbeddingClient(), other)
 
     key_a = service_a._cache_key("q", 1, "dense:v1:hyde:fake:v1")
     key_b = service_b._cache_key("q", 1, "dense:v1:hyde:fake:v2")
@@ -509,9 +545,7 @@ def test_hyde_metadata_applied_on_success() -> None:
 def test_hyde_metadata_fallback_on_transform_error() -> None:
     chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
     raising = _FakeQueryTransformer(raise_error=True)
-    service, _ = _hyde_service(
-        chunks, _FakeEmbeddingClient(), FailOpenQueryTransformer(cast(QueryTransformer, raising))
-    )
+    service, _ = _hyde_service(chunks, _FakeEmbeddingClient(), raising)
 
     response = service.answer("q", top_k=1)
 
@@ -535,3 +569,99 @@ def test_hyde_metadata_rollout_bypass_is_distinct_from_fallback() -> None:
     assert response.metadata.hyde.applied is False
     assert response.metadata.hyde.fallback is False
     assert response.metadata.hyde.bypass_reason == "rollout"
+
+
+class _FakeMetricsRecorder:
+    def __init__(self) -> None:
+        self.hyde_attempt_calls: list[dict[str, object]] = []
+        self.hyde_bypass_calls: list[str] = []
+
+    def record_semantic_cache_lookup(self, *, hit: bool) -> None:
+        pass
+
+    def record_hyde_attempt(self, *, duration_ms: float, fallback: bool, usage_tokens: int) -> None:
+        self.hyde_attempt_calls.append(
+            {"duration_ms": duration_ms, "fallback": fallback, "usage_tokens": usage_tokens}
+        )
+
+    def record_hyde_bypass(self, *, reason: str) -> None:
+        self.hyde_bypass_calls.append(reason)
+
+
+def test_treatment_attempt_metrics_include_total_stage_latency_not_just_generation() -> None:
+    """Regression: the old code recorded the metric right after the LLM
+    generation call returned, before the embedding+fusion stage could still
+    fail - HydeQueryTransformer itself never sets duration_ms, so a metric
+    recorded that early would always read ~0ms and could report "success"
+    for a request that later failed during embedding/fusion. RAGService
+    must record exactly once, after the complete stage, with a real
+    measured duration."""
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    metrics = _FakeMetricsRecorder()
+    embedding_client = _FakeEmbeddingClient()
+    transformer = _FakeQueryTransformer()
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, embedding_client),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        query_transformer=DynamicQueryTransformer(delegate=cast(QueryTransformer, transformer)),
+        hyde_enabled=True,
+        metrics=cast("object", metrics),
+    )
+
+    service.answer("q", top_k=1)
+
+    assert len(metrics.hyde_attempt_calls) == 1
+    assert metrics.hyde_attempt_calls[0]["fallback"] is False
+    assert isinstance(metrics.hyde_attempt_calls[0]["duration_ms"], float)
+
+
+def test_embedding_fusion_failure_is_recorded_as_a_fallback_attempt_not_a_success() -> None:
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    metrics = _FakeMetricsRecorder()
+    embedding_client = _FailingHyDEEmbeddingClient()
+    transformer = _FakeQueryTransformer()
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, embedding_client),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        query_transformer=DynamicQueryTransformer(delegate=cast(QueryTransformer, transformer)),
+        hyde_enabled=True,
+        metrics=cast("object", metrics),
+    )
+
+    service.answer("q", top_k=1)
+
+    assert len(metrics.hyde_attempt_calls) == 1
+    assert metrics.hyde_attempt_calls[0]["fallback"] is True
+
+
+def test_metrics_none_does_not_crash_when_hyde_and_semantic_cache_are_active() -> None:
+    """Mirrors the eval harness, which constructs RAGService without a
+    metrics= kwarg at all - RAGService must default to a no-op recorder,
+    not require every caller to supply one."""
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    semantic_cache = _FakeSemanticQueryCache()
+    service, _ = _hyde_service(
+        chunks,
+        _FakeEmbeddingClient(),
+        _FakeQueryTransformer(),
+        semantic_cache=semantic_cache,
+        semantic_cache_enabled=True,
+    )
+
+    response = service.answer("q", top_k=1)
+
+    assert response.metadata.hyde.applied is True

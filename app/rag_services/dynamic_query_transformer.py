@@ -1,94 +1,57 @@
-from __future__ import annotations
+"""Admin-mutable HyDE rollout: canary percentage and an emergency kill
+switch, changeable from the RAG Operations panel without a process restart
+(see ``app.controllers.rag_ops_controller``).
 
-import threading
-import time
-from dataclasses import dataclass, replace
-from typing import Protocol
+``DynamicQueryTransformer`` holds no mutable state of its own - ``plan()``
+decides a query's cohort from a single, caller-supplied ``RagRuntimeConfig``
+snapshot (``RAGService.answer`` captures exactly one per request and passes
+it in), and ``execute()`` performs the transformation according to a
+previously-computed plan. Nothing here re-reads a shared store mid-request,
+which is what makes it safe for ``RAGService`` to build a cohort-aware cache
+namespace from the same plan it later executes against - see
+``app.rag_services.rag_runtime_config`` and ``app.rag_services.rag_service``
+for why a second, independent config read partway through a request would
+be a real bug (a concurrent admin update could split one request across two
+cohorts).
+"""
+
+from __future__ import annotations
 
 from app.rag_services.query_transformer import (
     FailOpenQueryTransformer,
+    HyDEPlan,
     NoOpQueryTransformer,
+    PlannedQueryTransformer,
     QueryTransformer,
     QueryTransformOutcome,
 )
+from app.rag_services.rag_runtime_config import RagRuntimeConfig
 from app.rag_services.rollout import sampled_in
 
 
-class _HyDEMetricsRecorder(Protocol):
-    def record_hyde_attempt(self,*,
-                            duration_ms: float,
-                            fallback: bool,
-                            usage_tokens: int) -> None : ...
-    def record_hyde_bypass(self,*,
-                           reason: str) -> None: ...
+class DynamicQueryTransformer(PlannedQueryTransformer):
+    """Production :class:`PlannedQueryTransformer`: cohort decided from a
+    caller-supplied config snapshot - see module docstring."""
 
-
-@dataclass(frozen=True)
-class HyDERuntimeState:
-    rollout_percentage: int
-    emergency_disabled: bool
-
-class DynamicQueryTransformer:
-    def __init__(self,*,
-                 delegate:QueryTransformer,
-                 metrics:_HyDEMetricsRecorder,
-                 rollout_percentage: int = 0,
-                 emergency_disabled: bool = False) -> None:
-
-        if not 0 <= rollout_percentage <= 100:
-            raise ValueError("rollout_percentage must be between 0 and 100")
-
+    def __init__(self, *, delegate: QueryTransformer) -> None:
         self._delegate = FailOpenQueryTransformer(delegate)
-        self._metrics=metrics
-        self._lock=threading.Lock()
-        self._state=HyDERuntimeState(rollout_percentage,emergency_disabled)
 
-    def configure(self,*,
-                  rollout_percentage: int,
-                  emergency_disabled:bool)->None:
-        if not 0 <= rollout_percentage <= 100:
-            raise ValueError("rollout_percentage must be between 0 and 100")
-
-        new_state=HyDERuntimeState(rollout_percentage,emergency_disabled)
-        with self._lock:
-            self._state=new_state
-
-    def _snapshot(self)->HyDERuntimeState:
-        with self._lock:
-            return self._state
-
-    @property
-    def name(self)->str:
-        return self._delegate.name
-
-    @property
-    def cache_namespace(self) -> str:
-        state = self._snapshot()
-        return (
-            f"dynamic-query-transform:v1:rollout={state.rollout_percentage}"
-            f":emergency={int(state.emergency_disabled)}:{self._delegate.cache_namespace}"
+    def plan(self, query: str, config: RagRuntimeConfig, *, enabled: bool) -> HyDEPlan:
+        if not enabled:
+            return HyDEPlan("disabled", "disabled", "query-transform:none:reason=disabled")
+        if config.emergency_disabled:
+            return HyDEPlan(
+                "disabled", "emergency_disabled", "query-transform:none:reason=emergency_disabled"
+            )
+        if not sampled_in(query, config.hyde_rollout_percentage, salt="hyde:v1"):
+            return HyDEPlan("control", "rollout", "query-transform:none:reason=rollout")
+        return HyDEPlan(
+            "treatment",
+            None,
+            f"dynamic-query-transform:v1:cohort=treatment:{self._delegate.cache_namespace}",
         )
 
-    def transform(self,
-                  query:str) -> QueryTransformOutcome:
-        state = self._snapshot()
-        if state.emergency_disabled:
-            self._metrics.record_hyde_bypass(reason="emergency_disabled")
-            return NoOpQueryTransformer(reason="emergency_disabled").transform(query)
-
-        if not sampled_in(query,
-                          state.rollout_percentage,
-                          salt="hyde:v1"):
-            self._metrics.record_hyde_bypass(reason="rollout")
-            return NoOpQueryTransformer(reason="rollout").transform(query)
-
-        started=time.perf_counter()
-        outcome=self._delegate.transform(query)
-        duration_ms=(time.perf_counter() - started) * 1000
-        measured=replace(outcome, duration_ms=duration_ms)
-        self._metrics.record_hyde_attempt(
-            duration_ms=duration_ms,
-            fallback=measured.fallback,
-            usage_tokens=measured.usage_tokens
-        )
-        return measured
+    def execute(self, query: str, plan: HyDEPlan) -> QueryTransformOutcome:
+        if plan.cohort != "treatment":
+            return NoOpQueryTransformer(reason=plan.bypass_reason or "disabled").transform(query)
+        return self._delegate.transform(query)

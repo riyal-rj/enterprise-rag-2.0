@@ -55,14 +55,25 @@ class SemanticQueryCache(Protocol):
     partition."""
 
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         """Return exact-match cache keys of previously-cached questions in
-        this partition that clear the configured similarity threshold,
-        nearest-first. Empty if nothing clears it. Callers should try each
-        key in order (via the exact-match cache) until one is still live,
-        since the nearest embedding match's underlying answer may have
-        expired."""
+        this partition that clear ``similarity_threshold``, nearest-first.
+        Empty if nothing clears it. Callers should try each key in order
+        (via the exact-match cache) until one is still live, since the
+        nearest embedding match's underlying answer may have expired.
+
+        ``similarity_threshold`` is a caller-supplied value, not read from
+        any shared store here - the caller (``RAGService.answer``) captures
+        one config snapshot per request and passes its
+        ``semantic_cache_threshold`` straight through, so this repository
+        can't disagree with the rest of that same request about which
+        config generation is in effect."""
         ...
 
     def record(
@@ -83,13 +94,6 @@ class SemanticQueryCache(Protocol):
         """
         ...
 
-    def set_similarity_threshold(self, threshold: float) -> None:
-        """Live-update the match threshold - lets an admin's RAG
-        Operations panel change take effect on the very next lookup
-        without rebuilding this (``lru_cache``'d) singleton. See
-        ``app.controllers.rag_ops_controller``."""
-        ...
-
 
 class QdrantSemanticQueryCache:
     """:class:`SemanticQueryCache` backed by a dedicated Qdrant collection.
@@ -106,29 +110,27 @@ class QdrantSemanticQueryCache:
     it on later without a cold-construction cost) - eagerly ensuring the
     Qdrant collection in ``__init__`` would reintroduce a hard Qdrant
     dependency for deployments that keep semantic caching disabled.
+
+    ``similarity_threshold`` is passed in per-call by ``RAGService`` (from
+    the one config snapshot it captures per request) rather than read from
+    a shared store here - this class holds no runtime-config reference at
+    all, so it can never independently disagree with the rest of a request
+    about which config generation is in effect.
     """
 
-    def __init__(
-        self,
-        client: QdrantClient,
-        collection_name: str,
-        similarity_threshold: float,
-    ) -> None:
-        if not 0.0 <= similarity_threshold <= 1.0:
-            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
+    def __init__(self, client: QdrantClient, collection_name: str) -> None:
         self._client = client
         self._collection_name = collection_name
-        self._similarity_threshold = similarity_threshold
         self._collection_ready = False
         self._collection_ready_lock = threading.Lock()
 
-    def set_similarity_threshold(self, threshold: float) -> None:
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError("similarity_threshold must be between 0.0 and 1.0")
-        self._similarity_threshold = threshold
-
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         self._ensure_collection_ready()
         results = self._client.query_points(
@@ -141,7 +143,7 @@ class QdrantSemanticQueryCache:
 
         candidates: list[str] = []
         for point in results:
-            if point.score < self._similarity_threshold:
+            if point.score < similarity_threshold:
                 break  # results are score-sorted descending; nothing after this clears it either
             payload = point.payload or {}
             cache_key = payload.get("cache_key")

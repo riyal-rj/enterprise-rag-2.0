@@ -5,7 +5,15 @@ from collections.abc import Sequence
 
 _MIN_NORM = 1e-12
 
-def mean_pool_and_normalize(vectors:Sequence[Sequence[float]]) -> list[float]:
+# Bump whenever the fusion algorithm changes (e.g. mean-pool -> weighted
+# pool) - referenced by HydeQueryTransformer.cache_namespace so a cached
+# HyDE-fused answer can't be served back under a fusion algorithm that
+# would have produced a different retrieval vector for the same
+# hypotheses.
+FUSION_ALGORITHM_VERSION = "mean-pool-l2-normalize:v1"
+
+
+def mean_pool_and_normalize(vectors: Sequence[Sequence[float]]) -> list[float]:
     if not vectors:
         raise ValueError("at least one embedding is required.")
 
@@ -13,7 +21,7 @@ def mean_pool_and_normalize(vectors:Sequence[Sequence[float]]) -> list[float]:
     if dimension == 0:
         raise ValueError("embedding dimension must be greater than zero.")
 
-    totals=[0.0] * dimension
+    totals = [0.0] * dimension
     for vector_index, vector in enumerate(vectors):
         if len(vector) != dimension:
             raise ValueError(
@@ -21,16 +29,16 @@ def mean_pool_and_normalize(vectors:Sequence[Sequence[float]]) -> list[float]:
             )
 
         for value_index, raw_value in enumerate(vector):
-             value=float(raw_value)
-             if not math.isfinite(value):
-                 raise ValueError(
-                     f"embedding {vector_index} has non-finite value {raw_value} at index {value_index}"
-                 )
-             totals[value_index] += value
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"embedding {vector_index} has non-finite value {raw_value} at index {value_index}"
+                )
+            totals[value_index] += value
 
-    count=float(len(vectors))
-    mean=[value/count for value in totals]
-    norm=math.sqrt(sum(value * value for value in mean))
+    count = float(len(vectors))
+    mean = [value / count for value in totals]
+    norm = math.sqrt(sum(value * value for value in mean))
     if not math.isfinite(norm) or norm <= _MIN_NORM:
         raise ValueError("mean embedding has zero or invalid norm")
-    return [ value / norm for value in mean]
+    return [value / norm for value in mean]

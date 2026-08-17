@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from app.controllers.rag_ops_controller import RagOpsController
 from app.core.exceptions import InvalidRagOpsConfigError
 from app.models.rag_ops import RagOpsAuditEntry, RagOpsConfig
+from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
 from app.schemas.rag_ops import (
     EmergencyDisableRequest,
     EmergencyEnableRequest,
@@ -30,7 +31,7 @@ def _config(**overrides: object) -> RagOpsConfig:
         emergency_disabled_by=None,
         corpus_version=1,
         last_cache_invalidated_at=None,
-        updated_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(UTC),
         updated_by=None,
     )
     defaults.update(overrides)
@@ -48,11 +49,15 @@ class _FakeRepository:
 
     def update_config(self, **kwargs: object) -> RagOpsConfig:
         self.update_calls.append(kwargs)
-        updates = {k: v for k, v in kwargs.items() if v is not None and k not in {"actor", "reason"}}
+        updates = {
+            k: v for k, v in kwargs.items() if v is not None and k not in {"actor", "reason"}
+        }
         self.config = RagOpsConfig(**{**self.config.__dict__, **updates})
         return self.config
 
-    def set_emergency_disabled(self, *, actor: str, disabled: bool, reason: str | None) -> RagOpsConfig:
+    def set_emergency_disabled(
+        self, *, actor: str, disabled: bool, reason: str | None
+    ) -> RagOpsConfig:
         self.emergency_calls.append({"actor": actor, "disabled": disabled, "reason": reason})
         self.config = RagOpsConfig(
             **{
@@ -78,85 +83,28 @@ class _FakeRepository:
                 action="config_update",
                 changes={"reranking_enabled": {"old": False, "new": True}},
                 reason="testing",
-                created_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
             )
         ][:limit]
-
-
-class _FakeRagService:
-    def __init__(self) -> None:
-        self.reranking_enabled: bool | None = None
-        self.semantic_cache_enabled: bool | None = None
-        self.hyde_enabled: bool | None = None
-
-    def set_reranking_enabled(self, enabled: bool) -> None:
-        self.reranking_enabled = enabled
-
-    def set_semantic_cache_enabled(self, enabled: bool) -> None:
-        self.semantic_cache_enabled = enabled
-
-    def set_hyde_enabled(self, enabled: bool) -> None:
-        self.hyde_enabled = enabled
 
 
 class _FakeDynamicReranker:
     def __init__(self, has_voyage: bool = True) -> None:
         self._has_voyage = has_voyage
-        self.backend: str | None = None
-        self.rollout_percentage: int | None = None
-        self.emergency_disabled: bool | None = None
 
     @property
     def has_voyage_backend(self) -> bool:
         return self._has_voyage
 
-    def set_backend(self, backend: str) -> None:
-        self.backend = backend
-
-    def set_rollout_percentage(self, percentage: int) -> None:
-        self.rollout_percentage = percentage
-
-    def set_emergency_disabled(self, disabled: bool) -> None:
-        self.emergency_disabled = disabled
-
-
-class _FakeSemanticQueryCache:
-    def __init__(self) -> None:
-        self.threshold: float | None = None
-
-    def set_similarity_threshold(self, threshold: float) -> None:
-        self.threshold = threshold
-
-
-class _FakeDynamicHydeTransformer:
-    def __init__(self) -> None:
-        self.rollout_percentage: int | None = None
-        self.emergency_disabled: bool | None = None
-
-    def configure(self, *, rollout_percentage: int, emergency_disabled: bool) -> None:
-        self.rollout_percentage = rollout_percentage
-        self.emergency_disabled = emergency_disabled
-
 
 def _controller(
     config: RagOpsConfig | None = None, has_voyage: bool = True
-) -> tuple[
-    RagOpsController,
-    _FakeRepository,
-    _FakeRagService,
-    _FakeDynamicReranker,
-    _FakeDynamicHydeTransformer,
-    _FakeSemanticQueryCache,
-]:
+) -> tuple[RagOpsController, _FakeRepository, RagRuntimeConfigStore, _FakeDynamicReranker]:
     repository = _FakeRepository(config or _config())
-    rag_service = _FakeRagService()
+    config_store = RagRuntimeConfigStore()
     reranker = _FakeDynamicReranker(has_voyage=has_voyage)
-    hyde_transformer = _FakeDynamicHydeTransformer()
-    semantic_cache = _FakeSemanticQueryCache()
-    controller = RagOpsController(
-        repository, rag_service, reranker, hyde_transformer, semantic_cache, RagMetricsService()
-    )
-    return controller, repository, rag_service, reranker, hyde_transformer, semantic_cache
+    controller = RagOpsController(repository, config_store, reranker, RagMetricsService())
+    return controller, repository, config_store, reranker
 
 
 def test_status_reflects_current_config() -> None:
@@ -168,8 +116,17 @@ def test_status_reflects_current_config() -> None:
     assert status.corpus_version == 3
 
 
-def test_update_config_pushes_new_values_into_live_singletons() -> None:
-    controller, repository, rag_service, reranker, hyde_transformer, semantic_cache = _controller()
+def test_status_reflects_hyde_fields() -> None:
+    controller, *_ = _controller(_config(hyde_enabled=True, hyde_rollout_percentage=17))
+
+    status = controller.status()
+
+    assert status.hyde_enabled is True
+    assert status.hyde_rollout_percentage == 17
+
+
+def test_update_config_pushes_new_values_into_the_shared_config_store() -> None:
+    controller, repository, config_store, reranker = _controller()
 
     controller.update_config(
         "admin",
@@ -184,27 +141,25 @@ def test_update_config_pushes_new_values_into_live_singletons() -> None:
         ),
     )
 
-    assert rag_service.reranking_enabled is True
-    assert rag_service.semantic_cache_enabled is True
-    assert rag_service.hyde_enabled is True
-    assert reranker.backend == "voyage"
-    assert reranker.rollout_percentage == 25
-    assert semantic_cache.threshold == 0.8
-    assert hyde_transformer.rollout_percentage == 5
-    assert hyde_transformer.emergency_disabled is False
+    current = config_store.current
+    assert current.reranking_enabled is True
+    assert current.semantic_cache_enabled is True
+    assert current.reranker_backend == "voyage"
+    assert current.reranker_rollout_percentage == 25
+    assert current.semantic_cache_threshold == 0.8
+    assert current.hyde_enabled is True
+    assert current.hyde_rollout_percentage == 5
 
 
 def test_update_config_rejects_voyage_backend_without_api_key() -> None:
     controller, *_ = _controller(has_voyage=False)
 
     with pytest.raises(InvalidRagOpsConfigError):
-        controller.update_config(
-            "admin", RagOpsConfigUpdateRequest(reranker_backend="voyage")
-        )
+        controller.update_config("admin", RagOpsConfigUpdateRequest(reranker_backend="voyage"))
 
 
 def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
-    controller, repository, rag_service, reranker, hyde_transformer, semantic_cache = _controller(
+    controller, repository, config_store, reranker = _controller(
         _config(reranking_enabled=True, semantic_cache_enabled=True, hyde_enabled=True)
     )
 
@@ -213,22 +168,26 @@ def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
     )
 
     assert status.emergency_disabled is True
-    assert rag_service.reranking_enabled is False
-    assert rag_service.semantic_cache_enabled is False
-    assert rag_service.hyde_enabled is False
-    assert reranker.emergency_disabled is True
-    assert hyde_transformer.emergency_disabled is True
+    current = config_store.current
+    assert current.reranking_enabled is False
+    assert current.semantic_cache_enabled is False
+    assert current.emergency_disabled is True
+    # hyde_enabled is stored raw (not pre-baked with emergency_disabled) -
+    # DynamicQueryTransformer.plan resolves the emergency bypass itself so
+    # HyDEMetricsSnapshot.emergency_bypasses stays observable. See
+    # app.controllers.rag_ops_controller.apply_rag_ops_config.
+    assert current.hyde_enabled is True
 
 
 def test_emergency_enable_restores_previously_configured_state() -> None:
-    controller, repository, rag_service, *_ = _controller(
+    controller, repository, config_store, _ = _controller(
         _config(reranking_enabled=True, emergency_disabled=True)
     )
 
     status = controller.emergency_enable("admin", EmergencyEnableRequest(reason=None))
 
     assert status.emergency_disabled is False
-    assert rag_service.reranking_enabled is True
+    assert config_store.current.reranking_enabled is True
 
 
 def test_audit_log_maps_repository_entries() -> None:
@@ -238,3 +197,35 @@ def test_audit_log_maps_repository_entries() -> None:
 
     assert len(audit.items) == 1
     assert audit.items[0].action == "config_update"
+
+
+def test_config_replacement_never_leaves_the_store_in_a_torn_state() -> None:
+    """Regression: _apply() used to make several independent set_*() calls
+    across multiple objects - a concurrent reader between any two of them
+    could observe a mix of old and new fields. Replacing the whole
+    RagRuntimeConfig snapshot in one call makes that impossible: after
+    update_config() returns, every field in config_store.current reflects
+    the *same* update, never a partial one."""
+    controller, _, config_store, _ = _controller(
+        _config(reranking_enabled=False, semantic_cache_enabled=False, corpus_version=1)
+    )
+
+    controller.update_config(
+        "admin",
+        RagOpsConfigUpdateRequest(
+            reranking_enabled=True,
+            reranker_backend="voyage",
+            reranker_rollout_percentage=42,
+            semantic_cache_enabled=True,
+            semantic_cache_threshold=0.42,
+        ),
+    )
+
+    current = config_store.current
+    assert (
+        current.reranking_enabled,
+        current.reranker_backend,
+        current.reranker_rollout_percentage,
+        current.semantic_cache_enabled,
+        current.semantic_cache_threshold,
+    ) == (True, "voyage", 42, True, 0.42)

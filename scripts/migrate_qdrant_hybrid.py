@@ -59,9 +59,15 @@ from qdrant_client.models import (
     DeleteAliasOperation,
 )
 
-from app.api.deps import get_qdrant_client
+from app.api.deps import (
+    get_qdrant_client,
+    get_query_cache_service,
+    get_rag_ops_repository,
+    get_semantic_query_cache,
+)
 from app.core.config import get_settings
 from app.repositories.vector_repository import QdrantVectorRepository
+from app.services.corpus_cache_invalidation_service import invalidate_corpus_caches
 from scripts.seed_db import SeedReport, seed_docs
 
 logger = logging.getLogger(__name__)
@@ -124,6 +130,19 @@ def blue_green_migrate() -> None:
         )
 
     _cutover_alias(client, target_name, new_collection_name)
+
+    # The alias now resolves to freshly re-ingested content, but nothing
+    # above touched corpus_version or the RAG-answer caches - without this,
+    # a request landing right after cutover could still get an answer
+    # cached (exact-match or semantic) from before the migration ever ran.
+    # See app.services.corpus_cache_invalidation_service.
+    invalidate_corpus_caches(
+        rag_ops_repository=get_rag_ops_repository(),
+        query_cache=get_query_cache_service(),
+        semantic_query_cache=get_semantic_query_cache(),
+        actor="qdrant_migration",
+        source=f"{target_name}->{new_collection_name}",
+    )
 
 
 def _require_complete_corpus(report: SeedReport) -> None:

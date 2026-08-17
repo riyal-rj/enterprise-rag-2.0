@@ -2,12 +2,17 @@
 an emergency kill switch, all changeable from the RAG Operations panel
 without a process restart (see ``app.controllers.rag_ops_controller``).
 
-``app.api.deps.get_dynamic_reranker`` returns a single long-lived instance
-of this class; mutating it in place (``set_backend`` /
-``set_rollout_percentage`` / ``set_emergency_disabled``) is what lets an
-admin's config-update request take effect on the very next chat request,
-since ``RAGService`` always holds this same object rather than a config
-snapshot taken at construction time.
+``DynamicReranker`` holds no mutable state of its own - ``plan()`` decides a
+query's cohort (disabled/control/treatment) from a single, caller-supplied
+``RagRuntimeConfig`` snapshot (``RAGService.answer`` captures exactly one
+per request and passes it in), and ``execute()`` performs the reranking
+according to a previously-computed plan. Nothing here re-reads a shared
+store mid-request, which is what makes it safe for ``RAGService`` to build
+a cohort-aware cache namespace from the same plan it later executes
+against - see ``app.rag_services.rag_runtime_config`` and
+``app.rag_services.rag_service`` for why a second, independent config read
+partway through a request would be a real bug (a concurrent admin update
+could split one request across two cohorts).
 """
 
 from __future__ import annotations
@@ -15,22 +20,26 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Sequence
-from typing import Literal
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker, ReRankOutcome
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RerankerBackendName
+from app.rag_services.reranker import (
+    FailOpenReranker,
+    NoOpReranker,
+    PlannedReranker,
+    ReRanker,
+    ReRankOutcome,
+    RerankPlan,
+)
 from app.rag_services.rollout import sampled_in
 from app.services.rag_metrics_service import RagMetricsService
 
 logger = logging.getLogger(__name__)
 
-RerankerBackendName = Literal["local", "voyage"]
 
-
-class DynamicReranker:
-    """:class:`ReRanker` that reads its backend/rollout/kill-switch state
-    from mutable instance fields instead of frozen settings - see module
-    docstring."""
+class DynamicReranker(PlannedReranker):
+    """Production :class:`PlannedReranker`: cohort decided from a
+    caller-supplied config snapshot - see module docstring."""
 
     def __init__(
         self,
@@ -38,27 +47,10 @@ class DynamicReranker:
         local: ReRanker,
         voyage: ReRanker | None,
         metrics: RagMetricsService,
-        backend: RerankerBackendName = "local",
-        rollout_percentage: int = 100,
-        emergency_disabled: bool = False,
     ) -> None:
         self._local = local
         self._voyage = voyage
         self._metrics = metrics
-        self._backend: RerankerBackendName = backend
-        self._rollout_percentage = rollout_percentage
-        self._emergency_disabled = emergency_disabled
-
-    def set_backend(self, backend: RerankerBackendName) -> None:
-        self._backend = backend
-
-    def set_rollout_percentage(self, percentage: int) -> None:
-        if not 0 <= percentage <= 100:
-            raise ValueError("percentage must be between 0 and 100")
-        self._rollout_percentage = percentage
-
-    def set_emergency_disabled(self, disabled: bool) -> None:
-        self._emergency_disabled = disabled
 
     @property
     def has_voyage_backend(self) -> bool:
@@ -67,47 +59,53 @@ class DynamicReranker:
         ``voyage`` before it ever reaches a real request."""
         return self._voyage is not None
 
-    @property
-    def name(self) -> str:
-        try:
-            return self._delegate().name
-        except RuntimeError:
-            return self._backend
+    def plan(self, query: str, config: RagRuntimeConfig, *, enabled: bool) -> RerankPlan:
+        if not enabled:
+            return RerankPlan("disabled", None, "none", "disabled", "rerank:none:reason=disabled")
+        if config.emergency_disabled:
+            return RerankPlan(
+                "disabled",
+                None,
+                "none",
+                "emergency_disabled",
+                "rerank:none:reason=emergency_disabled",
+            )
+        if not sampled_in(query, config.reranker_rollout_percentage, salt="reranker:v1"):
+            return RerankPlan("control", None, "none", "rollout", "rerank:none:reason=rollout")
 
-    @property
-    def cache_namespace(self) -> str:
-        # Rollout% and emergency-disabled are folded in alongside the
-        # backend so a cache entry produced under one rollout config can't
-        # be served back after an admin changes it - same reasoning as
-        # RAGService._cache_key's candidate-pool-size versioning.
+        backend = config.reranker_backend
         try:
-            delegate_namespace = self._delegate().cache_namespace
+            delegate_namespace = self._delegate(backend).cache_namespace
+            reported_backend = self._delegate(backend).name
         except RuntimeError:
-            delegate_namespace = f"unconfigured:{self._backend}"
-        return (
-            f"dynamic:v1:backend={self._backend}"
-            f":rollout={self._rollout_percentage}"
-            f":emergency={int(self._emergency_disabled)}"
-            f":{delegate_namespace}"
+            delegate_namespace = f"unconfigured:{backend}"
+            reported_backend = backend
+        return RerankPlan(
+            "treatment",
+            backend,
+            reported_backend,
+            None,
+            f"dynamic:v1:cohort=treatment:backend={backend}:{delegate_namespace}",
         )
 
-    def rerank(
-        self, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
+    def execute(
+        self, plan: RerankPlan, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
     ) -> ReRankOutcome:
-        if self._emergency_disabled:
+        if plan.cohort != "treatment":
             return NoOpReranker().rerank(query=query, candidates=candidates, top_k=top_k)
 
-        if not sampled_in(query, self._rollout_percentage, salt="reranker:v1"):
-            return NoOpReranker().rerank(query=query, candidates=candidates, top_k=top_k)
-
+        assert plan.backend_key is not None  # guaranteed by plan() for cohort == "treatment"
         try:
-            delegate = self._delegate()
+            delegate = self._delegate(plan.backend_key)
         except RuntimeError:
-            logger.exception("rag_ops.reranker_misconfigured", extra={"backend": self._backend})
+            logger.exception("rag_ops.reranker_misconfigured", extra={"backend": plan.backend_key})
             self._metrics.record_rerank(duration_ms=0.0, fallback=True, usage_tokens=None)
             noop_outcome = NoOpReranker().rerank(query=query, candidates=candidates, top_k=top_k)
             return ReRankOutcome(
-                items=noop_outcome.items, backend=self._backend, applied=False, fallback=True
+                items=noop_outcome.items,
+                backend=plan.backend_key,
+                applied=False,
+                fallback=True,
             )
 
         started = time.perf_counter()
@@ -120,8 +118,8 @@ class DynamicReranker:
         )
         return outcome
 
-    def _delegate(self) -> ReRanker:
-        if self._backend == "voyage":
+    def _delegate(self, backend: RerankerBackendName) -> ReRanker:
+        if backend == "voyage":
             if self._voyage is None:
                 raise RuntimeError("reranker_backend=voyage but no Voyage API key is configured")
             return self._voyage
