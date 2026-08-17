@@ -64,6 +64,28 @@ class RerankingMetadata(BaseModel):
     usage_tokens: int | None = None
 
 
+class HyDEMetadata(BaseModel):
+    """Diagnostic detail about the HyDE query-transformation stage.
+
+    ``enabled`` reflects whether this request was eligible to run HyDE
+    (feature on + sampled into rollout), independent of whether it actually
+    ``applied`` - the same disabled/bypass/applied/fallback distinction
+    ``RerankingMetadata`` carries for reranking. Hypothetical passage text
+    itself is never included here - it's a retrieval probe, not evidence,
+    and must not leak into the response, logs, or cache (see
+    ``app.rag_services.hyde_query_transformer``).
+    """
+
+    enabled: bool
+    applied: bool = False
+    fallback: bool = False
+    backend: str = "none"
+    hypothesis_count: int = 0
+    usage_tokens: int = 0
+    duration_ms: float = 0.0
+    bypass_reason: str | None = None
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
@@ -74,6 +96,7 @@ class ResponseMetadata(BaseModel):
 
     route: str
     retrieval_mode: str = "dense"
+    hyde: HyDEMetadata
     reranking: RerankingMetadata
     retrieved_chunks: list[RetrievedChunkPreview]
     flagged_claims: list[str] = Field(default_factory=list)

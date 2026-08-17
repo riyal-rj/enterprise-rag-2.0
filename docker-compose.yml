@@ -53,6 +53,15 @@ services:
       # Self-RAG / reflection tuning (overridable via host .env)
       - REFLECTION_MIN_SCORE=${REFLECTION_MIN_SCORE:-0.85}
       - MAX_REFLECTION_RETRIES=${MAX_REFLECTION_RETRIES:-2}
+      # HYDE tuning (overridable via host .env)
+      - HYDE_MODEL=${HYDE_MODEL:-gpt-4o-mini}
+      - HYDE_PROMPT_VERSION=${HYDE_PROMPT_VERSION:-bank-policy-v1}
+      - HYDE_NUM_HYPOTHESES=${HYDE_NUM_HYPOTHESES:-3}
+      - HYDE_TEMPERATURE=${HYDE_TEMPERATURE:-0.3}
+      - HYDE_MAX_COMPLETION_TOKENS=${HYDE_MAX_COMPLETION_TOKENS:-600}
+      - HYDE_TIMEOUT_SECONDS=${HYDE_TIMEOUT_SECONDS:-12}
+      - HYDE_MAX_ATTEMPTS=${HYDE_MAX_ATTEMPTS:-2}
+
     depends_on:
       postgres:
         condition: service_healthy

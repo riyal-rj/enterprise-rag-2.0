@@ -84,6 +84,8 @@ def _config() -> RagOpsConfig:
         reranker_rollout_percentage=100,
         semantic_cache_enabled=False,
         semantic_cache_threshold=0.95,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,

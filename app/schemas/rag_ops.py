@@ -29,6 +29,23 @@ class SemanticCacheMetrics(BaseModel):
     hit_rate: float
 
 
+class HyDEMetrics(BaseModel):
+    """HyDE performance over the last N *attempted* transforms (a rolling
+    in-memory window - see ``app.services.rag_metrics_service``). ``None``
+    latencies mean no HyDE attempt has happened yet since the process
+    started. ``rollout_bypasses``/``emergency_bypasses`` count requests that
+    never reached the delegate at all (sampled out / emergency-disabled),
+    distinct from ``fallback_rate``, which is over attempted transforms."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    fallback_rate: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
 class RagOpsStatusResponse(BaseModel):
     """Everything the RAG Operations panel displays: live config, rolled-up
     metrics, and emergency-disable state."""
@@ -41,6 +58,10 @@ class RagOpsStatusResponse(BaseModel):
     semantic_cache_enabled: bool
     semantic_cache_threshold: float
     semantic_cache_metrics: SemanticCacheMetrics
+
+    hyde_enabled: bool
+    hyde_rollout_percentage: int
+    hyde_metrics: HyDEMetrics
 
     emergency_disabled: bool
     emergency_disabled_reason: str | None
@@ -63,6 +84,8 @@ class RagOpsConfigUpdateRequest(BaseModel):
     reranker_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     semantic_cache_enabled: bool | None = None
     semantic_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    hyde_enabled: bool | None = None
+    hyde_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     reason: str | None = Field(default=None, max_length=500)
 
 

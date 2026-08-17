@@ -25,6 +25,7 @@ import logging
 from datetime import datetime
 
 from app.api.deps import (
+    get_dynamic_hyde_transformer,
     get_dynamic_reranker,
     get_rag_ops_repository,
     get_rag_service,
@@ -82,8 +83,9 @@ class RagOpsConfigPoller:
         # laziness exists specifically to defer (see
         # app.api.deps.get_dynamic_reranker, get_rag_service). Once a
         # worker *has* served a request, get_rag_service() having
-        # constructed it also guarantees get_dynamic_reranker() and
-        # get_semantic_query_cache() were constructed too, since
+        # constructed it also guarantees get_dynamic_reranker(),
+        # get_dynamic_hyde_transformer(), and get_semantic_query_cache()
+        # were constructed too, since
         # get_rag_service() calls both internally.
         if get_rag_service.cache_info().currsize == 0:
             return
@@ -100,6 +102,7 @@ class RagOpsConfigPoller:
             config,
             rag_service=get_rag_service(),
             reranker=get_dynamic_reranker(),
+            hyde_transformer=get_dynamic_hyde_transformer(),
             semantic_query_cache=get_semantic_query_cache(),
         )
         logger.info(

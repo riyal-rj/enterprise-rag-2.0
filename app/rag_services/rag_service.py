@@ -1,11 +1,13 @@
 """Basic RAG answer generation: embed, dense-search, generate, cache.
 
 The full pipeline this is meant to grow into - CRAG relevance grading,
-self-reflective answer refinement, HyDE query expansion, reranking,
-hybrid/sparse search, SQL intent routing, prompt-injection spotlighting -
-layers on top of this. This is deliberately the minimal "retrieve then
-generate" core those strategies plug into later, not a placeholder for
-any one of them: no query expansion, no relevance grading, no answer
+self-reflective answer refinement, reranking, hybrid/sparse search, SQL
+intent routing, prompt-injection spotlighting - layers on top of this.
+HyDE query expansion is wired (see the ``query_transformer``/``hyde_enabled``
+constructor args and ``answer()``'s HyDE stage): it only ever replaces the
+*dense retrieval vector*, never the sparse query, reranker query, or
+answer-LLM question, and it fails open to the original-query embedding on
+any LLM/schema/embedding/fusion error. No relevance grading, no answer
 refinement loop, and no prompt-injection defense yet.
 
 Caching follows the same cache-aside shape as
@@ -29,11 +31,18 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.embedding_fusion import mean_pool_and_normalize
+from app.rag_services.query_transformer import (
+    NoOpQueryTransformer,
+    QueryTransformer,
+    QueryTransformOutcome,
+)
 from app.rag_services.reranker import NoOpReranker, ReRankedChunk, ReRanker
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import (
     ChatResponse,
+    HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
@@ -148,6 +157,8 @@ class RAGService:
         semantic_cache: SemanticQueryCache | None = None,
         semantic_cache_enabled: bool = False,
         metrics: _SemanticCacheMetricsRecorder | None = None,
+        query_transformer: QueryTransformer | None = None,
+        hyde_enabled: bool = False,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -177,6 +188,8 @@ class RAGService:
         self._semantic_cache = semantic_cache
         self._semantic_cache_enabled = semantic_cache_enabled and semantic_cache is not None
         self._metrics = metrics
+        self._query_transformer = query_transformer or NoOpQueryTransformer()
+        self._hyde_enabled = hyde_enabled
 
     def set_reranking_enabled(self, enabled: bool) -> None:
         """Live-toggle the instance-level reranking default (see
@@ -192,6 +205,11 @@ class RAGService:
         having been supplied at construction time, same as ``__init__``."""
         self._semantic_cache_enabled = enabled and self._semantic_cache is not None
 
+    def set_hyde_enabled(self, enabled: bool) -> None:
+        """Same live-toggle as :meth:`set_reranking_enabled`, for HyDE
+        query transformation."""
+        self._hyde_enabled = enabled
+
     def answer(
         self,
         question: str,
@@ -199,21 +217,23 @@ class RAGService:
         retrieval_mode: str | None = None,
         *,
         reranking_enabled: bool | None = None,
+        hyde_enabled: bool | None = None,
     ) -> ChatResponse:
         """Answer ``question``.
 
-        ``reranking_enabled`` overrides the instance-level default
-        (``self._reranking_enabled``, set from
-        ``RAGFeatureSettings.reranking_enabled_by_default`` in production)
-        for this call only - ``None`` (the default) defers to the
-        instance. This is what lets the eval harness exercise both the
-        reranked and non-reranked pipeline through the same service
-        instance/config (see ``app.eval.invokers.ServiceInvoker``) instead
-        of needing a second, separately-wired ``RAGService``.
+        ``reranking_enabled``/``hyde_enabled`` override the instance-level
+        defaults (``self._reranking_enabled``/``self._hyde_enabled``, set
+        from the centralized RAG ops config in production) for this call
+        only - ``None`` (the default) defers to the instance. This is what
+        lets the eval harness exercise the pipeline with any combination of
+        flags through the same service instance/config (see
+        ``app.eval.invokers.ServiceInvoker``) instead of needing a
+        separately-wired ``RAGService`` per combination.
         """
         effective_reranking_enabled = (
             self._reranking_enabled if reranking_enabled is None else reranking_enabled
         )
+        effective_hyde_enabled = self._hyde_enabled if hyde_enabled is None else hyde_enabled
 
         mode = retrieval_mode or self._default_retrieval_mode
         if mode in self._retrieval_strategies:
@@ -235,24 +255,62 @@ class RAGService:
             cache_namespace = (
                 f"{cache_namespace}:{self._reranker.cache_namespace}:candidates={candidate_top_k}"
             )
+
+        hyde_can_run = effective_hyde_enabled and strategy.requires_dense_embedding
+        if hyde_can_run:
+            cache_namespace = f"{cache_namespace}:{self._query_transformer.cache_namespace}"
+
         cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached.model_copy(update={"cache_hit": True})
 
-        query_embedding = (
-            self._embedding_client.embed_texts([question])[0]
-            if strategy.requires_dense_embedding
-            else None
-        )
-
-        if self._semantic_cache_enabled and query_embedding is not None:
-            semantic_hit = self._check_semantic_cache(query_embedding, cache_namespace, top_k)
+        # The original embedding is the semantic-cache identity - computing
+        # it before HyDE lets a semantic hit avoid all HyDE LLM and
+        # hypothesis-embedding cost.
+        original_query_embedding: list[float] | None = None
+        if strategy.requires_dense_embedding and self._semantic_cache_enabled:
+            original_query_embedding = self._embedding_client.embed_texts([question])[0]
+            semantic_hit = self._check_semantic_cache(
+                original_query_embedding, cache_namespace, top_k
+            )
             if semantic_hit is not None:
                 return semantic_hit.model_copy(update={"cache_hit": True})
 
+        hyde_outcome = NoOpQueryTransformer(reason="disabled").transform(question)
+        query_embedding: list[float] | None = None
+
+        if strategy.requires_dense_embedding:
+            if hyde_can_run:
+                hyde_outcome = self._query_transformer.transform(question)
+                if hyde_outcome.applied:
+                    try:
+                        hypothesis_embeddings = self._embedding_client.embed_texts(
+                            list(hyde_outcome.retrieval_texts)
+                        )
+                        query_embedding = mean_pool_and_normalize(hypothesis_embeddings)
+                    except Exception as exc:  # noqa: BLE001 - retrieval must remain available
+                        logger.warning(
+                            "rag.hyde_embedding_fallback",
+                            extra={"error_type": type(exc).__name__},
+                        )
+                        hyde_outcome = QueryTransformOutcome(
+                            retrieval_texts=(question,),
+                            backend=hyde_outcome.backend,
+                            applied=False,
+                            fallback=True,
+                            bypass_reason="embedding_or_fusion_error",
+                            usage_tokens=hyde_outcome.usage_tokens,
+                            duration_ms=hyde_outcome.duration_ms,
+                        )
+
+            if query_embedding is None:
+                if original_query_embedding is None:
+                    original_query_embedding = self._embedding_client.embed_texts([question])[0]
+                query_embedding = original_query_embedding
+
         chunks = strategy.retrieve(
-            query_text=question,
+            query_text=question,             # always original - hybrid's sparse branch uses this
             query_embedding=query_embedding,
             top_k=candidate_top_k,
         )
@@ -329,6 +387,18 @@ class RAGService:
             metadata=ResponseMetadata(
                 route="rag",
                 retrieval_mode=strategy.name,
+                hyde=HyDEMetadata(
+                    enabled=hyde_can_run,
+                    applied=hyde_outcome.applied,
+                    fallback=hyde_outcome.fallback,
+                    backend=hyde_outcome.backend,
+                    hypothesis_count=(
+                        len(hyde_outcome.retrieval_texts) if hyde_outcome.applied else 0
+                    ),
+                    usage_tokens=hyde_outcome.usage_tokens,
+                    duration_ms=round(hyde_outcome.duration_ms, 2),
+                    bypass_reason=hyde_outcome.bypass_reason,
+                ),
                 reranking=RerankingMetadata(
                     enabled=effective_reranking_enabled,
                     applied=reranked,
@@ -343,16 +413,23 @@ class RAGService:
         )
 
         # A fallback response is retrieval-order output produced *under
-        # the reranked config's cache key* - caching it would let later
+        # the reranked/HyDE config's cache key* - caching it would let later
         # requests keep receiving the degraded answer even after the
-        # reranker recovers, since nothing would ever invalidate it (see
+        # reranker/HyDE recovers, since nothing would ever invalidate it (see
         # module docstring: reads/writes are cache-aside, there's no TTL
-        # tied to reranker health). Simplest correct fix: never cache a
+        # tied to reranker/HyDE health). Simplest correct fix: never cache a
         # fallback response at all, exact-match or semantic.
-        if not fallback_occurred:
+        pipeline_fallback = fallback_occurred or hyde_outcome.fallback
+        if not pipeline_fallback:
             cache_written = self._set_cached(cache_key, response)
-            if cache_written and self._semantic_cache_enabled and query_embedding is not None:
-                self._record_semantic_cache(query_embedding, cache_namespace, top_k, cache_key)
+            if (
+                cache_written
+                and self._semantic_cache_enabled
+                and original_query_embedding is not None
+            ):
+                self._record_semantic_cache(
+                    original_query_embedding, cache_namespace, top_k, cache_key
+                )
         return response
 
     def _build_chunk_previews(
@@ -396,11 +473,12 @@ class RAGService:
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
         normalized_question = " ".join(question.split())
 
-        # v3: cache_namespace now folds in the reranker's candidate pool
-        # size (see answer()) - bumped so a v2 key computed under the old
-        # (candidate-pool-blind) namespace scheme can't collide with or
-        # mask a v3 key for the same question/config.
-        raw_key = f"rag:v3:{cache_namespace}:{top_k}:{normalized_question}"
+        # v4: cache_namespace now folds in the HyDE transformer's identity
+        # (model/prompt/N/rollout/emergency state) and the response schema
+        # gained the ``hyde`` metadata field - bumped so a v3 key computed
+        # before HyDE existed can't collide with or mask a v4 key for the
+        # same question/config.
+        raw_key = f"rag:v4:{cache_namespace}:{top_k}:{normalized_question}"
 
         return hashlib.sha256(raw_key.encode()).hexdigest()
 

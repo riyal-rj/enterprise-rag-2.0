@@ -15,6 +15,7 @@ from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import (
     ChatResponse,
+    HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
@@ -51,6 +52,7 @@ class _FakeRAGService:
         retrieval_mode: str | None = None,
         *,
         reranking_enabled: bool | None = None,
+        hyde_enabled: bool | None = None,
     ) -> ChatResponse:
         self.calls.append(
             {
@@ -58,6 +60,7 @@ class _FakeRAGService:
                 "top_k": top_k,
                 "retrieval_mode": retrieval_mode,
                 "reranking_enabled": reranking_enabled,
+                "hyde_enabled": hyde_enabled,
             }
         )
         return self._response
@@ -71,6 +74,7 @@ def _response(answer: str = "the answer") -> ChatResponse:
         metadata=ResponseMetadata(
             route="rag",
             retrieval_mode="dense",
+            hyde=HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
@@ -118,6 +122,7 @@ def test_service_invoker_calls_the_real_rag_service_for_a_supported_profile() ->
             "top_k": PROFILES["naive"].top_k,
             "retrieval_mode": "dense",
             "reranking_enabled": False,
+            "hyde_enabled": False,
         }
     ]
 
@@ -144,14 +149,31 @@ def test_service_invoker_passes_enable_rerank_as_a_per_call_override() -> None:
     assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
 
 
-@pytest.mark.parametrize("profile_name", ["hybrid+rerank+hyde", "hybrid+rerank+crag", "all"])
+def test_service_invoker_passes_enable_hyde_as_a_per_call_override() -> None:
+    """hybrid+rerank+hyde must actually exercise HyDE through the real
+    RAGService.answer() override, not silently no-op - this is what makes
+    a baseline-vs-HyDE RAGAS comparison possible. HyDE is no longer in the
+    unimplemented-features skip list - see
+    test_service_invoker_skips_profiles_requesting_unimplemented_features."""
+    fake_rag_service = _FakeRAGService(_response())
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+    assert fake_rag_service.calls[0]["hyde_enabled"] is True
+    assert fake_rag_service.calls[0]["reranking_enabled"] is True
+    assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
+
+
+@pytest.mark.parametrize("profile_name", ["hybrid+rerank+crag", "all"])
 def test_service_invoker_skips_profiles_requesting_unimplemented_features(
     profile_name: str,
 ) -> None:
-    """HyDE/CRAG/self-reflective don't exist in the pipeline yet - silently
+    """CRAG/self-reflective don't exist in the pipeline yet - silently
     ignoring the flag would produce misleading pass/fail results, so these
     skip cleanly instead, even with a working rag_service wired up.
-    Reranking alone (hybrid+rerank) is no longer in this list - see
+    HyDE and reranking alone are no longer in this list - see
+    test_service_invoker_passes_enable_hyde_as_a_per_call_override and
     test_service_invoker_passes_enable_rerank_as_a_per_call_override."""
     fake_rag_service = _FakeRAGService(_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))

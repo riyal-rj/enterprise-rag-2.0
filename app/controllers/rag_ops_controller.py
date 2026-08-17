@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from app.core.exceptions import InvalidRagOpsConfigError
 from app.models.rag_ops import RagOpsConfig
+from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
 from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_service import RAGService
 from app.repositories.rag_ops_repository import RagOpsRepository
@@ -35,6 +36,7 @@ from app.schemas.rag_ops import (
     AuditLogResponse,
     EmergencyDisableRequest,
     EmergencyEnableRequest,
+    HyDEMetrics,
     RagOpsConfigUpdateRequest,
     RagOpsStatusResponse,
     RerankMetrics,
@@ -48,11 +50,12 @@ def apply_rag_ops_config(
     *,
     rag_service: RAGService,
     reranker: DynamicReranker,
+    hyde_transformer: DynamicQueryTransformer,
     semantic_query_cache: SemanticQueryCache,
 ) -> None:
     """Push ``config`` into every live singleton that needs to observe it
-    immediately. Emergency disable forces reranking and semantic caching
-    off regardless of their individually stored "enabled" flags - it's
+    immediately. Emergency disable forces reranking, semantic caching, and
+    HyDE off regardless of their individually stored "enabled" flags - it's
     meant to revert to the safe baseline retrieve-then-generate pipeline,
     not just gate the reranker.
 
@@ -61,13 +64,17 @@ def apply_rag_ops_config(
     other worker, on its next poll tick) so both apply a config change
     identically - see module docstring.
     """
-    rag_service.set_reranking_enabled(config.reranking_enabled and not config.emergency_disabled)
-    rag_service.set_semantic_cache_enabled(
-        config.semantic_cache_enabled and not config.emergency_disabled
-    )
+    emergency = config.emergency_disabled
+    rag_service.set_reranking_enabled(config.reranking_enabled and not emergency)
+    rag_service.set_semantic_cache_enabled(config.semantic_cache_enabled and not emergency)
+    rag_service.set_hyde_enabled(config.hyde_enabled and not emergency)
     reranker.set_backend(config.reranker_backend)  # type: ignore[arg-type]
     reranker.set_rollout_percentage(config.reranker_rollout_percentage)
-    reranker.set_emergency_disabled(config.emergency_disabled)
+    reranker.set_emergency_disabled(emergency)
+    hyde_transformer.configure(
+        rollout_percentage=config.hyde_rollout_percentage,
+        emergency_disabled=emergency,
+    )
     semantic_query_cache.set_similarity_threshold(config.semantic_cache_threshold)
 
 
@@ -80,12 +87,14 @@ class RagOpsController:
         repository: RagOpsRepository,
         rag_service: RAGService,
         reranker: DynamicReranker,
+        hyde_transformer: DynamicQueryTransformer,
         semantic_query_cache: SemanticQueryCache,
         metrics: RagMetricsService,
     ) -> None:
         self._repository = repository
         self._rag_service = rag_service
         self._reranker = reranker
+        self._hyde_transformer = hyde_transformer
         self._semantic_query_cache = semantic_query_cache
         self._metrics = metrics
 
@@ -107,6 +116,8 @@ class RagOpsController:
             reranker_rollout_percentage=payload.reranker_rollout_percentage,
             semantic_cache_enabled=payload.semantic_cache_enabled,
             semantic_cache_threshold=payload.semantic_cache_threshold,
+            hyde_enabled=payload.hyde_enabled,
+            hyde_rollout_percentage=payload.hyde_rollout_percentage,
         )
         self._apply(config)
         return self._to_status(config)
@@ -149,12 +160,14 @@ class RagOpsController:
             config,
             rag_service=self._rag_service,
             reranker=self._reranker,
+            hyde_transformer=self._hyde_transformer,
             semantic_query_cache=self._semantic_query_cache,
         )
 
     def _to_status(self, config: RagOpsConfig) -> RagOpsStatusResponse:
         rerank_snapshot = self._metrics.rerank_stats()
         semantic_snapshot = self._metrics.semantic_cache_stats()
+        hyde_snapshot = self._metrics.hyde_stats()
         return RagOpsStatusResponse(
             reranking_enabled=config.reranking_enabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
@@ -172,6 +185,17 @@ class RagOpsController:
                 lookups=semantic_snapshot.lookups,
                 hits=semantic_snapshot.hits,
                 hit_rate=semantic_snapshot.hit_rate,
+            ),
+            hyde_enabled=config.hyde_enabled,
+            hyde_rollout_percentage=config.hyde_rollout_percentage,
+            hyde_metrics=HyDEMetrics(
+                sample_count=hyde_snapshot.sample_count,
+                p50_latency_ms=hyde_snapshot.p50_latency_ms,
+                p95_latency_ms=hyde_snapshot.p95_latency_ms,
+                fallback_rate=hyde_snapshot.fallback_rate,
+                usage_tokens_total=hyde_snapshot.usage_tokens_total,
+                rollout_bypasses=hyde_snapshot.rollout_bypasses,
+                emergency_bypasses=hyde_snapshot.emergency_bypasses,
             ),
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,

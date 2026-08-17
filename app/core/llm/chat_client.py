@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Generic, Protocol, TypeVar
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
@@ -30,6 +31,7 @@ _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 2.0
 _REQUEST_TIMEOUT_SECONDS = 60.0
 
+StructuredModel=TypeVar("StructuredModel", bound=BaseModel)
 
 class TokenUsage(BaseModel):
     prompt_tokens: int = 0
@@ -41,6 +43,10 @@ class LLMResponse(BaseModel):
     text: str
     usage: TokenUsage
 
+@dataclass(frozen=True)
+class StructuredLLMResponse(Generic[StructuredModel]):
+    value: StructuredModel
+    usage: TokenUsage
 
 class LLMClient(Protocol):
     """Contract for a chat-completion provider."""
@@ -64,10 +70,24 @@ class LLMClient(Protocol):
     ) -> LLMResponse: ...
 
 
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        response_model: type[StructuredModel],
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_completion_tokens: int = 1_000,
+        timeout_seconds: float = 30.0,
+        max_attempts: int = 2,
+    ) -> StructuredLLMResponse[StructuredModel]: ...
+
+
 def build_openai_client(api_key: str, timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS) -> OpenAI:
     if not api_key:
         raise ValueError("OpenAI API key must not be empty")
-    return OpenAI(api_key=api_key, timeout=timeout_seconds)
+    return OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
 
 
 class OpenAILLMClient:
@@ -152,9 +172,72 @@ class OpenAILLMClient:
             ),
         )
 
-    def _create_with_retries(self, model: str, kwargs: dict[str, object]) -> ChatCompletion:
+    def generate_structured(self,
+                            system_prompt: str,
+                            user_message: str,
+                            *,
+                            response_model: type[StructuredModel],
+                            model: str | None = None,
+                            temperature: float = 0.0,
+                            max_completion_tokens: int = 1_000,
+                            timeout_seconds: float = 30.0,
+                            max_attempts: int = 2,
+                            ) -> StructuredLLMResponse[StructuredModel]:
+        resolved_model=model or self._default_grader_model
+        schema_name=response_model.__name__.lower()
+        kwargs: dict[str, object] = {
+            "model":resolved_model,
+            "messages":[
+                {
+                    "role":"system",
+                    "content": system_prompt
+                },
+                {
+                    "role":"user",
+                    "content":user_message
+                }
+            ],
+            "temperature":temperature,
+            "max_completion_tokens":max_completion_tokens,
+            "timeout":timeout_seconds,
+            "response_format":{
+                "type":"json_schema",
+                "json_schema":{
+                    "name":schema_name,
+                    "strict":True,
+                    "schema":response_model.model_json_schema()
+                }
+            }
+        }
+
+        response = self._create_with_retries(
+            resolved_model,
+            kwargs,
+            max_attempts=max_attempts,
+        )
+
+        message= response.choices[0].message
+        refusal=getattr(message, "refusal", None)
+        if refusal:
+            raise RuntimeError(f"structured output refused by model {resolved_model}")
+        if not message.content:
+            raise ValueError("structured output was empty")
+
+        usage=response.usage
+        parsed=response_model.model_validate_json(message.content)
+        return StructuredLLMResponse(
+            value=parsed,
+            usage=TokenUsage(
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
+                total_tokens=usage.total_tokens if usage else 0,
+            ),
+        )
+
+
+    def _create_with_retries(self, model: str, kwargs: dict[str, object], max_attempts: int = _MAX_ATTEMPTS) -> ChatCompletion:
         last_error: Exception | None = None
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
                 # kwargs is built dynamically (with/without response_format);
                 # OpenAI's heavily-overloaded signature can't be statically
@@ -167,11 +250,11 @@ class OpenAILLMClient:
                     extra={
                         "model": model,
                         "attempt": attempt,
-                        "max_attempts": _MAX_ATTEMPTS,
+                        "max_attempts": max_attempts,
                         "error": str(exc),
                     },
                 )
-                if attempt < _MAX_ATTEMPTS:
+                if attempt < max_attempts:
                     time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
 
         assert last_error is not None  # loop always sets it before exhausting attempts

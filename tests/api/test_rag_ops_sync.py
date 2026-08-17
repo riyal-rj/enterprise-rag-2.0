@@ -16,6 +16,8 @@ def _config(*, updated_at: datetime, reranking_enabled: bool = True) -> RagOpsCo
         reranker_rollout_percentage=100,
         semantic_cache_enabled=False,
         semantic_cache_threshold=0.95,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,
@@ -31,12 +33,16 @@ class _FakeRagService:
     def __init__(self) -> None:
         self.reranking_enabled: bool | None = None
         self.semantic_cache_enabled: bool | None = None
+        self.hyde_enabled: bool | None = None
 
     def set_reranking_enabled(self, enabled: bool) -> None:
         self.reranking_enabled = enabled
 
     def set_semantic_cache_enabled(self, enabled: bool) -> None:
         self.semantic_cache_enabled = enabled
+
+    def set_hyde_enabled(self, enabled: bool) -> None:
+        self.hyde_enabled = enabled
 
 
 class _FakeReranker:
@@ -61,6 +67,16 @@ class _FakeSemanticQueryCache:
 
     def set_similarity_threshold(self, threshold: float) -> None:
         self.threshold = threshold
+
+
+class _FakeHydeTransformer:
+    def __init__(self) -> None:
+        self.rollout_percentage: int | None = None
+        self.emergency_disabled: bool | None = None
+
+    def configure(self, *, rollout_percentage: int, emergency_disabled: bool) -> None:
+        self.rollout_percentage = rollout_percentage
+        self.emergency_disabled = emergency_disabled
 
 
 class _FakeRepository:
@@ -120,12 +136,16 @@ async def test_poll_applies_config_once_worker_has_constructed_rag_service(
 ) -> None:
     rag_service = _FakeRagService()
     reranker = _FakeReranker()
+    hyde_transformer = _FakeHydeTransformer()
     semantic_cache = _FakeSemanticQueryCache()
     updated_at = datetime.now(UTC)
     repository = _FakeRepository(_config(updated_at=updated_at, reranking_enabled=True))
 
     monkeypatch.setattr(rag_ops_sync, "get_rag_service", _AlreadyConstructedGetter(rag_service))
     monkeypatch.setattr(rag_ops_sync, "get_dynamic_reranker", _AlreadyConstructedGetter(reranker))
+    monkeypatch.setattr(
+        rag_ops_sync, "get_dynamic_hyde_transformer", _AlreadyConstructedGetter(hyde_transformer)
+    )
     monkeypatch.setattr(
         rag_ops_sync, "get_semantic_query_cache", _AlreadyConstructedGetter(semantic_cache)
     )
@@ -143,12 +163,16 @@ async def test_poll_is_a_no_op_when_config_has_not_changed_since_last_poll(
 ) -> None:
     rag_service = _FakeRagService()
     reranker = _FakeReranker()
+    hyde_transformer = _FakeHydeTransformer()
     semantic_cache = _FakeSemanticQueryCache()
     updated_at = datetime.now(UTC)
     repository = _FakeRepository(_config(updated_at=updated_at, reranking_enabled=True))
 
     monkeypatch.setattr(rag_ops_sync, "get_rag_service", _AlreadyConstructedGetter(rag_service))
     monkeypatch.setattr(rag_ops_sync, "get_dynamic_reranker", _AlreadyConstructedGetter(reranker))
+    monkeypatch.setattr(
+        rag_ops_sync, "get_dynamic_hyde_transformer", _AlreadyConstructedGetter(hyde_transformer)
+    )
     monkeypatch.setattr(
         rag_ops_sync, "get_semantic_query_cache", _AlreadyConstructedGetter(semantic_cache)
     )
@@ -168,12 +192,16 @@ async def test_poll_reapplies_when_config_changes_on_a_later_poll(
 ) -> None:
     rag_service = _FakeRagService()
     reranker = _FakeReranker()
+    hyde_transformer = _FakeHydeTransformer()
     semantic_cache = _FakeSemanticQueryCache()
     first_updated_at = datetime.now(UTC)
     repository = _FakeRepository(_config(updated_at=first_updated_at, reranking_enabled=False))
 
     monkeypatch.setattr(rag_ops_sync, "get_rag_service", _AlreadyConstructedGetter(rag_service))
     monkeypatch.setattr(rag_ops_sync, "get_dynamic_reranker", _AlreadyConstructedGetter(reranker))
+    monkeypatch.setattr(
+        rag_ops_sync, "get_dynamic_hyde_transformer", _AlreadyConstructedGetter(hyde_transformer)
+    )
     monkeypatch.setattr(
         rag_ops_sync, "get_semantic_query_cache", _AlreadyConstructedGetter(semantic_cache)
     )
@@ -199,6 +227,7 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
 ) -> None:
     rag_service = _FakeRagService()
     reranker = _FakeReranker()
+    hyde_transformer = _FakeHydeTransformer()
     semantic_cache = _FakeSemanticQueryCache()
     config = RagOpsConfig(
         reranking_enabled=True,
@@ -206,6 +235,8 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
         reranker_rollout_percentage=100,
         semantic_cache_enabled=True,
         semantic_cache_threshold=0.95,
+        hyde_enabled=True,
+        hyde_rollout_percentage=10,
         emergency_disabled=True,
         emergency_disabled_reason="incident",
         emergency_disabled_at=datetime.now(UTC),
@@ -220,6 +251,9 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
     monkeypatch.setattr(rag_ops_sync, "get_rag_service", _AlreadyConstructedGetter(rag_service))
     monkeypatch.setattr(rag_ops_sync, "get_dynamic_reranker", _AlreadyConstructedGetter(reranker))
     monkeypatch.setattr(
+        rag_ops_sync, "get_dynamic_hyde_transformer", _AlreadyConstructedGetter(hyde_transformer)
+    )
+    monkeypatch.setattr(
         rag_ops_sync, "get_semantic_query_cache", _AlreadyConstructedGetter(semantic_cache)
     )
     monkeypatch.setattr(rag_ops_sync, "get_rag_ops_repository", lambda: repository)
@@ -229,4 +263,6 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
 
     assert rag_service.reranking_enabled is False
     assert rag_service.semantic_cache_enabled is False
+    assert rag_service.hyde_enabled is False
+    assert hyde_transformer.emergency_disabled is True
     assert reranker.emergency_disabled is True

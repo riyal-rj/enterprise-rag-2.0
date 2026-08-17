@@ -12,7 +12,6 @@ snapshot taken at construction time.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from collections.abc import Sequence
@@ -20,6 +19,7 @@ from typing import Literal
 
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker, ReRankOutcome
+from app.rag_services.rollout import sampled_in
 from app.services.rag_metrics_service import RagMetricsService
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ class DynamicReranker:
         if self._emergency_disabled:
             return NoOpReranker().rerank(query=query, candidates=candidates, top_k=top_k)
 
-        if not _sampled_in(query, self._rollout_percentage):
+        if not sampled_in(query, self._rollout_percentage, salt="reranker:v1"):
             return NoOpReranker().rerank(query=query, candidates=candidates, top_k=top_k)
 
         try:
@@ -126,25 +126,3 @@ class DynamicReranker:
                 raise RuntimeError("reranker_backend=voyage but no Voyage API key is configured")
             return self._voyage
         return self._local
-
-
-def _sampled_in(query: str, rollout_percentage: int) -> bool:
-    """Deterministic per-question rollout sample: hash the question text
-    rather than a per-call random draw, so the *same* question always gets
-    the same treatment.
-
-    A random per-call coin flip would race with caching: RAGService caches
-    under a key that doesn't vary per rerank attempt, so whichever outcome
-    is computed first for a given question would be served to every later
-    ask of it regardless of its own flip - on a small, high-repeat-rate
-    policy corpus like this one, that would make "rollout percentage"
-    mostly measure "percentage of *first-ever* asks", not sustained
-    traffic. Hashing the question makes the split stable and immune to
-    that race.
-    """
-    if rollout_percentage >= 100:
-        return True
-    if rollout_percentage <= 0:
-        return False
-    digest = hashlib.sha256(query.strip().lower().encode()).hexdigest()
-    return (int(digest, 16) % 100) < rollout_percentage

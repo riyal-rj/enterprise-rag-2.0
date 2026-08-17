@@ -22,6 +22,8 @@ def _config(**overrides: object) -> RagOpsConfig:
         reranker_rollout_percentage=100,
         semantic_cache_enabled=False,
         semantic_cache_threshold=0.95,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,
@@ -85,12 +87,16 @@ class _FakeRagService:
     def __init__(self) -> None:
         self.reranking_enabled: bool | None = None
         self.semantic_cache_enabled: bool | None = None
+        self.hyde_enabled: bool | None = None
 
     def set_reranking_enabled(self, enabled: bool) -> None:
         self.reranking_enabled = enabled
 
     def set_semantic_cache_enabled(self, enabled: bool) -> None:
         self.semantic_cache_enabled = enabled
+
+    def set_hyde_enabled(self, enabled: bool) -> None:
+        self.hyde_enabled = enabled
 
 
 class _FakeDynamicReranker:
@@ -122,17 +128,35 @@ class _FakeSemanticQueryCache:
         self.threshold = threshold
 
 
+class _FakeDynamicHydeTransformer:
+    def __init__(self) -> None:
+        self.rollout_percentage: int | None = None
+        self.emergency_disabled: bool | None = None
+
+    def configure(self, *, rollout_percentage: int, emergency_disabled: bool) -> None:
+        self.rollout_percentage = rollout_percentage
+        self.emergency_disabled = emergency_disabled
+
+
 def _controller(
     config: RagOpsConfig | None = None, has_voyage: bool = True
-) -> tuple[RagOpsController, _FakeRepository, _FakeRagService, _FakeDynamicReranker, _FakeSemanticQueryCache]:
+) -> tuple[
+    RagOpsController,
+    _FakeRepository,
+    _FakeRagService,
+    _FakeDynamicReranker,
+    _FakeDynamicHydeTransformer,
+    _FakeSemanticQueryCache,
+]:
     repository = _FakeRepository(config or _config())
     rag_service = _FakeRagService()
     reranker = _FakeDynamicReranker(has_voyage=has_voyage)
+    hyde_transformer = _FakeDynamicHydeTransformer()
     semantic_cache = _FakeSemanticQueryCache()
     controller = RagOpsController(
-        repository, rag_service, reranker, semantic_cache, RagMetricsService()
+        repository, rag_service, reranker, hyde_transformer, semantic_cache, RagMetricsService()
     )
-    return controller, repository, rag_service, reranker, semantic_cache
+    return controller, repository, rag_service, reranker, hyde_transformer, semantic_cache
 
 
 def test_status_reflects_current_config() -> None:
@@ -145,7 +169,7 @@ def test_status_reflects_current_config() -> None:
 
 
 def test_update_config_pushes_new_values_into_live_singletons() -> None:
-    controller, repository, rag_service, reranker, semantic_cache = _controller()
+    controller, repository, rag_service, reranker, hyde_transformer, semantic_cache = _controller()
 
     controller.update_config(
         "admin",
@@ -155,14 +179,19 @@ def test_update_config_pushes_new_values_into_live_singletons() -> None:
             reranker_rollout_percentage=25,
             semantic_cache_enabled=True,
             semantic_cache_threshold=0.8,
+            hyde_enabled=True,
+            hyde_rollout_percentage=5,
         ),
     )
 
     assert rag_service.reranking_enabled is True
     assert rag_service.semantic_cache_enabled is True
+    assert rag_service.hyde_enabled is True
     assert reranker.backend == "voyage"
     assert reranker.rollout_percentage == 25
     assert semantic_cache.threshold == 0.8
+    assert hyde_transformer.rollout_percentage == 5
+    assert hyde_transformer.emergency_disabled is False
 
 
 def test_update_config_rejects_voyage_backend_without_api_key() -> None:
@@ -175,8 +204,8 @@ def test_update_config_rejects_voyage_backend_without_api_key() -> None:
 
 
 def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
-    controller, repository, rag_service, reranker, semantic_cache = _controller(
-        _config(reranking_enabled=True, semantic_cache_enabled=True)
+    controller, repository, rag_service, reranker, hyde_transformer, semantic_cache = _controller(
+        _config(reranking_enabled=True, semantic_cache_enabled=True, hyde_enabled=True)
     )
 
     status = controller.emergency_disable(
@@ -186,7 +215,9 @@ def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
     assert status.emergency_disabled is True
     assert rag_service.reranking_enabled is False
     assert rag_service.semantic_cache_enabled is False
+    assert rag_service.hyde_enabled is False
     assert reranker.emergency_disabled is True
+    assert hyde_transformer.emergency_disabled is True
 
 
 def test_emergency_enable_restores_previously_configured_state() -> None:

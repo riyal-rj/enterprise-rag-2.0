@@ -21,7 +21,8 @@ from app.models.rag_ops import RagOpsAuditEntry, RagOpsConfig
 
 _CONFIG_COLUMNS = (
     "id, reranking_enabled, reranker_backend, reranker_rollout_percentage, "
-    "semantic_cache_enabled, semantic_cache_threshold, emergency_disabled, "
+    "semantic_cache_enabled, semantic_cache_threshold, hyde_enabled, "
+    "hyde_rollout_percentage, emergency_disabled, "
     "emergency_disabled_reason, emergency_disabled_at, emergency_disabled_by, "
     "corpus_version, last_cache_invalidated_at, updated_at, updated_by"
 )
@@ -32,6 +33,8 @@ _DIFF_FIELDS = (
     "reranker_rollout_percentage",
     "semantic_cache_enabled",
     "semantic_cache_threshold",
+    "hyde_enabled",
+    "hyde_rollout_percentage",
 )
 
 
@@ -50,6 +53,8 @@ class RagOpsRepository(Protocol):
         reranker_rollout_percentage: int | None = None,
         semantic_cache_enabled: bool | None = None,
         semantic_cache_threshold: float | None = None,
+        hyde_enabled: bool | None = None,
+        hyde_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
         """Partial update: ``None`` fields are left unchanged. Writes an
         audit row iff at least one field actually changed value."""
@@ -96,6 +101,8 @@ class PostgresRagOpsRepository:
         reranker_rollout_percentage: int | None = None,
         semantic_cache_enabled: bool | None = None,
         semantic_cache_threshold: float | None = None,
+        hyde_enabled: bool | None = None,
+        hyde_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -117,6 +124,8 @@ class PostgresRagOpsRepository:
                         reranker_rollout_percentage = COALESCE(%s, reranker_rollout_percentage),
                         semantic_cache_enabled = COALESCE(%s, semantic_cache_enabled),
                         semantic_cache_threshold = COALESCE(%s, semantic_cache_threshold),
+                        hyde_enabled = COALESCE(%s, hyde_enabled),
+                        hyde_rollout_percentage = COALESCE(%s, hyde_rollout_percentage),
                         updated_at = now(),
                         updated_by = %s
                     WHERE id = 1
@@ -128,6 +137,8 @@ class PostgresRagOpsRepository:
                         reranker_rollout_percentage,
                         semantic_cache_enabled,
                         semantic_cache_threshold,
+                        hyde_enabled,
+                        hyde_rollout_percentage,
                         actor,
                     ),
                 )
@@ -266,12 +277,14 @@ def _row_to_config(row: tuple[Any, ...]) -> RagOpsConfig:
         reranker_rollout_percentage=row[3],
         semantic_cache_enabled=row[4],
         semantic_cache_threshold=row[5],
-        emergency_disabled=row[6],
-        emergency_disabled_reason=row[7],
-        emergency_disabled_at=row[8],
-        emergency_disabled_by=row[9],
-        corpus_version=row[10],
-        last_cache_invalidated_at=row[11],
-        updated_at=row[12],
-        updated_by=row[13],
+        hyde_enabled=row[6],
+        hyde_rollout_percentage=row[7],
+        emergency_disabled=row[8],
+        emergency_disabled_reason=row[9],
+        emergency_disabled_at=row[10],
+        emergency_disabled_by=row[11],
+        corpus_version=row[12],
+        last_cache_invalidated_at=row[13],
+        updated_at=row[14],
+        updated_by=row[15],
     )

@@ -25,13 +25,16 @@ is cleanly skipped with a clear reason rather than erroring partway
 through a real call.
 
 ``_call_pipeline`` calls the real :class:`~app.rag_services.rag_service.RAGService`,
-via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override and
+via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override,
 ``PipelineProfile.enable_rerank`` as a per-call ``reranking_enabled``
-override (see ``RAGService.answer``) - dense/sparse/hybrid and reranking
-all run for real. HyDE/CRAG/self-reflective profiles still skip cleanly:
-none of those exist in the pipeline yet (see
-``app.rag_services.rag_service``'s module docstring), so silently
-ignoring those flags would produce misleading pass/fail results.
+override, and ``PipelineProfile.enable_hyde`` as a per-call
+``hyde_enabled`` override (see ``RAGService.answer``) - dense/sparse/hybrid,
+reranking, and HyDE all run for real, through
+``app.api.deps.get_eval_hyde_transformer`` (never the production
+admin-rollout-controlled transformer - see ``_rag_service`` below).
+CRAG/self-reflective profiles still skip cleanly: neither exists in the
+pipeline yet (see ``app.rag_services.rag_service``'s module docstring), so
+silently ignoring those flags would produce misleading pass/fail results.
 """
 
 from __future__ import annotations
@@ -117,6 +120,7 @@ class ServiceInvoker:
         from app.api.deps import (
             get_default_retrieval_mode,
             get_embedding_client,
+            get_eval_hyde_transformer,
             get_llm_client,
             get_reranker,
             get_retrieval_strategies,
@@ -139,6 +143,14 @@ class ServiceInvoker:
             # that would make "ran with reranking on" a no-op in practice.
             reranker=get_reranker(),
             reranker_initial_top_k=rag_settings.reranker_initial_top_k,
+            # Same reasoning as the reranker above, for HyDE: the eval-only
+            # transformer (never the admin-rollout-controlled production
+            # one), always constructed regardless of
+            # RAGFeatureSettings.hyde_enabled_by_default - flags.enable_hyde
+            # (a per-call override, see _call_pipeline) is what switches it
+            # on/off per case.
+            query_transformer=get_eval_hyde_transformer(),
+            hyde_enabled=False,
         )
 
     def invoke(
@@ -156,10 +168,10 @@ class ServiceInvoker:
     def _call_pipeline(
         self, question: str, flags: PipelineProfile
     ) -> tuple[InvokeResponse, list[RetrievedChunk]]:
-        if flags.enable_hyde or flags.enable_crag or flags.enable_self_reflective:
+        if flags.enable_crag or flags.enable_self_reflective:
             raise SkippedIntent(
-                f"{flags.name}: HyDE/CRAG/self-reflective aren't implemented "
-                "in the pipeline yet, only search_mode and reranking are wired"
+                f"{flags.name}: CRAG/self-reflective aren't implemented "
+                "in the pipeline yet, only search_mode, reranking, and HyDE are wired"
             )
 
         response = self._rag_service.answer(
@@ -167,6 +179,7 @@ class ServiceInvoker:
             top_k=flags.top_k,
             retrieval_mode=flags.search_mode,
             reranking_enabled=flags.enable_rerank,
+            hyde_enabled=flags.enable_hyde,
         )
         chunks = [
             RetrievedChunk(text=c.text, source=c.source) for c in response.metadata.retrieved_chunks
