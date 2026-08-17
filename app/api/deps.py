@@ -36,7 +36,10 @@ from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
 from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
+from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
 from app.rag_services.dynamic_reranker import DynamicReranker
+from app.rag_services.hyde_query_transformer import HydeQueryTransformer
+from app.rag_services.query_transformer import FailOpenQueryTransformer, QueryTransformer
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
 from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker
@@ -134,6 +137,53 @@ def get_llm_client() -> LLMClient:
 
 
 @lru_cache(maxsize=1)
+def get_hyde_transformer() -> QueryTransformer:
+    """Raw HyDE transformer: prompt/schema generation, batch embedding
+    fusion, no rollout/emergency state. Never used directly against real
+    ``/chat`` traffic - see ``get_dynamic_hyde_transformer`` (production)
+    and ``get_eval_hyde_transformer`` (offline eval) below, which each wrap
+    this for the availability/isolation guarantees their callers need."""
+    settings = get_settings().rag
+    return HydeQueryTransformer(
+        llm_client=get_llm_client(),
+        model=settings.hyde_model,
+        prompt_version=settings.hyde_prompt_version,
+        num_hypotheses=settings.hyde_num_hypotheses,
+        temperature=settings.hyde_temperature,
+        max_completion_tokens=settings.hyde_max_completion_tokens,
+        timeout_seconds=settings.hyde_timeout_seconds,
+        max_attempts=settings.hyde_max_attempts,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_eval_hyde_transformer() -> QueryTransformer:
+    """HyDE transformer for the offline eval harness only.
+
+    Deliberately not the same instance as ``get_dynamic_hyde_transformer``:
+    eval profiles control HyDE enablement per case
+    (``PipelineProfile.enable_hyde``, see ``app.eval.invokers``) and must
+    not inherit an admin's live production rollout percentage or emergency
+    state - an eval run has to be able to exercise HyDE for real regardless
+    of what's currently rolled out to real traffic. Still fail-open, same
+    availability guarantee as production.
+    """
+    return FailOpenQueryTransformer(get_hyde_transformer())
+
+
+@lru_cache(maxsize=1)
+def get_dynamic_hyde_transformer() -> DynamicQueryTransformer:
+    """The HyDE transformer that actually serves real ``/chat`` traffic -
+    admin-mutable (rollout%/emergency-disable) via the RAG Operations panel.
+    Holds no config/metrics state of its own - ``RAGService.answer`` passes
+    in the one ``RagRuntimeConfig`` snapshot it captures per request (see
+    ``app.rag_services.rag_runtime_config``) and records HyDE metrics
+    itself, since only it observes the complete generation-embedding-fusion
+    pipeline."""
+    return DynamicQueryTransformer(delegate=get_hyde_transformer())
+
+
+@lru_cache(maxsize=1)
 def get_embedding_client() -> EmbeddingClient:
     return OpenAIEmbeddingClient(
         client=get_openai_client(),
@@ -222,21 +272,30 @@ def get_reranker() -> ReRanker:
 def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
     """Process-wide, atomically-swapped snapshot of the admin-mutable RAG
     Ops fields (see ``app.rag_services.rag_runtime_config``) - the single
-    shared source ``get_rag_service``/``get_dynamic_reranker``/
-    ``get_semantic_query_cache`` all read from below, so an admin's config
-    update (or ``RagOpsConfigPoller``'s cross-worker sync - see
-    ``app.api.rag_ops_sync``) is applied to all three in one atomic swap
-    instead of via each object's own independently-timed mutations."""
+    shared source ``RAGService.answer`` reads from (once per request,
+    passing it into ``DynamicReranker``/``DynamicQueryTransformer`` as a
+    plain argument rather than letting either read the store itself), so an
+    admin's config update (or ``RagOpsConfigPoller``'s cross-worker sync -
+    see ``app.api.rag_ops_sync``) is applied to every collaborator in one
+    atomic swap instead of via each object's own independently-timed
+    mutations.
+
+    ``hyde_enabled`` is deliberately stored raw here (not pre-baked with
+    ``emergency_disabled``, unlike ``reranking_enabled``/
+    ``semantic_cache_enabled``) - see
+    ``app.controllers.rag_ops_controller.apply_rag_ops_config`` for why."""
     config = get_rag_ops_repository().get_config()
     return RagRuntimeConfigStore(
         RagRuntimeConfig(
             reranking_enabled=config.reranking_enabled and not config.emergency_disabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
             reranker_rollout_percentage=config.reranker_rollout_percentage,
-            reranker_emergency_disabled=config.emergency_disabled,
+            emergency_disabled=config.emergency_disabled,
             semantic_cache_enabled=config.semantic_cache_enabled and not config.emergency_disabled,
             semantic_cache_threshold=config.semantic_cache_threshold,
             corpus_version=config.corpus_version,
+            hyde_enabled=config.hyde_enabled,
+            hyde_rollout_percentage=config.hyde_rollout_percentage,
         )
     )
 
@@ -248,7 +307,9 @@ def get_dynamic_reranker() -> DynamicReranker:
     panel, unlike ``get_reranker`` above. Both local and Voyage delegates
     are constructed up front (Voyage only if an API key is configured) so
     an admin can flip ``reranker_backend`` at any time without a cold
-    construction cost on the next request."""
+    construction cost on the next request. Holds no config state of its
+    own - ``RAGService.answer`` passes in the one ``RagRuntimeConfig``
+    snapshot it captures per request."""
     settings = get_settings().rag
     local: ReRanker = LocalCrossEncoderReranker(model_name=settings.reranker_model)
     voyage: ReRanker | None = None
@@ -257,12 +318,7 @@ def get_dynamic_reranker() -> DynamicReranker:
             api_key=settings.voyage_api_key.get_secret_value(),
             model_name=settings.voyage_model,
         )
-    return DynamicReranker(
-        local=local,
-        voyage=voyage,
-        metrics=get_rag_metrics_service(),
-        config_store=get_rag_runtime_config_store(),
-    )
+    return DynamicReranker(local=local, voyage=voyage, metrics=get_rag_metrics_service())
 
 
 @lru_cache(maxsize=1)
@@ -272,14 +328,14 @@ def get_semantic_query_cache() -> SemanticQueryCache:
     exist on first real use, not at construction time - see
     ``QdrantSemanticQueryCache``'s docstring - since this is always
     constructed regardless of whether semantic caching is currently
-    enabled). ``similarity_threshold`` is read live from the shared
-    ``RagRuntimeConfigStore`` (not ``RAGFeatureSettings`` directly), so an
-    admin's threshold change is live without a restart."""
+    enabled). Holds no config state of its own - ``RAGService.answer``
+    passes ``similarity_threshold`` in per-call, from the same snapshot it
+    uses for everything else in that request (see
+    ``app.repositories.semantic_cache_repository``)."""
     settings = get_settings().rag
     return QdrantSemanticQueryCache(
         client=get_qdrant_client(),
         collection_name=settings.semantic_cache_collection,
-        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -303,13 +359,14 @@ def get_allowed_retrieval_modes() -> frozenset[str]:
 def get_rag_service() -> RAGService:
     """The RAGService that serves real ``/chat`` traffic.
 
-    ``reranking_enabled``/``semantic_cache_enabled``/``corpus_version`` are
-    read live from the shared ``RagRuntimeConfigStore`` (not
-    ``RAGFeatureSettings`` directly) - and the semantic cache instance is
-    always passed in (regardless of whether it starts enabled), since an
-    admin can flip ``semantic_cache_enabled`` on later via that same store,
-    which ``RAGService.answer`` additionally gates on a real cache instance
-    having been supplied here at construction time.
+    ``reranking_enabled``/``semantic_cache_enabled``/``hyde_enabled``/
+    ``corpus_version`` are all read live from the shared
+    ``RagRuntimeConfigStore`` (not ``RAGFeatureSettings`` directly) - and
+    the semantic cache instance is always passed in (regardless of whether
+    it starts enabled), since an admin can flip ``semantic_cache_enabled``
+    on later via that same store, which ``RAGService.answer`` additionally
+    gates on a real cache instance having been supplied here at
+    construction time.
     """
     settings = get_settings().rag
     return RAGService(
@@ -323,6 +380,7 @@ def get_rag_service() -> RAGService:
         reranker_initial_top_k=settings.reranker_initial_top_k,
         semantic_cache=get_semantic_query_cache(),
         metrics=get_rag_metrics_service(),
+        query_transformer=get_dynamic_hyde_transformer(),
         config_store=get_rag_runtime_config_store(),
     )
 

@@ -24,6 +24,8 @@ class RagOpsConfig:
     reranker_rollout_percentage: int
     semantic_cache_enabled: bool
     semantic_cache_threshold: float
+    hyde_enabled: bool
+    hyde_rollout_percentage: int
     emergency_disabled: bool
     emergency_disabled_reason: str | None
     emergency_disabled_at: datetime | None

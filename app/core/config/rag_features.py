@@ -20,8 +20,14 @@ class RAGFeatureSettings(EnvBaseSettings):
     reranking Strategy/Adapter (local cross-encoder vs. Voyage API).
     """
 
-    hyde_num_hypotheses: int = Field(default=3, gt=0)
     hyde_enabled_by_default: bool = Field(default=False)
+    hyde_model: str = Field(default="gpt-4o-mini", min_length=1)
+    hyde_prompt_version: str = Field(default="bank-policy-v1", min_length=1)
+    hyde_num_hypotheses: int = Field(default=3, ge=1, le=5)
+    hyde_temperature: float = Field(default=0.3, ge=0.0, le=1.0)
+    hyde_max_completion_tokens: int = Field(default=600, ge=64, le=2_000)
+    hyde_timeout_seconds: float = Field(default=12.0, gt=0.0, le=60.0)
+    hyde_max_attempts: int = Field(default=2, ge=1, le=3)
 
     hybrid_candidate_top_k: int = Field(default=20, gt=0)
     hybrid_search_enabled: bool = Field(default=True)

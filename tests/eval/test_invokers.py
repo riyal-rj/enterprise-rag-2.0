@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+from app.core.exceptions import EvaluationPipelineError
 from app.core.llm.chat_client import LLMResponse, TokenUsage
 from app.eval import invokers
 from app.eval.invokers import RetrievedChunk, ServiceInvoker, SkippedIntent
@@ -15,6 +16,7 @@ from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import (
     ChatResponse,
+    HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
@@ -51,6 +53,7 @@ class _FakeRAGService:
         retrieval_mode: str | None = None,
         *,
         reranking_enabled: bool | None = None,
+        hyde_enabled: bool | None = None,
     ) -> ChatResponse:
         self.calls.append(
             {
@@ -58,12 +61,13 @@ class _FakeRAGService:
                 "top_k": top_k,
                 "retrieval_mode": retrieval_mode,
                 "reranking_enabled": reranking_enabled,
+                "hyde_enabled": hyde_enabled,
             }
         )
         return self._response
 
 
-def _response(answer: str = "the answer") -> ChatResponse:
+def _response(answer: str = "the answer", *, hyde: HyDEMetadata | None = None) -> ChatResponse:
     return ChatResponse(
         answer=answer,
         sources=["a.pdf"],
@@ -71,12 +75,26 @@ def _response(answer: str = "the answer") -> ChatResponse:
         metadata=ResponseMetadata(
             route="rag",
             retrieval_mode="dense",
+            hyde=hyde or HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
         ),
         conversation_id=1,
+    )
+
+
+def _hyde_applied_response(answer: str = "the answer") -> ChatResponse:
+    """A response shaped like a real, successfully-applied HyDE run - used
+    by tests that pass ``enable_hyde=True`` and must clear
+    ServiceInvoker._call_pipeline's EvaluationPipelineError check (see
+    app.eval.invokers)."""
+    return _response(
+        answer,
+        hyde=HyDEMetadata(
+            enabled=True, applied=True, fallback=False, backend="hyde", hypothesis_count=2
+        ),
     )
 
 
@@ -118,6 +136,7 @@ def test_service_invoker_calls_the_real_rag_service_for_a_supported_profile() ->
             "top_k": PROFILES["naive"].top_k,
             "retrieval_mode": "dense",
             "reranking_enabled": False,
+            "hyde_enabled": False,
         }
     ]
 
@@ -144,14 +163,75 @@ def test_service_invoker_passes_enable_rerank_as_a_per_call_override() -> None:
     assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
 
 
-@pytest.mark.parametrize("profile_name", ["hybrid+rerank+hyde", "hybrid+rerank+crag", "all"])
+def test_service_invoker_passes_enable_hyde_as_a_per_call_override() -> None:
+    """hybrid+rerank+hyde must actually exercise HyDE through the real
+    RAGService.answer() override, not silently no-op - this is what makes
+    a baseline-vs-HyDE RAGAS comparison possible. HyDE is no longer in the
+    unimplemented-features skip list - see
+    test_service_invoker_skips_profiles_requesting_unimplemented_features."""
+    fake_rag_service = _FakeRAGService(_hyde_applied_response())
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+    assert fake_rag_service.calls[0]["hyde_enabled"] is True
+    assert fake_rag_service.calls[0]["reranking_enabled"] is True
+    assert fake_rag_service.calls[0]["retrieval_mode"] == "hybrid"
+
+
+def test_hyde_fallback_raises_evaluation_pipeline_error_instead_of_scoring_baseline() -> None:
+    """A HyDE case that silently fell back (LLM/embedding/fusion failure)
+    must fail loudly, not be scored as if HyDE ran - see
+    app.core.exceptions.EvaluationPipelineError."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=True, applied=False, fallback=True, backend="hyde")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError, match="hybrid\\+rerank\\+hyde"):
+        invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+
+def test_hyde_bypass_reason_raises_evaluation_pipeline_error() -> None:
+    """applied=False with a bypass_reason (even without fallback=True) is
+    still "HyDE did not run" - the eval harness's StaticPlannedQueryTransformer
+    never bypasses for rollout/emergency reasons in practice, but the check
+    itself doesn't assume that; it rejects any non-treatment outcome."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=True, applied=False, fallback=False, bypass_reason="rollout")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError):
+        invoker.invoke("q", PROFILES["hybrid+rerank+hyde"], Intent.RAG)
+
+
+def test_non_hyde_profile_ignores_hyde_metadata_entirely() -> None:
+    """A profile with enable_hyde=False must never trigger the HyDE
+    integrity check, regardless of what the response's hyde metadata says -
+    that field is meaningless when HyDE wasn't even requested."""
+    response = _response(
+        hyde=HyDEMetadata(enabled=False, applied=False, fallback=True, bypass_reason="disabled")
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["naive"], Intent.RAG)
+
+    assert result.answer == response.answer
+
+
+@pytest.mark.parametrize("profile_name", ["hybrid+rerank+crag", "all"])
 def test_service_invoker_skips_profiles_requesting_unimplemented_features(
     profile_name: str,
 ) -> None:
-    """HyDE/CRAG/self-reflective don't exist in the pipeline yet - silently
+    """CRAG/self-reflective don't exist in the pipeline yet - silently
     ignoring the flag would produce misleading pass/fail results, so these
     skip cleanly instead, even with a working rag_service wired up.
-    Reranking alone (hybrid+rerank) is no longer in this list - see
+    HyDE and reranking alone are no longer in this list - see
+    test_service_invoker_passes_enable_hyde_as_a_per_call_override and
     test_service_invoker_passes_enable_rerank_as_a_per_call_override."""
     fake_rag_service = _FakeRAGService(_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))

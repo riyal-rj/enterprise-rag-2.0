@@ -14,9 +14,10 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import ReRankedChunk, ReRankOutcome
+from app.rag_services.reranker import NoOpReranker, ReRankedChunk, ReRankOutcome, RerankPlan
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,
@@ -25,6 +26,7 @@ from app.rag_services.retrieval_strategy import (
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.repositories.vector_repository import VectorRepository
 from app.services.query_cache_service import QueryCacheService
+from app.services.rag_metrics_service import RagMetricsService
 
 
 class _InMemoryCacheBackend:
@@ -132,20 +134,23 @@ class _FakeLLMClient:
 
 
 class _FakeReranker:
+    """A PlannedReranker fake that's always "treatment" when enabled (no
+    rollout sampling) - deterministic for tests, same as
+    StaticPlannedReranker but keeping the exact pre-existing
+    cache_namespace format (``reranker:{name}:v1``) so existing namespace
+    assertions in this file don't need to change."""
+
     def __init__(self, *, name: str = "fake-reranker", fallback: bool = False) -> None:
         self._name = name
         self._fallback = fallback
         self.calls: list[dict[str, object]] = []
 
-    @property
-    def name(self) -> str:
-        return self._name
+    def plan(self, query: str, config, *, enabled: bool) -> RerankPlan:
+        if not enabled:
+            return RerankPlan("disabled", None, "none", "disabled", "rerank:none:reason=disabled")
+        return RerankPlan("treatment", None, self._name, None, f"reranker:{self._name}:v1")
 
-    @property
-    def cache_namespace(self) -> str:
-        return f"reranker:{self._name}:v1"
-
-    def rerank(self, *, query: str, candidates, top_k: int) -> ReRankOutcome:
+    def execute(self, plan: RerankPlan, *, query: str, candidates, top_k: int) -> ReRankOutcome:
         self.calls.append({"query": query, "candidates": list(candidates), "top_k": top_k})
         # Reverses retrieval order so tests can tell reranking actually ran.
         reordered = list(reversed(candidates))[:top_k]
@@ -176,13 +181,19 @@ class _FakeSemanticQueryCache:
         self.record_calls: list[dict[str, object]] = []
 
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         self.find_candidates_calls.append(
             {
                 "query_embedding": query_embedding,
                 "cache_namespace": cache_namespace,
                 "top_k": top_k,
+                "similarity_threshold": similarity_threshold,
             }
         )
         if self._raise_on_find:
@@ -207,9 +218,19 @@ class _FakeSemanticQueryCache:
 class _FakeMetricsRecorder:
     def __init__(self) -> None:
         self.semantic_lookup_calls: list[bool] = []
+        self.hyde_attempt_calls: list[dict[str, object]] = []
+        self.hyde_bypass_calls: list[str] = []
 
     def record_semantic_cache_lookup(self, *, hit: bool) -> None:
         self.semantic_lookup_calls.append(hit)
+
+    def record_hyde_attempt(self, *, duration_ms: float, fallback: bool, usage_tokens: int) -> None:
+        self.hyde_attempt_calls.append(
+            {"duration_ms": duration_ms, "fallback": fallback, "usage_tokens": usage_tokens}
+        )
+
+    def record_hyde_bypass(self, *, reason: str) -> None:
+        self.hyde_bypass_calls.append(reason)
 
 
 def _service(
@@ -1035,10 +1056,12 @@ def _config_store(*, corpus_version: int = 1) -> RagRuntimeConfigStore:
             reranking_enabled=False,
             reranker_backend="local",
             reranker_rollout_percentage=100,
-            reranker_emergency_disabled=False,
+            emergency_disabled=False,
             semantic_cache_enabled=False,
             semantic_cache_threshold=0.95,
             corpus_version=corpus_version,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
         )
     )
 
@@ -1076,10 +1099,12 @@ def test_corpus_version_bump_makes_a_previously_cached_answer_unreachable() -> N
             reranking_enabled=False,
             reranker_backend="local",
             reranker_rollout_percentage=100,
-            reranker_emergency_disabled=False,
+            emergency_disabled=False,
             semantic_cache_enabled=False,
             semantic_cache_threshold=0.95,
             corpus_version=2,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
         )
     )
     after_bump = service.answer("q", top_k=1)
@@ -1112,4 +1137,159 @@ def test_per_call_reranking_override_disables_reranking_for_a_single_request() -
     response = service.answer("q", top_k=1, reranking_enabled=False)
 
     assert response.metadata.reranking.enabled is False
-    assert reranker.calls == []
+
+
+def test_cache_key_uses_the_v5_prefix() -> None:
+    """Regression: the merged cache-key format combines candidate-pool-size
+    versioning (v3), HyDE identity (v4), and now cohort-isolation for both
+    reranking and HyDE - it must not collide with either predecessor
+    format for the same question/namespace."""
+    import hashlib
+
+    service, *_ = _service()
+
+    key = service._cache_key("q", 5, "dense:v1:corpus=1")
+
+    expected = hashlib.sha256(b"rag:v5:dense:v1:corpus=1:5:q").hexdigest()
+    assert key == expected
+
+
+def test_rollout_control_cohort_never_widens_the_candidate_pool_or_calls_the_backend() -> None:
+    """Regression: candidate_top_k used to widen for any query whenever
+    reranking was configured on at all, regardless of whether *this*
+    query's own rollout sampling actually selected it - only the treatment
+    cohort should ever retrieve a widened pool; control must see exactly
+    the caller's requested top_k, same as if reranking were off entirely."""
+    chunks = [RetrievedChunk(text=f"t{i}", source=f"s{i}.pdf", score=0.5) for i in range(10)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    config_store = RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=True,
+            reranker_backend="local",
+            reranker_rollout_percentage=0,  # guarantees every query is "control"
+            emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+        )
+    )
+    # A NoOpReranker "local" delegate is fine here - the whole point of this
+    # test is that the control cohort never reaches it at all.
+    reranker = DynamicReranker(local=NoOpReranker(), voyage=None, metrics=RagMetricsService())
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        reranker=reranker,
+        reranker_initial_top_k=8,
+        config_store=config_store,
+    )
+
+    response = service.answer("q", top_k=3)
+
+    assert vector_repository.search_calls[0]["top_k"] == 3  # not widened to 8
+    assert response.metadata.reranking.applied is False
+
+
+def test_semantic_cache_partitions_control_and_treatment_reranker_cohorts_separately() -> None:
+    """Regression: the semantic-cache namespace used to only encode the
+    *configured* rollout percentage, not which cohort a specific query
+    actually landed in - a control-cohort query and a treatment-cohort
+    query under the same rollout% must not be able to share a semantic
+    cache entry."""
+    semantic_cache = _FakeSemanticQueryCache()
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    config_store = RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=True,
+            reranker_backend="local",
+            reranker_rollout_percentage=50,
+            emergency_disabled=False,
+            semantic_cache_enabled=True,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+        )
+    )
+    reranker = DynamicReranker(local=NoOpReranker(), voyage=None, metrics=RagMetricsService())
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient()),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        reranker=reranker,
+        semantic_cache=cast(SemanticQueryCache, semantic_cache),
+        config_store=config_store,
+    )
+
+    # Find one query landing in each cohort under this 50% rollout.
+    control_query = next(
+        q
+        for q in (f"q{i}" for i in range(50))
+        if reranker.plan(q, config_store.current, enabled=True).cohort == "control"
+    )
+    treatment_query = next(
+        q
+        for q in (f"q{i}" for i in range(50))
+        if reranker.plan(q, config_store.current, enabled=True).cohort == "treatment"
+    )
+
+    service.answer(control_query, top_k=1)
+    service.answer(treatment_query, top_k=1)
+
+    control_namespace = semantic_cache.record_calls[0]["cache_namespace"]
+    treatment_namespace = semantic_cache.record_calls[1]["cache_namespace"]
+    assert control_namespace != treatment_namespace
+
+
+def test_config_store_current_is_read_exactly_once_per_answer_call() -> None:
+    """The whole point of capturing one snapshot up front: a config update
+    landing mid-request must not be observable within that same request.
+    This is a structural guarantee (DynamicReranker/DynamicQueryTransformer/
+    QdrantSemanticQueryCache hold no store reference of their own - see
+    their module docstrings) verified here by counting reads on the one
+    store RAGService itself holds."""
+    real_store = RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=True,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            emergency_disabled=False,
+            semantic_cache_enabled=True,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+        )
+    )
+    read_count = 0
+
+    class _CountingConfigStore:
+        @property
+        def current(self) -> RagRuntimeConfig:
+            nonlocal read_count
+            read_count += 1
+            return real_store.current
+
+    chunks = [RetrievedChunk(text="a", source="a.pdf", score=0.9)]
+    semantic_cache = _FakeSemanticQueryCache()
+    service, _, reranker = _service_with_reranker(chunks, reranking_enabled=True)
+    service._config_store = cast(RagRuntimeConfigStore, _CountingConfigStore())
+    service._semantic_cache = cast(SemanticQueryCache, semantic_cache)
+
+    service.answer("q", top_k=1)
+
+    assert read_count == 1

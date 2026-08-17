@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRankedChunk, ReRankOutcome
+from app.rag_services.rag_runtime_config import RagRuntimeConfig
+from app.rag_services.reranker import (
+    FailOpenReranker,
+    NoOpReranker,
+    PlannedNoOpReranker,
+    ReRankedChunk,
+    ReRankOutcome,
+    StaticPlannedReranker,
+)
 
 
 class _FakeReranker:
@@ -89,3 +97,69 @@ def test_fail_open_reranker_uses_fallback_reranker_on_delegate_failure() -> None
     assert [item.chunk for item in outcome.items] == chunks[:2]
     assert outcome.applied is False
     assert outcome.fallback is True
+
+
+def _config() -> RagRuntimeConfig:
+    return RagRuntimeConfig(
+        reranking_enabled=True,
+        reranker_backend="local",
+        reranker_rollout_percentage=100,
+        emergency_disabled=False,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        corpus_version=1,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
+    )
+
+
+def test_planned_noop_reranker_is_always_disabled() -> None:
+    plan = PlannedNoOpReranker().plan("q", _config(), enabled=True)
+
+    assert plan.cohort == "disabled"
+    assert plan.reported_backend == "none"
+
+
+def test_planned_noop_reranker_execute_is_a_noop() -> None:
+    reranker = PlannedNoOpReranker()
+    plan = reranker.plan("q", _config(), enabled=True)
+
+    outcome = reranker.execute(plan, query="q", candidates=_chunks(2), top_k=2)
+
+    assert outcome.applied is False
+    assert outcome.backend == "none"
+
+
+def test_static_planned_reranker_is_disabled_when_not_enabled() -> None:
+    reranker = StaticPlannedReranker(_FakeReranker())
+
+    plan = reranker.plan("q", _config(), enabled=False)
+
+    assert plan.cohort == "disabled"
+
+
+def test_static_planned_reranker_is_always_treatment_when_enabled_regardless_of_rollout() -> None:
+    """Mirrors get_reranker()'s docstring guarantee: eval must exercise
+    reranking for real whenever enable_rerank is on, never silently
+    bypassed by an admin's live rollout%/emergency-disable setting - even
+    a 0%-rollout, emergency-disabled config must not change this."""
+    delegate = _FakeReranker()
+    reranker = StaticPlannedReranker(delegate)
+    hostile_config = RagRuntimeConfig(
+        reranking_enabled=False,
+        reranker_backend="local",
+        reranker_rollout_percentage=0,
+        emergency_disabled=True,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        corpus_version=1,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
+    )
+
+    plan = reranker.plan("q", hostile_config, enabled=True)
+    outcome = reranker.execute(plan, query="q", candidates=_chunks(2), top_k=2)
+
+    assert plan.cohort == "treatment"
+    assert outcome.applied is True
+    assert len(delegate.calls) == 1

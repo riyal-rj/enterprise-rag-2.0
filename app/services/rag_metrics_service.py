@@ -38,9 +38,25 @@ class SemanticCacheMetricsSnapshot:
     hit_rate: float
 
 
+@dataclass(frozen=True)
+class HyDEMetricsSnapshot:
+    """HyDE performance over the last ``window_size`` *attempted* transforms
+    (the delegate was actually invoked - rollout-bypassed and
+    emergency-disabled requests don't count as attempts, same distinction as
+    :class:`RerankMetricsSnapshot`)."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    fallback_rate: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
 class RagMetricsService:
-    """Records reranker latency/fallback/token-usage samples and semantic
-    cache lookup outcomes; exposes rolled-up snapshots for the RAG
+    """Records reranker/HyDE latency/fallback/token-usage samples and
+    semantic cache lookup outcomes; exposes rolled-up snapshots for the RAG
     Operations panel's status endpoint."""
 
     def __init__(self, window_size: int = _DEFAULT_WINDOW_SIZE) -> None:
@@ -55,8 +71,13 @@ class RagMetricsService:
         self._voyage_tokens_total = 0
         self._semantic_lookups = 0
         self._semantic_hits = 0
+        self._hyde_samples: deque[tuple[float, bool]] = deque(maxlen=window_size)
+        self._hyde_usage_tokens_total = 0
+        self._hyde_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
 
-    def record_rerank(self, *, duration_ms: float, fallback: bool, usage_tokens: int | None) -> None:
+    def record_rerank(
+        self, *, duration_ms: float, fallback: bool, usage_tokens: int | None
+    ) -> None:
         with self._lock:
             self._rerank_samples.append((duration_ms, fallback))
             if usage_tokens:
@@ -90,6 +111,34 @@ class RagMetricsService:
             hits = self._semantic_hits
         return SemanticCacheMetricsSnapshot(
             lookups=lookups, hits=hits, hit_rate=(hits / lookups) if lookups else 0.0
+        )
+
+    def record_hyde_attempt(self, *, duration_ms: float, fallback: bool, usage_tokens: int) -> None:
+        with self._lock:
+            self._hyde_samples.append((duration_ms, fallback))
+            self._hyde_usage_tokens_total += max(usage_tokens, 0)
+
+    def record_hyde_bypass(self, *, reason: str) -> None:
+        with self._lock:
+            self._hyde_bypass_counts[reason] = self._hyde_bypass_counts.get(reason, 0) + 1
+
+    def hyde_stats(self) -> HyDEMetricsSnapshot:
+        with self._lock:
+            samples = list(self._hyde_samples)
+            tokens = self._hyde_usage_tokens_total
+            bypasses = dict(self._hyde_bypass_counts)
+
+        durations = sorted(duration for duration, _ in samples)
+        attempts = len(samples)
+        fallback_count = sum(1 for _, fallback in samples if fallback)
+        return HyDEMetricsSnapshot(
+            sample_count=attempts,
+            p50_latency_ms=_percentile(durations, 0.50),
+            p95_latency_ms=_percentile(durations, 0.95),
+            fallback_rate=(fallback_count / attempts) if attempts else 0.0,
+            usage_tokens_total=tokens,
+            rollout_bypasses=bypasses.get("rollout", 0),
+            emergency_bypasses=bypasses.get("emergency_disabled", 0),
         )
 
 

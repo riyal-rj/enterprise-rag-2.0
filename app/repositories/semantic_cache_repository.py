@@ -34,8 +34,6 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
-
 # Must match the output dimensionality of LLMSettings.embedding_model
 # (text-embedding-3-small) - same invariant as
 # app.repositories.vector_repository._VECTOR_SIZE, since both index the
@@ -57,14 +55,25 @@ class SemanticQueryCache(Protocol):
     partition."""
 
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         """Return exact-match cache keys of previously-cached questions in
-        this partition that clear the configured similarity threshold,
-        nearest-first. Empty if nothing clears it. Callers should try each
-        key in order (via the exact-match cache) until one is still live,
-        since the nearest embedding match's underlying answer may have
-        expired."""
+        this partition that clear ``similarity_threshold``, nearest-first.
+        Empty if nothing clears it. Callers should try each key in order
+        (via the exact-match cache) until one is still live, since the
+        nearest embedding match's underlying answer may have expired.
+
+        ``similarity_threshold`` is a caller-supplied value, not read from
+        any shared store here - the caller (``RAGService.answer``) captures
+        one config snapshot per request and passes its
+        ``semantic_cache_threshold`` straight through, so this repository
+        can't disagree with the rest of that same request about which
+        config generation is in effect."""
         ...
 
     def record(
@@ -102,30 +111,28 @@ class QdrantSemanticQueryCache:
     Qdrant collection in ``__init__`` would reintroduce a hard Qdrant
     dependency for deployments that keep semantic caching disabled.
 
-    ``similarity_threshold`` is read from a shared ``RagRuntimeConfigStore``
-    (see ``app.rag_services.rag_runtime_config``) instead of an independently
-    mutable instance field, so an admin's threshold change is applied via
-    the exact same atomic snapshot swap ``RAGService``/``DynamicReranker``
-    observe - not a fourth, separately-timed mutation.
+    ``similarity_threshold`` is passed in per-call by ``RAGService`` (from
+    the one config snapshot it captures per request) rather than read from
+    a shared store here - this class holds no runtime-config reference at
+    all, so it can never independently disagree with the rest of a request
+    about which config generation is in effect.
     """
 
-    def __init__(
-        self,
-        client: QdrantClient,
-        collection_name: str,
-        config_store: RagRuntimeConfigStore,
-    ) -> None:
+    def __init__(self, client: QdrantClient, collection_name: str) -> None:
         self._client = client
         self._collection_name = collection_name
-        self._config_store = config_store
         self._collection_ready = False
         self._collection_ready_lock = threading.Lock()
 
     def find_candidates(
-        self, *, query_embedding: list[float], cache_namespace: str, top_k: int
+        self,
+        *,
+        query_embedding: list[float],
+        cache_namespace: str,
+        top_k: int,
+        similarity_threshold: float,
     ) -> list[str]:
         self._ensure_collection_ready()
-        similarity_threshold = self._config_store.current.semantic_cache_threshold
         results = self._client.query_points(
             collection_name=self._collection_name,
             query=query_embedding,

@@ -3,11 +3,42 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
+import httpx
 import pytest
-from openai import OpenAI
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
+from pydantic import BaseModel
 
 from app.core.llm import chat_client
 from app.core.llm.chat_client import OpenAILLMClient, build_openai_client
+
+
+class _Answer(BaseModel):
+    value: str
+
+
+_REQUEST = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+
+def _rate_limit_error(message: str = "rate limited") -> RateLimitError:
+    return RateLimitError(message, response=httpx.Response(429, request=_REQUEST), body=None)
+
+
+def _server_error(message: str = "server error") -> InternalServerError:
+    return InternalServerError(message, response=httpx.Response(500, request=_REQUEST), body=None)
+
+
+def _bad_request_error(message: str = "bad request") -> BadRequestError:
+    return BadRequestError(message, response=httpx.Response(400, request=_REQUEST), body=None)
+
+
+def _auth_error(message: str = "invalid api key") -> AuthenticationError:
+    return AuthenticationError(message, response=httpx.Response(401, request=_REQUEST), body=None)
 
 
 @dataclass
@@ -146,7 +177,7 @@ def test_missing_content_defaults_to_empty_string() -> None:
 
 def test_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 0.001)
-    llm, fake = _client(RuntimeError("transient"), _fake_completion("recovered"))
+    llm, fake = _client(_rate_limit_error(), _fake_completion("recovered"))
 
     result = llm.generate("system", "user")
 
@@ -157,10 +188,51 @@ def test_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_raises_after_exhausting_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 0.001)
     llm, fake = _client(
-        RuntimeError("fail 1"), RuntimeError("fail 2"), RuntimeError("permanent failure")
+        _rate_limit_error("fail 1"), _rate_limit_error("fail 2"), _rate_limit_error("fail 3")
     )
 
-    with pytest.raises(RuntimeError, match="permanent failure"):
+    with pytest.raises(RateLimitError, match="fail 3"):
         llm.generate("system", "user")
 
     assert len(fake.completions.calls) == 3
+
+
+def test_server_error_is_also_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 0.001)
+    llm, fake = _client(_server_error(), _fake_completion("recovered"))
+
+    result = llm.generate("system", "user")
+
+    assert result.text == "recovered"
+    assert len(fake.completions.calls) == 2
+
+
+def test_permanent_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 0.001)
+    llm, fake = _client(_bad_request_error("malformed request"), _fake_completion("never reached"))
+
+    with pytest.raises(BadRequestError, match="malformed request"):
+        llm.generate("system", "user")
+
+    # Exactly one attempt - a permanent failure fails fast, it doesn't burn
+    # the retry budget on an error that will look identical every time.
+    assert len(fake.completions.calls) == 1
+
+
+def test_authentication_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 0.001)
+    llm, fake = _client(_auth_error(), _fake_completion("never reached"))
+
+    with pytest.raises(AuthenticationError):
+        llm.generate("system", "user")
+
+    assert len(fake.completions.calls) == 1
+
+
+def test_invalid_max_attempts_is_rejected_before_any_call() -> None:
+    llm, fake = _client(_fake_completion("unused"))
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        llm.generate_structured("system", "user", response_model=_Answer, max_attempts=0)
+
+    assert fake.completions.calls == []

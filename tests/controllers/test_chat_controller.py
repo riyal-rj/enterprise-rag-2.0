@@ -12,7 +12,13 @@ from app.models.conversation import ConversationEntry
 from app.rag_services.rag_service import RAGService
 from app.repositories.chat_history_repository import ChatHistoryRepository
 from app.repositories.conversation_repository import ConversationRepository
-from app.schemas.chat import ChatRequest, ChatResponse, RerankingMetadata, ResponseMetadata
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    HyDEMetadata,
+    RerankingMetadata,
+    ResponseMetadata,
+)
 
 
 class _FakeRAGService:
@@ -122,6 +128,7 @@ def _response(answer: str = "hello") -> ChatResponse:
         confidence=0.9,
         metadata=ResponseMetadata(
             route="rag",
+            hyde=HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             retrieved_chunks=[],
         ),

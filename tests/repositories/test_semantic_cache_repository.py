@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache
 
 
@@ -59,26 +58,8 @@ class _FakeQdrantClient:
         self._point_count = 0
 
 
-def _config_store(*, threshold: float = 0.95) -> RagRuntimeConfigStore:
-    return RagRuntimeConfigStore(
-        RagRuntimeConfig(
-            reranking_enabled=False,
-            reranker_backend="local",
-            reranker_rollout_percentage=100,
-            reranker_emergency_disabled=False,
-            semantic_cache_enabled=True,
-            semantic_cache_threshold=threshold,
-            corpus_version=1,
-        )
-    )
-
-
-def _cache(client: _FakeQdrantClient, *, threshold: float = 0.95) -> QdrantSemanticQueryCache:
-    return QdrantSemanticQueryCache(
-        client=client,  # type: ignore[arg-type]
-        collection_name="rag_query_cache",
-        config_store=_config_store(threshold=threshold),
-    )
+def _cache(client: _FakeQdrantClient) -> QdrantSemanticQueryCache:
+    return QdrantSemanticQueryCache(client=client, collection_name="rag_query_cache")  # type: ignore[arg-type]
 
 
 def test_construction_does_not_touch_qdrant_at_all() -> None:
@@ -98,7 +79,9 @@ def test_first_find_candidates_call_creates_the_collection_and_payload_indexes_i
     client = _FakeQdrantClient()
     cache = _cache(client)
 
-    cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert len(client.created_collections) == 1
     assert client.created_collections[0]["collection_name"] == "rag_query_cache"
@@ -110,7 +93,9 @@ def test_first_use_does_not_recreate_an_existing_collection() -> None:
     client = _FakeQdrantClient(existing_collections=["rag_query_cache"])
     cache = _cache(client)
 
-    cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert client.created_collections == []
     assert client.created_payload_indexes == []
@@ -120,43 +105,31 @@ def test_collection_is_only_ensured_once_across_multiple_calls() -> None:
     client = _FakeQdrantClient()
     cache = _cache(client)
 
-    cache.find_candidates(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5)
+    cache.find_candidates(
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
     cache.record(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, cache_key="k")
 
     assert len(client.created_collections) == 1
 
 
-def test_find_candidates_reads_the_threshold_live_from_the_shared_store() -> None:
-    """An admin's threshold change (RagOpsController._apply /
-    RagOpsConfigPoller replacing the shared store's snapshot) must take
-    effect on the very next lookup without rebuilding this instance."""
+def test_find_candidates_uses_the_caller_supplied_threshold_each_call() -> None:
+    """The repository holds no config state of its own - RAGService passes
+    similarity_threshold in per-call, from the one snapshot it captures per
+    request (see app.rag_services.rag_service), so the exact same lookup
+    can behave differently across two calls purely based on what the caller
+    passes, with no internal state to "take effect"."""
     client = _FakeQdrantClient()
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.90)]
     )
-    store = _config_store(threshold=0.95)
-    cache = QdrantSemanticQueryCache(
-        client=client,
-        collection_name="rag_query_cache",
-        config_store=store,  # type: ignore[arg-type]
-    )
+    cache = _cache(client)
 
     below_threshold = cache.find_candidates(
-        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5
-    )
-    store.replace(
-        RagRuntimeConfig(
-            reranking_enabled=False,
-            reranker_backend="local",
-            reranker_rollout_percentage=100,
-            reranker_emergency_disabled=False,
-            semantic_cache_enabled=True,
-            semantic_cache_threshold=0.80,
-            corpus_version=1,
-        )
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
     )
     now_clears_threshold = cache.find_candidates(
-        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.80
     )
 
     assert below_threshold == []
@@ -168,7 +141,9 @@ def test_find_candidates_returns_empty_list_when_no_points_match() -> None:
     client.query_response = _FakeQueryResponse(points=[])
     cache = _cache(client)
 
-    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert result == []
 
@@ -178,9 +153,11 @@ def test_find_candidates_excludes_points_below_threshold() -> None:
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.80)]
     )
-    cache = _cache(client, threshold=0.95)
+    cache = _cache(client)
 
-    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert result == []
 
@@ -190,9 +167,11 @@ def test_find_candidates_returns_the_cache_key_when_score_clears_threshold() -> 
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc123"}, score=0.97)]
     )
-    cache = _cache(client, threshold=0.95)
+    cache = _cache(client)
 
-    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert result == ["abc123"]
 
@@ -202,9 +181,11 @@ def test_find_candidates_score_exactly_at_threshold_counts_as_a_match() -> None:
     client.query_response = _FakeQueryResponse(
         points=[_FakeScoredPoint(payload={"cache_key": "abc"}, score=0.95)]
     )
-    cache = _cache(client, threshold=0.95)
+    cache = _cache(client)
 
-    result = cache.find_candidates(query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(
+        query_embedding=[0.1, 0.2], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert result == ["abc"]
 
@@ -222,9 +203,11 @@ def test_find_candidates_returns_multiple_matches_nearest_first_and_stops_at_thr
             _FakeScoredPoint(payload={"cache_key": "below-threshold"}, score=0.80),
         ]
     )
-    cache = _cache(client, threshold=0.95)
+    cache = _cache(client)
 
-    result = cache.find_candidates(query_embedding=[0.1], cache_namespace="dense:v1", top_k=5)
+    result = cache.find_candidates(
+        query_embedding=[0.1], cache_namespace="dense:v1", top_k=5, similarity_threshold=0.95
+    )
 
     assert result == ["nearest", "second"]
 
@@ -233,7 +216,9 @@ def test_find_candidates_filters_by_cache_namespace_and_top_k() -> None:
     client = _FakeQdrantClient()
     cache = _cache(client)
 
-    cache.find_candidates(query_embedding=[0.1], cache_namespace="hybrid:v2", top_k=8)
+    cache.find_candidates(
+        query_embedding=[0.1], cache_namespace="hybrid:v2", top_k=8, similarity_threshold=0.95
+    )
 
     call = client.query_points_calls[0]
     query_filter = call["query_filter"]

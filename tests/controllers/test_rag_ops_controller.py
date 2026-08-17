@@ -23,6 +23,8 @@ def _config(**overrides: object) -> RagOpsConfig:
         reranker_rollout_percentage=100,
         semantic_cache_enabled=False,
         semantic_cache_threshold=0.95,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,
@@ -114,6 +116,15 @@ def test_status_reflects_current_config() -> None:
     assert status.corpus_version == 3
 
 
+def test_status_reflects_hyde_fields() -> None:
+    controller, *_ = _controller(_config(hyde_enabled=True, hyde_rollout_percentage=17))
+
+    status = controller.status()
+
+    assert status.hyde_enabled is True
+    assert status.hyde_rollout_percentage == 17
+
+
 def test_update_config_pushes_new_values_into_the_shared_config_store() -> None:
     controller, repository, config_store, reranker = _controller()
 
@@ -125,6 +136,8 @@ def test_update_config_pushes_new_values_into_the_shared_config_store() -> None:
             reranker_rollout_percentage=25,
             semantic_cache_enabled=True,
             semantic_cache_threshold=0.8,
+            hyde_enabled=True,
+            hyde_rollout_percentage=5,
         ),
     )
 
@@ -134,6 +147,8 @@ def test_update_config_pushes_new_values_into_the_shared_config_store() -> None:
     assert current.reranker_backend == "voyage"
     assert current.reranker_rollout_percentage == 25
     assert current.semantic_cache_threshold == 0.8
+    assert current.hyde_enabled is True
+    assert current.hyde_rollout_percentage == 5
 
 
 def test_update_config_rejects_voyage_backend_without_api_key() -> None:
@@ -145,7 +160,7 @@ def test_update_config_rejects_voyage_backend_without_api_key() -> None:
 
 def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
     controller, repository, config_store, reranker = _controller(
-        _config(reranking_enabled=True, semantic_cache_enabled=True)
+        _config(reranking_enabled=True, semantic_cache_enabled=True, hyde_enabled=True)
     )
 
     status = controller.emergency_disable(
@@ -156,7 +171,12 @@ def test_emergency_disable_forces_reranking_and_semantic_cache_off() -> None:
     current = config_store.current
     assert current.reranking_enabled is False
     assert current.semantic_cache_enabled is False
-    assert current.reranker_emergency_disabled is True
+    assert current.emergency_disabled is True
+    # hyde_enabled is stored raw (not pre-baked with emergency_disabled) -
+    # DynamicQueryTransformer.plan resolves the emergency bypass itself so
+    # HyDEMetricsSnapshot.emergency_bypasses stays observable. See
+    # app.controllers.rag_ops_controller.apply_rag_ops_config.
+    assert current.hyde_enabled is True
 
 
 def test_emergency_enable_restores_previously_configured_state() -> None:
@@ -180,9 +200,9 @@ def test_audit_log_maps_repository_entries() -> None:
 
 
 def test_config_replacement_never_leaves_the_store_in_a_torn_state() -> None:
-    """Regression: _apply() used to make six independent set_*() calls
-    across three different objects - a concurrent reader between any two
-    of them could observe a mix of old and new fields. Replacing the whole
+    """Regression: _apply() used to make several independent set_*() calls
+    across multiple objects - a concurrent reader between any two of them
+    could observe a mix of old and new fields. Replacing the whole
     RagRuntimeConfig snapshot in one call makes that impossible: after
     update_config() returns, every field in config_store.current reflects
     the *same* update, never a partial one."""
