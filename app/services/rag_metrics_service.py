@@ -75,7 +75,9 @@ class RagMetricsService:
         self._hyde_usage_tokens_total = 0
         self._hyde_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
 
-    def record_rerank(self, *, duration_ms: float, fallback: bool, usage_tokens: int | None) -> None:
+    def record_rerank(
+        self, *, duration_ms: float, fallback: bool, usage_tokens: int | None
+    ) -> None:
         with self._lock:
             self._rerank_samples.append((duration_ms, fallback))
             if usage_tokens:

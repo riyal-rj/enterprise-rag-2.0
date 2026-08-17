@@ -20,6 +20,7 @@ cohort-decision unit tests themselves).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 
 from qdrant_client.models import SparseVector
@@ -173,7 +174,7 @@ class _FakeReranker:
         return RerankPlan("treatment", None, "fake-reranker", None, "reranker:fake-reranker:v1")
 
     def execute(
-        self, plan: RerankPlan, *, query: str, candidates: list[RetrievedChunk], top_k: int
+        self, plan: RerankPlan, *, query: str, candidates: Sequence[RetrievedChunk], top_k: int
     ) -> ReRankOutcome:
         self.calls.append({"query": query, "top_k": top_k})
         items = tuple(
@@ -612,7 +613,7 @@ def test_treatment_attempt_metrics_include_total_stage_latency_not_just_generati
         default_retrieval_mode=dense_strategy.name,
         query_transformer=DynamicQueryTransformer(delegate=cast(QueryTransformer, transformer)),
         hyde_enabled=True,
-        metrics=cast("object", metrics),
+        metrics=metrics,
     )
 
     service.answer("q", top_k=1)
@@ -639,7 +640,7 @@ def test_embedding_fusion_failure_is_recorded_as_a_fallback_attempt_not_a_succes
         default_retrieval_mode=dense_strategy.name,
         query_transformer=DynamicQueryTransformer(delegate=cast(QueryTransformer, transformer)),
         hyde_enabled=True,
-        metrics=cast("object", metrics),
+        metrics=metrics,
     )
 
     service.answer("q", top_k=1)

@@ -87,7 +87,12 @@ class LLMResponse(BaseModel):
 
 
 @dataclass(frozen=True)
-class StructuredLLMResponse(Generic[StructuredModel]):
+class StructuredLLMResponse(Generic[StructuredModel]):  # noqa: UP046 - PEP 695 class
+    # type params are Python 3.12+ only; this venv (and the pinned lockfile)
+    # run 3.11, where `class Foo[T]:` is a SyntaxError, not just a style
+    # nit - ruff's target-version = "py312" is aspirational here, not the
+    # actual interpreter. Confirmed via `python -c "import ...chat_client"`
+    # raising SyntaxError before this suppression was added.
     value: StructuredModel
     usage: TokenUsage
 

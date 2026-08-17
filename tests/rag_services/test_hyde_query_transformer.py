@@ -44,9 +44,7 @@ class _FakeLLMClient:
             }
         )
         value = response_model(hypothesis=self._hypotheses)
-        return StructuredLLMResponse(
-            value=value, usage=TokenUsage(total_tokens=self._usage_tokens)
-        )
+        return StructuredLLMResponse(value=value, usage=TokenUsage(total_tokens=self._usage_tokens))
 
 
 class _RaisingLLMClient:

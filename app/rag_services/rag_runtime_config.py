@@ -34,9 +34,9 @@ class RagRuntimeConfig:
     see module docstring.
 
     ``emergency_disabled`` is the single global kill switch - it isn't
-    reranker-specific despite the historical field name it replaces
-    (``reranker_emergency_disabled``); reranking/semantic-cache gate on it
-    pre-baked into their own ``*_enabled`` fields below, while HyDE's
+    reranker-specific despite the historical, reranker-prefixed field name
+    it replaces; reranking/semantic-cache gate on it pre-baked into their
+    own ``*_enabled`` fields below, while HyDE's
     ``hyde_enabled`` is intentionally left raw (not pre-baked) so
     ``DynamicQueryTransformer.plan`` can distinguish "feature off" from
     "emergency-disabled" and keep both bypass reasons observable in
