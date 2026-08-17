@@ -1,18 +1,22 @@
 """Basic RAG answer generation: embed, dense-search, generate, cache.
 
-The full pipeline this is meant to grow into - CRAG relevance grading,
-self-reflective answer refinement, hybrid/sparse search, SQL intent
-routing, prompt-injection spotlighting - layers on top of this. HyDE query
-expansion and reranking are wired (see ``answer()``'s reranking/HyDE
-stages): HyDE only ever replaces the *dense retrieval vector*, never the
-sparse query, reranker query, or answer-LLM question, and it fails open to
-the original-query embedding on any LLM/schema/embedding/fusion error. No
-relevance grading, no answer refinement loop, and no prompt-injection
-defense yet.
+The full pipeline this is meant to grow into - self-reflective answer
+refinement, SQL intent routing, prompt-injection spotlighting - layers on
+top of this. HyDE query expansion, reranking, and CRAG evidence correction
+are wired (see ``answer()``'s reranking/HyDE/CRAG stages): HyDE only ever
+replaces the *dense retrieval vector*, never the sparse query, reranker
+query, or answer-LLM question, and it fails open to the original-query
+embedding on any LLM/schema/embedding/fusion error. CRAG grades the final
+reranked/retrieved chunks (never a HyDE hypothesis, never a pre-rerank
+pool), extractively refines them, and only escalates to allowlisted
+public-regulatory web search for an explicitly in-scope query - see
+``app.rag_services.crag`` for the full contract and non-negotiables. No
+answer refinement loop, no prompt-injection defense yet.
 
-Both reranking and HyDE are driven by a ``PlannedReranker``/
-``PlannedQueryTransformer`` pair (see ``app.rag_services.reranker`` /
-``app.rag_services.query_transformer``): ``answer()`` captures exactly one
+Reranking, HyDE, and CRAG are each driven by a ``PlannedReranker``/
+``PlannedQueryTransformer``/``PlannedCorrectiveRetriever`` (see
+``app.rag_services.reranker`` / ``app.rag_services.query_transformer`` /
+``app.rag_services.crag``): ``answer()`` captures exactly one
 ``RagRuntimeConfig`` snapshot per request (see
 ``app.rag_services.rag_runtime_config``) and calls each collaborator's
 ``plan()`` once, up front, to decide that request's cohort
@@ -33,6 +37,7 @@ correctness requirement.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Mapping
@@ -45,6 +50,11 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.crag import (
+    EvidenceChunk,
+    PlannedCorrectiveRetriever,
+    PlannedNoOpCorrectiveRetriever,
+)
 from app.rag_services.embedding_fusion import mean_pool_and_normalize
 from app.rag_services.query_transformer import (
     NoOpQueryTransformer,
@@ -58,6 +68,7 @@ from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import (
     ChatResponse,
+    CRAGMetadata,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -85,6 +96,17 @@ class _RagServiceMetricsRecorder(Protocol):
         self, *, duration_ms: float, fallback: bool, usage_tokens: int
     ) -> None: ...
     def record_hyde_bypass(self, *, reason: str) -> None: ...
+    def record_crag_outcome(
+        self,
+        *,
+        duration_ms: float,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        usage_tokens: int,
+    ) -> None: ...
+    def record_crag_bypass(self, *, reason: str) -> None: ...
 
 
 class _NoOpRagServiceMetrics:
@@ -99,6 +121,21 @@ class _NoOpRagServiceMetrics:
         pass
 
     def record_hyde_bypass(self, *, reason: str) -> None:
+        pass
+
+    def record_crag_outcome(
+        self,
+        *,
+        duration_ms: float,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        usage_tokens: int,
+    ) -> None:
+        pass
+
+    def record_crag_bypass(self, *, reason: str) -> None:
         pass
 
 
@@ -198,6 +235,8 @@ class RAGService:
         metrics: _RagServiceMetricsRecorder | None = None,
         query_transformer: PlannedQueryTransformer | None = None,
         hyde_enabled: bool = False,
+        corrective_retriever: PlannedCorrectiveRetriever | None = None,
+        crag_enabled: bool = False,
         config_store: RagRuntimeConfigStore | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
@@ -227,6 +266,7 @@ class RAGService:
         self._semantic_cache = semantic_cache
         self._metrics = metrics or _NoOpRagServiceMetrics()
         self._query_transformer = query_transformer or PlannedNoOpQueryTransformer()
+        self._corrective_retriever = corrective_retriever or PlannedNoOpCorrectiveRetriever()
         # A caller that cares about atomic cross-object config application
         # (app.api.deps.get_rag_service) passes the same config_store this
         # process's DynamicReranker/DynamicQueryTransformer read from (see
@@ -247,6 +287,9 @@ class RAGService:
                 corpus_version=1,
                 hyde_enabled=hyde_enabled,
                 hyde_rollout_percentage=100,
+                crag_enabled=crag_enabled,
+                crag_rollout_percentage=100,
+                crag_web_enabled=False,
             )
         )
 
@@ -258,15 +301,16 @@ class RAGService:
         *,
         reranking_enabled: bool | None = None,
         hyde_enabled: bool | None = None,
+        crag_enabled: bool | None = None,
     ) -> ChatResponse:
         """Answer ``question``.
 
-        ``reranking_enabled``/``hyde_enabled`` override the instance-level
-        defaults (from the config snapshot captured below, seeded from the
-        centralized RAG ops config in production) for this call only -
-        ``None`` (the default) defers to the instance. This is what lets
-        the eval harness exercise the pipeline with any combination of
-        flags through the same service instance/config (see
+        ``reranking_enabled``/``hyde_enabled``/``crag_enabled`` override the
+        instance-level defaults (from the config snapshot captured below,
+        seeded from the centralized RAG ops config in production) for this
+        call only - ``None`` (the default) defers to the instance. This is
+        what lets the eval harness exercise the pipeline with any
+        combination of flags through the same service instance/config (see
         ``app.eval.invokers.ServiceInvoker``) instead of needing a
         separately-wired ``RAGService`` per combination.
         """
@@ -281,6 +325,7 @@ class RAGService:
             config.reranking_enabled if reranking_enabled is None else reranking_enabled
         )
         effective_hyde_enabled = config.hyde_enabled if hyde_enabled is None else hyde_enabled
+        effective_crag_enabled = config.crag_enabled if crag_enabled is None else crag_enabled
 
         mode = retrieval_mode or self._default_retrieval_mode
         if mode in self._retrieval_strategies:
@@ -334,6 +379,18 @@ class RAGService:
         hyde_plan = self._query_transformer.plan(question, config, enabled=hyde_can_run)
         if hyde_can_run:
             cache_namespace = f"{cache_namespace}:{hyde_plan.cache_namespace}"
+
+        # CRAG cohort is decided here too, from the same single `config`
+        # snapshot, before any cache lookup - same reasoning as
+        # rerank_plan/hyde_plan above: a control-cohort query and a
+        # treatment-cohort query under the same rollout percentage must not
+        # share a cache namespace, since treatment can rewrite the evidence
+        # (and even add web sources) that reaches the answer LLM.
+        crag_plan = self._corrective_retriever.plan(
+            question, config, enabled=effective_crag_enabled
+        )
+        if effective_crag_enabled:
+            cache_namespace = f"{cache_namespace}:{crag_plan.cache_namespace}"
 
         cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
@@ -459,12 +516,65 @@ class RAGService:
             else:
                 logger.debug("rag.reranking_applied", extra=log_fields)
 
-        user_message = f"{self._build_context(chunks)}\n\nQuestion: {question}"
-        llm_response = self._llm_client.generate(_SYSTEM_PROMPT, user_message)
+        # CRAG grades/refines/corrects the exact evidence that would
+        # otherwise reach the answer LLM - the final reranked/retrieved
+        # `chunks`, never a pre-rerank pool or a HyDE hypothesis (see module
+        # docstring). ``execute`` always runs, even when CRAG is disabled or
+        # this query landed in the rollout control cohort: in every one of
+        # those cases ``crag_plan.cohort != "treatment"`` routes to
+        # ``PlannedNoOpCorrectiveRetriever``, which wraps `chunks` as-is via
+        # ``local_evidence`` - so evidence-context construction below never
+        # needs to branch on whether CRAG actually ran.
+        crag_started = time.perf_counter()
+        crag_outcome = self._corrective_retriever.execute(question, chunks, crag_plan)
+        if crag_plan.cohort == "treatment":
+            crag_outcome = replace(
+                crag_outcome, duration_ms=(time.perf_counter() - crag_started) * 1000
+            )
+            self._metrics.record_crag_outcome(
+                duration_ms=crag_outcome.duration_ms,
+                decision=(crag_outcome.decision.value if crag_outcome.decision else None),
+                fallback=crag_outcome.fallback,
+                abstain=crag_outcome.abstain,
+                web_used=crag_outcome.web_used,
+                usage_tokens=crag_outcome.usage_tokens,
+            )
+            log_fields = {
+                "decision": (crag_outcome.decision.value if crag_outcome.decision else None),
+                "applied": crag_outcome.applied,
+                "fallback": crag_outcome.fallback,
+                "abstain": crag_outcome.abstain,
+                "web_used": crag_outcome.web_used,
+                "evidence_count": len(crag_outcome.evidence),
+                "duration_ms": round(crag_outcome.duration_ms, 2),
+            }
+            if crag_outcome.fallback:
+                logger.warning("rag.crag_fallback_applied", extra=log_fields)
+            else:
+                logger.debug("rag.crag_applied", extra=log_fields)
+        elif crag_plan.bypass_reason in ("rollout", "emergency_disabled"):
+            # "disabled" (feature toggle fully off) isn't a canary bucket
+            # worth counting - only rollout-control and emergency bypasses
+            # are, matching HyDE's identical distinction above.
+            self._metrics.record_crag_bypass(reason=crag_plan.bypass_reason)
+
+        # Abstention is a deterministic response, never an LLM guess filling
+        # an evidence gap - see module docstring's non-negotiable #4 and
+        # ``ProductionCorrectiveRetriever.correct``'s internal-policy branch.
+        if crag_outcome.abstain:
+            answer_text = (
+                "The supplied approved evidence is insufficient to determine this point. "
+                "No external source was used to fill the gap."
+            )
+        else:
+            user_message = (
+                f"{self._build_evidence_context(crag_outcome.evidence)}\n\nQuestion: {question}"
+            )
+            answer_text = self._llm_client.generate(_SYSTEM_PROMPT, user_message).text
 
         confidence = compute_confidence_breakdown(
             chunks,
-            llm_response.text,
+            answer_text,
             retrieval_mode=strategy.name,
             retrieval_ordered_chunks=retrieval_ordered_top_k,
         )
@@ -480,7 +590,7 @@ class RAGService:
             },
         )
 
-        flagged_claims = find_unsupported_claims(llm_response.text, chunks)
+        flagged_claims = find_unsupported_claims(answer_text, chunks)
         if flagged_claims:
             logger.warning(
                 "rag.unsupported_claim_flagged",
@@ -488,8 +598,8 @@ class RAGService:
             )
 
         response = ChatResponse(
-            answer=llm_response.text,
-            sources=sorted({chunk.source for chunk in chunks}),
+            answer=answer_text,
+            sources=sorted({item.source for item in crag_outcome.evidence}),
             confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
@@ -514,19 +624,40 @@ class RAGService:
                     candidate_count=rerank_candidate_count,
                     usage_tokens=rerank_usage_tokens,
                 ),
+                crag=CRAGMetadata(
+                    enabled=effective_crag_enabled,
+                    applied=crag_outcome.applied,
+                    decision=(crag_outcome.decision.value if crag_outcome.decision else None),
+                    fallback=crag_outcome.fallback,
+                    abstain=crag_outcome.abstain,
+                    web_used=crag_outcome.web_used,
+                    evidence_count=len(crag_outcome.evidence),
+                    usage_tokens=crag_outcome.usage_tokens,
+                    duration_ms=round(crag_outcome.duration_ms, 2),
+                    bypass_reason=crag_outcome.bypass_reason,
+                ),
                 retrieved_chunks=self._build_chunk_previews(chunks, rerank_items),
                 flagged_claims=flagged_claims,
             ),
         )
 
         # A fallback response is retrieval-order output produced *under
-        # the reranked/HyDE config's cache key* - caching it would let later
-        # requests keep receiving the degraded answer even after the
-        # reranker/HyDE recovers, since nothing would ever invalidate it (see
-        # module docstring: reads/writes are cache-aside, there's no TTL
-        # tied to reranker/HyDE health). Simplest correct fix: never cache a
-        # fallback response at all, exact-match or semantic.
-        pipeline_fallback = fallback_occurred or hyde_outcome.fallback
+        # the reranked/HyDE/CRAG config's cache key* - caching it would let
+        # later requests keep receiving the degraded answer even after the
+        # reranker/HyDE/CRAG recovers, since nothing would ever invalidate
+        # it (see module docstring: reads/writes are cache-aside, there's no
+        # TTL tied to pipeline health). Simplest correct fix: never cache a
+        # fallback, abstained, or web-corrected response at all, exact-match
+        # or semantic - web state isn't versioned with corpus_version (see
+        # CRAG blueprint's non-negotiable #4/#5), and an abstention is a
+        # statement about *this* evidence set, not a durable answer.
+        pipeline_fallback = (
+            fallback_occurred
+            or hyde_outcome.fallback
+            or crag_outcome.fallback
+            or crag_outcome.web_used
+            or crag_outcome.abstain
+        )
         if not pipeline_fallback:
             cache_written = self._set_cached(cache_key, response)
             if (
@@ -564,31 +695,47 @@ class RAGService:
             for c in chunks
         ]
 
-    def _build_context(self, chunks: list[RetrievedChunk]) -> str:
-        if not chunks:
+    def _build_evidence_context(self, evidence: tuple[EvidenceChunk, ...]) -> str:
+        """Render CRAG-approved evidence for the answer LLM.
+
+        ``evidence`` is always CRAG's output - identity-wrapped original
+        chunks when CRAG is disabled/control (see ``PlannedNoOpCorrectiveRetriever``),
+        graded/refined/possibly-web-augmented evidence when it's active.
+        Metadata is JSON-serialized (not string-interpolated) so a source
+        name or URL containing special characters can't corrupt the
+        surrounding ``<evidence>`` delimiters; both ``QUESTION`` and this
+        evidence text remain untrusted data per this module's system
+        prompt, never instructions.
+        """
+        if not evidence:
             return "No relevant context was found."
 
-        sections: list[str] = []
-        for chunk in chunks:
-            source_label = chunk.source
-
-            if chunk.page_number is not None:
-                source_label = f"{source_label} page. {chunk.page_number}"
-
-            sections.append(f"[{source_label}]\n{chunk.text}")
-        return "\n\n".join(sections)
+        blocks: list[str] = []
+        for index, item in enumerate(evidence, start=1):
+            metadata = {
+                "evidence_id": index,
+                "source": item.source,
+                "page_number": item.page_number,
+                "origin": item.origin.value,
+                "canonical_url": item.canonical_url,
+                "retrieved_at": item.retrieved_at_iso,
+            }
+            blocks.append(f"<evidence metadata={json.dumps(metadata, ensure_ascii=True)}>")
+            blocks.append(item.text)
+            blocks.append("</evidence>")
+        return "\n".join(blocks)
 
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
         normalized_question = " ".join(question.split())
 
-        # v5: cache_namespace now folds in per-query cohort isolation for
-        # both reranking and HyDE (control vs. treatment, decided from
-        # DynamicReranker.plan/DynamicQueryTransformer.plan - not just the
-        # configured rollout percentage), on top of v3's candidate-pool-size
-        # versioning and v4's HyDE identity - bumped so a v3 or v4 key
-        # computed under either narrower format can't collide with or mask
-        # a v5 key for the same question/config.
-        raw_key = f"rag:v5:{cache_namespace}:{top_k}:{normalized_question}"
+        # v6: cache_namespace now folds in per-query CRAG cohort isolation
+        # too (control vs. treatment, decided from
+        # PlannedCorrectiveRetriever.plan - not just the configured rollout
+        # percentage), on top of v5's reranking/HyDE cohort isolation -
+        # bumped so a v5-or-earlier key can't collide with or mask a v6 key
+        # for the same question/config now that CRAG can rewrite (or
+        # web-augment) the evidence that reaches the answer LLM.
+        raw_key = f"rag:v6:{cache_namespace}:{top_k}:{normalized_question}"
 
         return hashlib.sha256(raw_key.encode()).hexdigest()
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
@@ -16,6 +16,9 @@ def _valid_kwargs(**overrides: object) -> dict[str, object]:
         corpus_version=3,
         hyde_enabled=True,
         hyde_rollout_percentage=25,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
     defaults.update(overrides)
     return defaults

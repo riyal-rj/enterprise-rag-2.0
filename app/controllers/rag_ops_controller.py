@@ -34,6 +34,7 @@ from app.repositories.rag_ops_repository import RagOpsRepository
 from app.schemas.rag_ops import (
     AuditLogEntryResponse,
     AuditLogResponse,
+    CRAGMetrics,
     EmergencyDisableRequest,
     EmergencyEnableRequest,
     HyDEMetrics,
@@ -72,6 +73,9 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             corpus_version=config.corpus_version,
             hyde_enabled=config.hyde_enabled,
             hyde_rollout_percentage=config.hyde_rollout_percentage,
+            crag_enabled=config.crag_enabled,
+            crag_rollout_percentage=config.crag_rollout_percentage,
+            crag_web_enabled=config.crag_web_enabled,
         )
     )
 
@@ -86,6 +90,8 @@ class RagOpsController:
         config_store: RagRuntimeConfigStore,
         reranker: DynamicReranker,
         metrics: RagMetricsService,
+        *,
+        crag_web_available: bool = False,
     ) -> None:
         self._repository = repository
         self._config_store = config_store
@@ -95,6 +101,12 @@ class RagOpsController:
         # a live reference to either.
         self._reranker = reranker
         self._metrics = metrics
+        # Whether a real WebRetriever was actually constructed (Tavily
+        # credentials + a non-empty approved-domain allowlist) - see
+        # app.api.deps.get_regulatory_web_retriever. Lets this controller
+        # reject crag_web_enabled=True before it ever reaches a real
+        # request, same as has_voyage_backend does for the reranker backend.
+        self._crag_web_available = crag_web_available
 
     def status(self) -> RagOpsStatusResponse:
         return self._to_status(self._repository.get_config())
@@ -104,6 +116,11 @@ class RagOpsController:
             raise InvalidRagOpsConfigError(
                 "Cannot switch to the Voyage reranker backend: no VOYAGE_API_KEY is "
                 "configured for this deployment."
+            )
+        if payload.crag_web_enabled is True and not self._crag_web_available:
+            raise InvalidRagOpsConfigError(
+                "Cannot enable CRAG web correction: this deployment has no Tavily "
+                "credentials and/or approved regulatory-domain allowlist configured."
             )
 
         config = self._repository.update_config(
@@ -116,6 +133,9 @@ class RagOpsController:
             semantic_cache_threshold=payload.semantic_cache_threshold,
             hyde_enabled=payload.hyde_enabled,
             hyde_rollout_percentage=payload.hyde_rollout_percentage,
+            crag_enabled=payload.crag_enabled,
+            crag_rollout_percentage=payload.crag_rollout_percentage,
+            crag_web_enabled=payload.crag_web_enabled,
         )
         self._apply(config)
         return self._to_status(config)
@@ -162,6 +182,7 @@ class RagOpsController:
         rerank_snapshot = self._metrics.rerank_stats()
         semantic_snapshot = self._metrics.semantic_cache_stats()
         hyde_snapshot = self._metrics.hyde_stats()
+        crag_snapshot = self._metrics.crag_stats()
         return RagOpsStatusResponse(
             reranking_enabled=config.reranking_enabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
@@ -190,6 +211,24 @@ class RagOpsController:
                 usage_tokens_total=hyde_snapshot.usage_tokens_total,
                 rollout_bypasses=hyde_snapshot.rollout_bypasses,
                 emergency_bypasses=hyde_snapshot.emergency_bypasses,
+            ),
+            crag_enabled=config.crag_enabled,
+            crag_rollout_percentage=config.crag_rollout_percentage,
+            crag_web_enabled=config.crag_web_enabled,
+            crag_web_available=self._crag_web_available,
+            crag_metrics=CRAGMetrics(
+                sample_count=crag_snapshot.sample_count,
+                p50_latency_ms=crag_snapshot.p50_latency_ms,
+                p95_latency_ms=crag_snapshot.p95_latency_ms,
+                correct_count=crag_snapshot.correct_count,
+                ambiguous_count=crag_snapshot.ambiguous_count,
+                incorrect_count=crag_snapshot.incorrect_count,
+                fallback_rate=crag_snapshot.fallback_rate,
+                abstention_rate=crag_snapshot.abstention_rate,
+                web_use_rate=crag_snapshot.web_use_rate,
+                usage_tokens_total=crag_snapshot.usage_tokens_total,
+                rollout_bypasses=crag_snapshot.rollout_bypasses,
+                emergency_bypasses=crag_snapshot.emergency_bypasses,
             ),
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,

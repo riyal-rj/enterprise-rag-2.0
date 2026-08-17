@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from app.rag_services.query_transformer import (
     FailOpenQueryTransformer,
@@ -91,6 +91,9 @@ def _config() -> RagRuntimeConfig:
         corpus_version=1,
         hyde_enabled=True,
         hyde_rollout_percentage=100,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
 
@@ -136,6 +139,9 @@ def test_static_planned_query_transformer_is_always_treatment_when_enabled_regar
         corpus_version=1,
         hyde_enabled=True,
         hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
     plan = transformer.plan("q", hostile_config, enabled=True)

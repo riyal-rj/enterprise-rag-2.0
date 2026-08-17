@@ -16,6 +16,7 @@ from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import (
     ChatResponse,
+    CRAGMetadata,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -54,6 +55,7 @@ class _FakeRAGService:
         *,
         reranking_enabled: bool | None = None,
         hyde_enabled: bool | None = None,
+        crag_enabled: bool | None = None,
     ) -> ChatResponse:
         self.calls.append(
             {
@@ -62,12 +64,18 @@ class _FakeRAGService:
                 "retrieval_mode": retrieval_mode,
                 "reranking_enabled": reranking_enabled,
                 "hyde_enabled": hyde_enabled,
+                "crag_enabled": crag_enabled,
             }
         )
         return self._response
 
 
-def _response(answer: str = "the answer", *, hyde: HyDEMetadata | None = None) -> ChatResponse:
+def _response(
+    answer: str = "the answer",
+    *,
+    hyde: HyDEMetadata | None = None,
+    crag: CRAGMetadata | None = None,
+) -> ChatResponse:
     return ChatResponse(
         answer=answer,
         sources=["a.pdf"],
@@ -77,6 +85,7 @@ def _response(answer: str = "the answer", *, hyde: HyDEMetadata | None = None) -
             retrieval_mode="dense",
             hyde=hyde or HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
+            crag=crag or CRAGMetadata(enabled=False),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
@@ -95,6 +104,17 @@ def _hyde_applied_response(answer: str = "the answer") -> ChatResponse:
         hyde=HyDEMetadata(
             enabled=True, applied=True, fallback=False, backend="hyde", hypothesis_count=2
         ),
+    )
+
+
+def _crag_applied_response(answer: str = "the answer") -> ChatResponse:
+    """A response shaped like a real, cleanly-applied CRAG run - used by
+    tests that pass ``enable_crag=True`` and must clear
+    ServiceInvoker._call_pipeline's EvaluationPipelineError check (see
+    app.eval.invokers)."""
+    return _response(
+        answer,
+        crag=CRAGMetadata(enabled=True, applied=True, decision="correct", evidence_count=2),
     )
 
 
@@ -137,6 +157,7 @@ def test_service_invoker_calls_the_real_rag_service_for_a_supported_profile() ->
             "retrieval_mode": "dense",
             "reranking_enabled": False,
             "hyde_enabled": False,
+            "crag_enabled": False,
         }
     ]
 
@@ -223,21 +244,75 @@ def test_non_hyde_profile_ignores_hyde_metadata_entirely() -> None:
     assert result.answer == response.answer
 
 
-@pytest.mark.parametrize("profile_name", ["hybrid+rerank+crag", "all"])
-def test_service_invoker_skips_profiles_requesting_unimplemented_features(
-    profile_name: str,
-) -> None:
-    """CRAG/self-reflective don't exist in the pipeline yet - silently
-    ignoring the flag would produce misleading pass/fail results, so these
-    skip cleanly instead, even with a working rag_service wired up.
-    HyDE and reranking alone are no longer in this list - see
-    test_service_invoker_passes_enable_hyde_as_a_per_call_override and
-    test_service_invoker_passes_enable_rerank_as_a_per_call_override."""
+def test_service_invoker_passes_enable_crag_as_a_per_call_override() -> None:
+    """hybrid+rerank+crag must actually exercise CRAG through the real
+    RAGService.answer() override, not silently no-op - this is what makes
+    a baseline-vs-CRAG RAGAS comparison possible. CRAG is no longer in the
+    unimplemented-features skip list - see
+    test_service_invoker_skips_profiles_requesting_unimplemented_features."""
+    fake_rag_service = _FakeRAGService(_crag_applied_response())
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    invoker.invoke("q", PROFILES["hybrid+rerank+crag"], Intent.RAG)
+
+    assert fake_rag_service.calls[0]["crag_enabled"] is True
+    assert fake_rag_service.calls[0]["reranking_enabled"] is True
+
+
+def test_crag_fallback_raises_evaluation_pipeline_error_instead_of_scoring_baseline() -> None:
+    """A CRAG case that fell back (grader/refiner error) must fail loudly,
+    not be scored as if CRAG cleanly graded/refined the evidence - see
+    app.core.exceptions.EvaluationPipelineError."""
+    response = _response(crag=CRAGMetadata(enabled=True, applied=False, fallback=True))
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError, match="hybrid\\+rerank\\+crag"):
+        invoker.invoke("q", PROFILES["hybrid+rerank+crag"], Intent.RAG)
+
+
+def test_crag_abstention_does_not_raise_evaluation_pipeline_error() -> None:
+    """Abstention is a legitimate CRAG branch outcome (insufficient
+    evidence, web correction not permitted), not a pipeline failure -
+    ``applied`` stays True in that branch, so it must not trip the same
+    check as an actual grader/refiner error."""
+    response = _response(
+        crag=CRAGMetadata(enabled=True, applied=True, decision="incorrect", abstain=True)
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["hybrid+rerank+crag"], Intent.RAG)
+
+    assert result.answer == response.answer
+
+
+def test_non_crag_profile_ignores_crag_metadata_entirely() -> None:
+    """A profile with enable_crag=False must never trigger the CRAG
+    integrity check, regardless of what the response's crag metadata says -
+    that field is meaningless when CRAG wasn't even requested."""
+    response = _response(crag=CRAGMetadata(enabled=False, applied=False, fallback=True))
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["naive"], Intent.RAG)
+
+    assert result.answer == response.answer
+
+
+def test_service_invoker_skips_profiles_requesting_unimplemented_features() -> None:
+    """Self-reflective doesn't exist in the pipeline yet - silently
+    ignoring the flag would produce misleading pass/fail results, so it
+    skips cleanly instead, even with a working rag_service wired up. HyDE,
+    reranking, and CRAG alone are no longer in this list - see
+    test_service_invoker_passes_enable_hyde_as_a_per_call_override,
+    test_service_invoker_passes_enable_rerank_as_a_per_call_override, and
+    test_service_invoker_passes_enable_crag_as_a_per_call_override."""
     fake_rag_service = _FakeRAGService(_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
 
-    with pytest.raises(SkippedIntent, match="aren't implemented"):
-        invoker.invoke("question", PROFILES[profile_name], Intent.RAG)
+    with pytest.raises(SkippedIntent, match="isn't implemented"):
+        invoker.invoke("question", PROFILES["all"], Intent.RAG)
 
     assert fake_rag_service.calls == []
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
@@ -24,6 +24,9 @@ def _config(
         semantic_cache_threshold=0.95,
         hyde_enabled=hyde_enabled,
         hyde_rollout_percentage=hyde_rollout_percentage,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,
@@ -104,6 +107,9 @@ async def test_poll_is_a_no_op_when_config_has_not_changed_since_last_poll(
             corpus_version=1,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
     await poller._poll_once()
@@ -148,6 +154,9 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
         semantic_cache_threshold=0.95,
         hyde_enabled=True,
         hyde_rollout_percentage=10,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
         emergency_disabled=True,
         emergency_disabled_reason="incident",
         emergency_disabled_at=datetime.now(UTC),

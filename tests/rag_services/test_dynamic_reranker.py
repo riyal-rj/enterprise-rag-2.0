@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.dynamic_reranker import DynamicReranker
@@ -52,6 +52,9 @@ def _config(
         corpus_version=1,
         hyde_enabled=False,
         hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
 

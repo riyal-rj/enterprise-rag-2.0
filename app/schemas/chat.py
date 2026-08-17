@@ -94,6 +94,33 @@ class HyDEMetadata(BaseModel):
     bypass_reason: str | None = None
 
 
+class CRAGMetadata(BaseModel):
+    """Diagnostic detail about the Corrective-RAG stage.
+
+    ``enabled=True`` only means the CRAG feature toggle was on for this
+    request - it does **not** imply the query was sampled into the rollout
+    treatment cohort. A query can have ``enabled=True`` and still show
+    ``applied=False, bypass_reason="rollout"`` (sampled into the control
+    cohort) or ``bypass_reason="emergency_disabled"`` - same
+    enabled/bypass/applied/fallback distinction ``HyDEMetadata`` carries for
+    HyDE. ``decision`` is ``None`` unless CRAG actually graded retrieval for
+    this request. Raw grader reasons, refiner selections, and web snippet
+    text are deliberately never included here - only counts and identifiers
+    (see ``app.rag_services.rag_service._build_evidence_context``).
+    """
+
+    enabled: bool
+    applied: bool = False
+    decision: Literal["correct", "ambiguous", "incorrect"] | None = None
+    fallback: bool = False
+    abstain: bool = False
+    web_used: bool = False
+    evidence_count: int = 0
+    usage_tokens: int = 0
+    duration_ms: float = 0.0
+    bypass_reason: str | None = None
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
@@ -106,6 +133,7 @@ class ResponseMetadata(BaseModel):
     retrieval_mode: str = "dense"
     hyde: HyDEMetadata
     reranking: RerankingMetadata
+    crag: CRAGMetadata
     retrieved_chunks: list[RetrievedChunkPreview]
     flagged_claims: list[str] = Field(default_factory=list)
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import UTC, datetime
 
@@ -25,6 +25,9 @@ def _config(**overrides: object) -> RagOpsConfig:
         semantic_cache_threshold=0.95,
         hyde_enabled=False,
         hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
         emergency_disabled=False,
         emergency_disabled_reason=None,
         emergency_disabled_at=None,
@@ -138,6 +141,9 @@ def test_update_config_pushes_new_values_into_the_shared_config_store() -> None:
             semantic_cache_threshold=0.8,
             hyde_enabled=True,
             hyde_rollout_percentage=5,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         ),
     )
 

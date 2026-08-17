@@ -26,6 +26,9 @@ class RagOpsConfig:
     semantic_cache_threshold: float
     hyde_enabled: bool
     hyde_rollout_percentage: int
+    crag_enabled: bool
+    crag_rollout_percentage: int
+    crag_web_enabled: bool
     emergency_disabled: bool
     emergency_disabled_reason: str | None
     emergency_disabled_at: datetime | None
