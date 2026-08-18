@@ -3,8 +3,8 @@ from __future__ import annotations
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.crag.crag import CRAGDecision, CRAGOutcome
 from app.rag_services.crag.dynamic_corrective_retriever import DynamicCorrectiveRetriever
-from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
-from app.rag_services.query_transformer import QueryTransformOutcome
+from app.rag_services.hyde.dynamic_query_transformer import DynamicQueryTransformer
+from app.rag_services.hyde.query_transformer import QueryTransformOutcome
 from app.rag_services.rag_runtime_config import RagRuntimeConfig
 
 

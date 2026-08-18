@@ -52,21 +52,21 @@ from app.rag_services.crag.web_retriever import (
     KeywordRegulatoryScopePolicy,
     TavilyRegulatoryWebRetriever,
 )
-from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
-from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
-from app.rag_services.dynamic_reranker import DynamicReranker
-from app.rag_services.hyde_query_transformer import HydeQueryTransformer
-from app.rag_services.query_transformer import FailOpenQueryTransformer, QueryTransformer
+from app.rag_services.hyde.dynamic_query_transformer import DynamicQueryTransformer
+from app.rag_services.hyde.hyde_query_transformer import HydeQueryTransformer
+from app.rag_services.hyde.query_transformer import FailOpenQueryTransformer, QueryTransformer
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import FailOpenReranker, NoOpReranker, ReRanker
+from app.rag_services.reranker.cross_encoder_reranker import LocalCrossEncoderReranker
+from app.rag_services.reranker.dynamic_reranker import DynamicReranker
+from app.rag_services.reranker.reranker import FailOpenReranker, NoOpReranker, ReRanker
+from app.rag_services.reranker.voyage_reranker import VoyageReranker
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,
     RetrievalStrategy,
     SparseRetrievalStrategy,
 )
-from app.rag_services.voyage_reranker import VoyageReranker
 from app.repositories.chat_history_repository import (
     ChatHistoryRepository,
     PostgresChatHistoryRepository,
@@ -371,7 +371,7 @@ def get_reranker() -> ReRanker:
     depends on this reranker actually running whenever a case's
     ``enable_rerank`` flag is on, not being silently bypassed by an admin's
     live rollout-percentage/emergency-disable setting - see
-    ``app.rag_services.dynamic_reranker`` for why that bypass exists at all.
+    ``app.rag_services.reranker.dynamic_reranker`` for why that bypass exists at all.
     """
     settings = get_settings().rag
     delegate: ReRanker

@@ -163,7 +163,7 @@ class PlannedReranker(Protocol):
     and eval (always-on) reranking paths implement, so ``RAGService.answer``
     can call ``plan()``/``execute()`` uniformly regardless of which one it
     was given - see ``DynamicReranker`` (production, in
-    ``app.rag_services.dynamic_reranker``) and ``StaticPlannedReranker``
+    ``app.rag_services.reranker.dynamic_reranker``) and ``StaticPlannedReranker``
     (eval, below)."""
 
     def plan(self, query: str, config: RagRuntimeConfig, *, enabled: bool) -> RerankPlan: ...

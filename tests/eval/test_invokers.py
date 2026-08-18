@@ -11,7 +11,7 @@ from app.eval.invokers import RetrievedChunk, ServiceInvoker, SkippedIntent
 from app.eval.profiles import PROFILES
 from app.eval.schemas import Intent
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import NoOpReranker
+from app.rag_services.reranker.reranker import NoOpReranker
 from app.rag_services.retrieval_strategy import DenseRetrievalStrategy
 from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import (

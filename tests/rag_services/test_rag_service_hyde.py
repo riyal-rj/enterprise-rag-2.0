@@ -30,10 +30,15 @@ from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
-from app.rag_services.query_transformer import QueryTransformer, QueryTransformOutcome
+from app.rag_services.hyde.dynamic_query_transformer import DynamicQueryTransformer
+from app.rag_services.hyde.query_transformer import QueryTransformer, QueryTransformOutcome
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import PlannedReranker, ReRankedChunk, ReRankOutcome, RerankPlan
+from app.rag_services.reranker.reranker import (
+    PlannedReranker,
+    ReRankedChunk,
+    ReRankOutcome,
+    RerankPlan,
+)
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,

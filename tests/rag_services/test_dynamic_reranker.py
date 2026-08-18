@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_runtime_config import RagRuntimeConfig
-from app.rag_services.reranker import ReRankedChunk, ReRankOutcome
+from app.rag_services.reranker.dynamic_reranker import DynamicReranker
+from app.rag_services.reranker.reranker import ReRankedChunk, ReRankOutcome
 from app.services.rag_metrics_service import RagMetricsService
 
 
