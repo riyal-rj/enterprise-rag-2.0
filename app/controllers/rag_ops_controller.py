@@ -28,8 +28,8 @@ from __future__ import annotations
 
 from app.core.exceptions import InvalidRagOpsConfigError
 from app.models.rag_ops import RagOpsConfig, validate_crag_state
-from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
+from app.rag_services.reranker.dynamic_reranker import DynamicReranker
 from app.repositories.rag_ops_repository import RagOpsRepository
 from app.schemas.rag_ops import (
     AuditLogEntryResponse,

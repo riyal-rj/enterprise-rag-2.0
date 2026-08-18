@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.rag_services.query_transformer import (
+from app.rag_services.hyde.query_transformer import (
     FailOpenQueryTransformer,
     NoOpQueryTransformer,
     PlannedNoOpQueryTransformer,

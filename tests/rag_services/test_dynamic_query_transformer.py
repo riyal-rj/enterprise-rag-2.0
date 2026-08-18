@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
-from app.rag_services.dynamic_reranker import DynamicReranker
-from app.rag_services.query_transformer import QueryTransformOutcome
+from app.rag_services.hyde.dynamic_query_transformer import DynamicQueryTransformer
+from app.rag_services.hyde.query_transformer import QueryTransformOutcome
 from app.rag_services.rag_runtime_config import RagRuntimeConfig
-from app.rag_services.reranker import ReRankOutcome
+from app.rag_services.reranker.dynamic_reranker import DynamicReranker
+from app.rag_services.reranker.reranker import ReRankOutcome
 from app.services.rag_metrics_service import RagMetricsService
 
 

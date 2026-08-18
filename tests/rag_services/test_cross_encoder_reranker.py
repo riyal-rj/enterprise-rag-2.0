@@ -5,7 +5,7 @@ import math
 import pytest
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
+from app.rag_services.reranker.cross_encoder_reranker import LocalCrossEncoderReranker
 
 
 class _FakeModel:

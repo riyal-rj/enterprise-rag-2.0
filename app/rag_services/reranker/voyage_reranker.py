@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.reranker import ReRankedChunk, ReRankOutcome
+from app.rag_services.reranker.reranker import ReRankedChunk, ReRankOutcome
 
 
 class VoyageReranker:

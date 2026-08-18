@@ -133,7 +133,7 @@ class PlannedQueryTransformer(Protocol):
     and eval (always-on) HyDE paths implement, so ``RAGService.answer`` can
     call ``plan()``/``execute()`` uniformly regardless of which one it was
     given - see ``DynamicQueryTransformer`` (production, in
-    ``app.rag_services.dynamic_query_transformer``) and
+    ``app.rag_services.hyde.dynamic_query_transformer``) and
     ``StaticPlannedQueryTransformer`` (eval, below)."""
 
     def plan(self, query: str, config: RagRuntimeConfig, *, enabled: bool) -> HyDEPlan: ...

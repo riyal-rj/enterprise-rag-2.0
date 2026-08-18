@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.llm.chat_client import StructuredLLMResponse, TokenUsage
-from app.rag_services.hyde_query_transformer import HyDEDocuments, HydeQueryTransformer
+from app.rag_services.hyde.hyde_query_transformer import HyDEDocuments, HydeQueryTransformer
 
 
 class _FakeLLMClient:

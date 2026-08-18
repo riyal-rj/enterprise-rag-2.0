@@ -14,10 +14,15 @@ from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
-from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import NoOpReranker, ReRankedChunk, ReRankOutcome, RerankPlan
+from app.rag_services.reranker.dynamic_reranker import DynamicReranker
+from app.rag_services.reranker.reranker import (
+    NoOpReranker,
+    ReRankedChunk,
+    ReRankOutcome,
+    RerankPlan,
+)
 from app.rag_services.retrieval_strategy import (
     DenseRetrievalStrategy,
     HybridRetrievalStrategy,

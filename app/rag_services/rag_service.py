@@ -15,7 +15,7 @@ answer refinement loop, no prompt-injection defense yet.
 
 Reranking, HyDE, and CRAG are each driven by a ``PlannedReranker``/
 ``PlannedQueryTransformer``/``PlannedCorrectiveRetriever`` (see
-``app.rag_services.reranker`` / ``app.rag_services.query_transformer`` /
+``app.rag_services.reranker.reranker`` / ``app.rag_services.hyde.query_transformer`` /
 ``app.rag_services.crag``): ``answer()`` captures exactly one
 ``RagRuntimeConfig`` snapshot per request (see
 ``app.rag_services.rag_runtime_config``) and calls each collaborator's
@@ -60,15 +60,15 @@ from app.rag_services.crag import (
     PlannedNoOpCorrectiveRetriever,
     local_evidence,
 )
-from app.rag_services.embedding_fusion import mean_pool_and_normalize
-from app.rag_services.query_transformer import (
+from app.rag_services.fusion.embedding_fusion import mean_pool_and_normalize
+from app.rag_services.hyde.query_transformer import (
     NoOpQueryTransformer,
     PlannedNoOpQueryTransformer,
     PlannedQueryTransformer,
     QueryTransformOutcome,
 )
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
-from app.rag_services.reranker import PlannedNoOpReranker, PlannedReranker, ReRankedChunk
+from app.rag_services.reranker.reranker import PlannedNoOpReranker, PlannedReranker, ReRankedChunk
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import (
