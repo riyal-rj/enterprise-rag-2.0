@@ -85,6 +85,27 @@ class RAGFeatureSettings(EnvBaseSettings):
     crag_min_evidence_chunks: int = Field(default=1, ge=1, le=5)
     crag_policy_version: str = Field(default="crag-policy-v1", min_length=1)
 
-    reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
-    max_reflection_retries: int = Field(default=2, ge=0)
     self_reflective_enabled_by_default: bool = Field(default=False)
+    reflection_critic_model: str = Field(default="gpt-4o-mini", min_length=1)
+    reflection_reviser_model: str = Field(default="gpt-4o-mini", min_length=1)
+    reflection_prompt_version: str = Field(default="bank-policy-v1", min_length=1)
+    # Answer-relevance acceptance floor - historically named reflection_min_score;
+    # kept as-is rather than renamed, since RagOpsConfig/eval goldens don't
+    # reference it directly and a rename buys nothing here.
+    reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
+    reflection_min_evidence_relevance: float = Field(default=0.70, ge=0.0, le=1.0)
+    reflection_min_citation_completeness: float = Field(default=0.90, ge=0.0, le=1.0)
+    reflection_min_utility: int = Field(default=4, ge=1, le=5)
+    # Iteration budget - each iteration is one critique + (revise or
+    # retrieve_more) round; the initial answer's first critique doesn't
+    # count against this.
+    max_reflection_retries: int = Field(default=2, ge=0, le=3)
+    reflection_max_additional_retrievals: int = Field(default=1, ge=0, le=1)
+    reflection_retrieval_top_k: int = Field(default=5, ge=1, le=10)
+    reflection_max_evidence_chunks: int = Field(default=10, ge=1, le=20)
+    reflection_max_evidence_chars: int = Field(default=30_000, ge=1_000, le=80_000)
+    reflection_max_total_tokens: int = Field(default=6_000, ge=500, le=20_000)
+    reflection_max_completion_tokens: int = Field(default=1_500, ge=128, le=4_000)
+    reflection_stage_timeout_seconds: float = Field(default=12.0, gt=0.0, le=60.0)
+    reflection_total_timeout_seconds: float = Field(default=25.0, gt=0.0, le=90.0)
+    reflection_max_attempts: int = Field(default=2, ge=1, le=2)

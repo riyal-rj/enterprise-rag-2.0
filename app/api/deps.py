@@ -57,6 +57,19 @@ from app.rag_services.hyde.hyde_query_transformer import HydeQueryTransformer
 from app.rag_services.hyde.query_transformer import FailOpenQueryTransformer, QueryTransformer
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
+from app.rag_services.reflection import (
+    DynamicSelfReflectionEngine,
+    GroundedAnswerReviser,
+    PlannedSelfReflectionEngine,
+    ReflectionCritic,
+    ReflectionDecisionPolicy,
+    SelfReflectionEngine,
+    StaticPlannedSelfReflectionEngine,
+    StructuredGroundedAnswerReviser,
+    StructuredReflectionCritic,
+    StructuredSelfReflectionEngine,
+    ThresholdReflectionDecisionPolicy,
+)
 from app.rag_services.reranker.cross_encoder_reranker import LocalCrossEncoderReranker
 from app.rag_services.reranker.dynamic_reranker import DynamicReranker
 from app.rag_services.reranker.reranker import FailOpenReranker, NoOpReranker, ReRanker
@@ -301,6 +314,88 @@ def get_dynamic_crag() -> PlannedCorrectiveRetriever:
 
 
 @lru_cache(maxsize=1)
+def get_reflection_critic() -> ReflectionCritic:
+    """Structured Self-RAG-inspired critic shared by production and eval
+    reflection wiring - see ``app.rag_services.reflection.reflection_critic``."""
+    settings = get_settings().rag
+    return StructuredReflectionCritic(
+        llm_client=get_llm_client(),
+        model=settings.reflection_critic_model,
+        prompt_version=settings.reflection_prompt_version,
+        timeout_seconds=settings.reflection_stage_timeout_seconds,
+        max_completion_tokens=settings.reflection_max_completion_tokens,
+        max_attempts=settings.reflection_max_attempts,
+        max_evidence_chars=settings.reflection_max_evidence_chars,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_reflection_decision_policy() -> ReflectionDecisionPolicy:
+    """Deterministic accept/revise/retrieve-more/abstain policy - never an
+    LLM call, see ``ThresholdReflectionDecisionPolicy``."""
+    settings = get_settings().rag
+    return ThresholdReflectionDecisionPolicy(
+        min_evidence_relevance=settings.reflection_min_evidence_relevance,
+        min_answer_relevance=settings.reflection_min_score,
+        min_citation_completeness=settings.reflection_min_citation_completeness,
+        min_utility=settings.reflection_min_utility,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_answer_reviser() -> GroundedAnswerReviser:
+    """Grounded structured revision adapter - see
+    ``app.rag_services.reflection.answer_reviser``."""
+    settings = get_settings().rag
+    return StructuredGroundedAnswerReviser(
+        llm_client=get_llm_client(),
+        model=settings.reflection_reviser_model,
+        prompt_version=settings.reflection_prompt_version,
+        timeout_seconds=settings.reflection_stage_timeout_seconds,
+        max_completion_tokens=settings.reflection_max_completion_tokens,
+        max_attempts=settings.reflection_max_attempts,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_self_reflection_delegate() -> SelfReflectionEngine:
+    """Raw bounded reflection state machine, no rollout/emergency state -
+    see ``get_dynamic_self_reflection`` (production) and
+    ``get_eval_self_reflection`` (offline eval) below, which each wrap this
+    for the availability/isolation guarantees their callers need, matching
+    ``get_crag_delegate``'s shape."""
+    settings = get_settings().rag
+    return StructuredSelfReflectionEngine(
+        critic=get_reflection_critic(),
+        policy=get_reflection_decision_policy(),
+        reviser=get_answer_reviser(),
+        max_iterations=settings.max_reflection_retries,
+        max_additional_retrievals=settings.reflection_max_additional_retrievals,
+        max_total_tokens=settings.reflection_max_total_tokens,
+        total_timeout_seconds=settings.reflection_total_timeout_seconds,
+        max_evidence_chunks=settings.reflection_max_evidence_chunks,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_eval_self_reflection() -> PlannedSelfReflectionEngine:
+    """Self-reflection for the offline eval harness only - always attempts
+    reflection for real when a case's ``PipelineProfile.enable_self_reflective``
+    is on, ignoring admin rollout%/emergency state entirely, matching
+    ``get_eval_crag``'s guarantee."""
+    return StaticPlannedSelfReflectionEngine(delegate=get_self_reflection_delegate())
+
+
+@lru_cache(maxsize=1)
+def get_dynamic_self_reflection() -> PlannedSelfReflectionEngine:
+    """The self-reflection stage that actually serves real ``/chat``
+    traffic - admin-mutable (rollout%/emergency-disable) via the RAG
+    Operations panel. Holds no config state of its own - ``RAGService.answer``
+    passes in the one ``RagRuntimeConfig`` snapshot it captures per request."""
+    return DynamicSelfReflectionEngine(delegate=get_self_reflection_delegate())
+
+
+@lru_cache(maxsize=1)
 def get_embedding_client() -> EmbeddingClient:
     return OpenAIEmbeddingClient(
         client=get_openai_client(),
@@ -417,6 +512,8 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
             crag_shadow_enabled=config.crag_shadow_enabled,
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
         )
     )
 
@@ -504,6 +601,8 @@ def get_rag_service() -> RAGService:
         query_transformer=get_dynamic_hyde_transformer(),
         corrective_retriever=get_dynamic_crag(),
         config_store=get_rag_runtime_config_store(),
+        self_reflection_engine=get_dynamic_self_reflection(),
+        reflection_retrieval_top_k=settings.reflection_retrieval_top_k,
     )
 
 

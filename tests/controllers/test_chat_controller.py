@@ -19,6 +19,7 @@ from app.schemas.chat import (
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
+    SelfReflectionMetadata,
 )
 
 
@@ -132,6 +133,7 @@ def _response(answer: str = "hello") -> ChatResponse:
             hyde=HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             crag=CRAGMetadata(enabled=False),
+            self_reflection=SelfReflectionMetadata(enabled=False),
             retrieved_chunks=[],
         ),
     )

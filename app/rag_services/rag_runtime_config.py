@@ -60,6 +60,14 @@ class RagRuntimeConfig:
     # "shadow" cohort handling. Defaulted so every pre-existing construction
     # site (deps.py, RagOpsController, tests) keeps working unchanged.
     crag_shadow_enabled: bool = False
+    # Self-reflective answer critique/revision stage - see
+    # app.rag_services.reflection.dynamic_self_reflection and
+    # RAGService.answer's post-answer reflection block. Two-field shape
+    # (enabled/rollout%), same as HyDE - no web/shadow-style dependent
+    # sub-flag exists for this stage. Defaulted so every pre-existing
+    # construction site keeps working unchanged.
+    self_reflective_enabled: bool = False
+    self_reflective_rollout_percentage: int = 0
 
     def __post_init__(self) -> None:
         if not 0 <= self.reranker_rollout_percentage <= 100:
@@ -76,6 +84,8 @@ class RagRuntimeConfig:
             raise ValueError("crag_web_enabled requires crag_enabled")
         if self.crag_shadow_enabled and not self.crag_enabled:
             raise ValueError("crag_shadow_enabled requires crag_enabled")
+        if not 0 <= self.self_reflective_rollout_percentage <= 100:
+            raise ValueError("self_reflective_rollout_percentage must be between 0 and 100")
 
 
 _DEFAULT_CONFIG = RagRuntimeConfig(

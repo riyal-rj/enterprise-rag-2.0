@@ -1155,18 +1155,19 @@ def test_per_call_reranking_override_disables_reranking_for_a_single_request() -
     assert response.metadata.reranking.enabled is False
 
 
-def test_cache_key_uses_the_v6_prefix() -> None:
+def test_cache_key_uses_the_v7_prefix() -> None:
     """Regression: the merged cache-key format combines candidate-pool-size
     versioning (v3), HyDE identity (v4), cohort-isolation for reranking and
-    HyDE (v5), and now cohort-isolation for CRAG too - it must not collide
-    with any predecessor format for the same question/namespace."""
+    HyDE (v5), cohort-isolation for CRAG (v6), and now cohort-isolation for
+    self-reflection too - it must not collide with any predecessor format
+    for the same question/namespace."""
     import hashlib
 
     service, *_ = _service()
 
     key = service._cache_key("q", 5, "dense:v1:corpus=1")
 
-    expected = hashlib.sha256(b"rag:v6:dense:v1:corpus=1:5:q").hexdigest()
+    expected = hashlib.sha256(b"rag:v7:dense:v1:corpus=1:5:q").hexdigest()
     assert key == expected
 
 

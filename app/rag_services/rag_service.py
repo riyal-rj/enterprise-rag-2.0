@@ -40,7 +40,7 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Protocol
 
@@ -68,6 +68,13 @@ from app.rag_services.hyde.query_transformer import (
     QueryTransformOutcome,
 )
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
+from app.rag_services.reflection.reflection import (
+    EvidenceAugmenter,
+    PlannedNoOpSelfReflectionEngine,
+    PlannedSelfReflectionEngine,
+    ReflectionAction,
+    SelfReflectionOutcome,
+)
 from app.rag_services.reranker.reranker import PlannedNoOpReranker, PlannedReranker, ReRankedChunk
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
@@ -79,6 +86,7 @@ from app.schemas.chat import (
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
+    SelfReflectionMetadata,
 )
 from app.services.query_cache_service import CacheTier, QueryCacheService
 
@@ -124,6 +132,17 @@ class _RagServiceMetricsRecorder(Protocol):
         duration_ms: float,
         usage_tokens: int,
     ) -> None: ...
+    def record_self_reflection_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None: ...
+    def record_self_reflection_bypass(self, *, reason: str) -> None: ...
 
 
 class _NoOpRagServiceMetrics:
@@ -166,6 +185,21 @@ class _NoOpRagServiceMetrics:
         duration_ms: float,
         usage_tokens: int,
     ) -> None:
+        pass
+
+    def record_self_reflection_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None:
+        pass
+
+    def record_self_reflection_bypass(self, *, reason: str) -> None:
         pass
 
 
@@ -246,6 +280,21 @@ Do not generate an arbitrary numeric confidence score. Confidence should be calc
 """
 
 
+class _CallableEvidenceAugmenter:
+    """Adapts a bound closure to the ``EvidenceAugmenter`` protocol -
+    ``RAGService.answer`` builds one per request from a closure over that
+    request's already-captured ``strategy``/``config`` (see
+    ``RAGService._retrieve_reflection_evidence``), so the reflection engine
+    never needs a reference to ``RAGService`` itself and can't recursively
+    call back into ``answer()``."""
+
+    def __init__(self, callback: Callable[[str], tuple[EvidenceChunk, ...]]) -> None:
+        self._callback = callback
+
+    def retrieve(self, query: str) -> tuple[EvidenceChunk, ...]:
+        return self._callback(query)
+
+
 class RAGService:
     """Retrieve-then-generate RAG answering, with response caching."""
 
@@ -269,6 +318,9 @@ class RAGService:
         crag_enabled: bool = False,
         config_store: RagRuntimeConfigStore | None = None,
         crag_telemetry: CRAGTelemetry | None = None,
+        self_reflection_engine: PlannedSelfReflectionEngine | None = None,
+        self_reflective_enabled: bool = False,
+        reflection_retrieval_top_k: int = 5,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -298,6 +350,8 @@ class RAGService:
         self._metrics = metrics or _NoOpRagServiceMetrics()
         self._query_transformer = query_transformer or PlannedNoOpQueryTransformer()
         self._corrective_retriever = corrective_retriever or PlannedNoOpCorrectiveRetriever()
+        self._self_reflection = self_reflection_engine or PlannedNoOpSelfReflectionEngine()
+        self._reflection_retrieval_top_k = reflection_retrieval_top_k
         # Fleet-wide (cross-worker/cross-process) exporter - see
         # app.rag_services.crag.telemetry. Distinct from `metrics` above
         # (process-local, powers the admin panel): this is the seam for a
@@ -328,6 +382,8 @@ class RAGService:
                 crag_rollout_percentage=100,
                 crag_web_enabled=False,
                 crag_shadow_enabled=False,
+                self_reflective_enabled=self_reflective_enabled,
+                self_reflective_rollout_percentage=100,
             )
         )
 
@@ -340,10 +396,12 @@ class RAGService:
         reranking_enabled: bool | None = None,
         hyde_enabled: bool | None = None,
         crag_enabled: bool | None = None,
+        self_reflective_enabled: bool | None = None,
     ) -> ChatResponse:
         """Answer ``question``.
 
-        ``reranking_enabled``/``hyde_enabled``/``crag_enabled`` override the
+        ``reranking_enabled``/``hyde_enabled``/``crag_enabled``/
+        ``self_reflective_enabled`` override the
         instance-level defaults (from the config snapshot captured below,
         seeded from the centralized RAG ops config in production) for this
         call only - ``None`` (the default) defers to the instance. This is
@@ -364,6 +422,11 @@ class RAGService:
         )
         effective_hyde_enabled = config.hyde_enabled if hyde_enabled is None else hyde_enabled
         effective_crag_enabled = config.crag_enabled if crag_enabled is None else crag_enabled
+        effective_self_reflective_enabled = (
+            config.self_reflective_enabled
+            if self_reflective_enabled is None
+            else self_reflective_enabled
+        )
 
         mode = retrieval_mode or self._default_retrieval_mode
         if mode in self._retrieval_strategies:
@@ -429,6 +492,18 @@ class RAGService:
         )
         if effective_crag_enabled:
             cache_namespace = f"{cache_namespace}:{crag_plan.cache_namespace}"
+
+        # Self-reflection cohort is decided here too, from the same single
+        # `config` snapshot, before any cache lookup - same reasoning as
+        # rerank_plan/hyde_plan/crag_plan above: a control-cohort query and a
+        # treatment-cohort query under the same rollout percentage must not
+        # share a cache namespace, since treatment can revise the answer (and
+        # even widen the evidence) that's ultimately served.
+        self_reflection_plan = self._self_reflection.plan(
+            question, config, enabled=effective_self_reflective_enabled
+        )
+        if effective_self_reflective_enabled:
+            cache_namespace = f"{cache_namespace}:{self_reflection_plan.cache_namespace}"
 
         cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
@@ -679,11 +754,92 @@ class RAGService:
             )
             answer_text = self._llm_client.generate(_SYSTEM_PROMPT, user_message).text
 
-        # Confidence and claim-checking must see exactly what the answer LLM
-        # saw - CRAG's final evidence, not the pre-CRAG retrieved/reranked
-        # `chunks` - or a corrected/web-augmented answer would be scored
-        # against evidence it was never actually generated from.
-        final_evidence_chunks = self._evidence_as_retrieved_chunks(crag_outcome.evidence)
+        # Self-reflection critiques/revises the initial answer against
+        # CRAG-approved evidence, and may perform one bounded additional
+        # retrieval (never a web search, never a re-entrant call into this
+        # method) - see app.rag_services.reflection. It never sees a HyDE
+        # hypothesis, and never runs when CRAG already abstained - there is
+        # no generated answer to critique, and the abstention string is
+        # already the safe terminal response.
+        reflection_started = time.perf_counter()
+        if (
+            effective_self_reflective_enabled
+            and self_reflection_plan.cohort == "treatment"
+            and not crag_outcome.abstain
+        ):
+            augmenter: EvidenceAugmenter = _CallableEvidenceAugmenter(
+                lambda query: self._retrieve_reflection_evidence(
+                    query, strategy=strategy, top_k=self._reflection_retrieval_top_k
+                )
+            )
+            self_reflection_outcome = self._self_reflection.execute(
+                question, crag_outcome.evidence, answer_text, augmenter, self_reflection_plan
+            )
+            self_reflection_outcome = replace(
+                self_reflection_outcome,
+                duration_ms=(time.perf_counter() - reflection_started) * 1000,
+            )
+            self._metrics.record_self_reflection_outcome(
+                duration_ms=self_reflection_outcome.duration_ms,
+                final_action=self_reflection_outcome.final_action.value,
+                fallback=self_reflection_outcome.fallback,
+                iterations=self_reflection_outcome.iterations,
+                additional_retrievals=self_reflection_outcome.additional_retrievals,
+                usage_tokens=self_reflection_outcome.usage_tokens,
+            )
+            log_fields = {
+                "final_action": self_reflection_outcome.final_action.value,
+                "accepted": self_reflection_outcome.accepted,
+                "fallback": self_reflection_outcome.fallback,
+                "abstain": self_reflection_outcome.abstain,
+                "iterations": self_reflection_outcome.iterations,
+                "additional_retrievals": self_reflection_outcome.additional_retrievals,
+                "duration_ms": round(self_reflection_outcome.duration_ms, 2),
+            }
+            if self_reflection_outcome.fallback:
+                logger.warning("rag.self_reflection_fallback_applied", extra=log_fields)
+            else:
+                logger.debug("rag.self_reflection_applied", extra=log_fields)
+        else:
+            bypass_reason = self_reflection_plan.bypass_reason
+            if crag_outcome.abstain and effective_self_reflective_enabled:
+                bypass_reason = "crag_abstained"
+            self_reflection_outcome = SelfReflectionOutcome(
+                answer=answer_text,
+                evidence=crag_outcome.evidence,
+                applied=False,
+                accepted=True,
+                final_action=ReflectionAction.ACCEPT,
+                iterations=0,
+                additional_retrievals=0,
+                bypass_reason=bypass_reason,
+            )
+            if effective_self_reflective_enabled and self_reflection_plan.bypass_reason in (
+                "rollout",
+                "emergency_disabled",
+            ):
+                # "disabled" (feature toggle fully off) isn't a canary bucket
+                # worth counting - only rollout-control and emergency
+                # bypasses are, matching HyDE/CRAG's identical distinction.
+                self._metrics.record_self_reflection_bypass(
+                    reason=self_reflection_plan.bypass_reason
+                )
+
+        # Everything downstream (confidence, claim-checking, sources,
+        # final-evidence preview) must see exactly what was actually
+        # returned - the post-reflection answer/evidence when reflection ran
+        # and accepted/revised, or the pre-reflection CRAG answer/evidence
+        # otherwise. Never the pre-reflection answer paired with
+        # post-reflection evidence (or vice versa).
+        answer_text = self_reflection_outcome.answer
+        final_evidence = self_reflection_outcome.evidence
+
+        # Confidence and claim-checking must see exactly what was returned -
+        # CRAG's (and, if it ran, self-reflection's) final evidence, not the
+        # pre-CRAG retrieved/reranked `chunks` - or a corrected/revised
+        # answer would be scored against evidence it was never actually
+        # generated from.
+        final_evidence_chunks = self._evidence_as_retrieved_chunks(final_evidence)
 
         confidence = compute_confidence_breakdown(
             final_evidence_chunks,
@@ -720,9 +876,7 @@ class RAGService:
 
         response = ChatResponse(
             answer=answer_text,
-            sources=sorted(
-                {self._public_source_identifier(item) for item in crag_outcome.evidence}
-            ),
+            sources=sorted({self._public_source_identifier(item) for item in final_evidence}),
             confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
@@ -759,8 +913,29 @@ class RAGService:
                     duration_ms=round(crag_outcome.duration_ms, 2),
                     bypass_reason=crag_outcome.bypass_reason,
                 ),
+                self_reflection=SelfReflectionMetadata(
+                    enabled=effective_self_reflective_enabled,
+                    applied=self_reflection_outcome.applied,
+                    accepted=self_reflection_outcome.accepted,
+                    final_action=self_reflection_outcome.final_action.value,
+                    iterations=self_reflection_outcome.iterations,
+                    additional_retrievals=self_reflection_outcome.additional_retrievals,
+                    fallback=self_reflection_outcome.fallback,
+                    abstain=self_reflection_outcome.abstain,
+                    support_level=(
+                        self_reflection_outcome.support_level.value
+                        if self_reflection_outcome.support_level
+                        else None
+                    ),
+                    answer_relevance=self_reflection_outcome.answer_relevance,
+                    citation_completeness=self_reflection_outcome.citation_completeness,
+                    utility=self_reflection_outcome.utility,
+                    usage_tokens=self_reflection_outcome.usage_tokens,
+                    duration_ms=round(self_reflection_outcome.duration_ms, 2),
+                    bypass_reason=self_reflection_outcome.bypass_reason,
+                ),
                 retrieved_chunks=self._build_chunk_previews(chunks, rerank_items),
-                final_evidence=self._build_evidence_previews(crag_outcome.evidence),
+                final_evidence=self._build_evidence_previews(final_evidence),
                 flagged_claims=flagged_claims,
             ),
         )
@@ -781,6 +956,8 @@ class RAGService:
             or crag_outcome.fallback
             or crag_outcome.web_used
             or crag_outcome.abstain
+            or self_reflection_outcome.fallback
+            or self_reflection_outcome.abstain
         )
         if not pipeline_fallback:
             cache_written = self._set_cached(cache_key, response)
@@ -794,6 +971,31 @@ class RAGService:
                     original_query_embedding, cache_namespace, top_k, cache_key
                 )
         return response
+
+    def _retrieve_reflection_evidence(
+        self,
+        query: str,
+        *,
+        strategy: RetrievalStrategy,
+        top_k: int,
+    ) -> tuple[EvidenceChunk, ...]:
+        """The one bounded additional retrieval self-reflection is allowed to
+        perform (see ``app.rag_services.reflection``'s module docstring).
+        Plain dense/sparse/hybrid retrieval via the same strategy already
+        resolved for this request - no reranking, no web, no CRAG re-grade,
+        and critically no call back into ``answer()`` - so this can't
+        recurse and can't widen scope beyond the corpus this request was
+        already allowed to search. ``query`` is expected to already have
+        passed ``validate_reflection_query`` (the reflection engine does
+        this before calling ``EvidenceAugmenter.retrieve``); any failure
+        here (embedding/retrieval error) propagates to the engine's caller,
+        where ``FailSafeSelfReflectionEngine`` treats it like any other
+        reflection-stage failure."""
+        query_embedding: list[float] | None = None
+        if strategy.requires_dense_embedding:
+            query_embedding = self._embedding_client.embed_texts([query])[0]
+        chunks = strategy.retrieve(query_text=query, query_embedding=query_embedding, top_k=top_k)
+        return local_evidence(chunks)
 
     def _build_chunk_previews(
         self,
@@ -894,14 +1096,14 @@ class RAGService:
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
         normalized_question = " ".join(question.split())
 
-        # v6: cache_namespace now folds in per-query CRAG cohort isolation
-        # too (control vs. treatment, decided from
-        # PlannedCorrectiveRetriever.plan - not just the configured rollout
-        # percentage), on top of v5's reranking/HyDE cohort isolation -
-        # bumped so a v5-or-earlier key can't collide with or mask a v6 key
-        # for the same question/config now that CRAG can rewrite (or
-        # web-augment) the evidence that reaches the answer LLM.
-        raw_key = f"rag:v6:{cache_namespace}:{top_k}:{normalized_question}"
+        # v7: cache_namespace now folds in per-query self-reflection cohort
+        # isolation too (control vs. treatment, decided from
+        # PlannedSelfReflectionEngine.plan), on top of v6's CRAG cohort
+        # isolation and v5's reranking/HyDE cohort isolation - bumped so a
+        # v6-or-earlier key can't collide with or mask a v7 key for the same
+        # question/config now that self-reflection can revise the answer (or
+        # widen the evidence) that's ultimately served.
+        raw_key = f"rag:v7:{cache_namespace}:{top_k}:{normalized_question}"
 
         return hashlib.sha256(raw_key.encode()).hexdigest()
 

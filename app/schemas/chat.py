@@ -141,6 +141,40 @@ class CRAGMetadata(BaseModel):
     bypass_reason: str | None = None
 
 
+class SelfReflectionMetadata(BaseModel):
+    """Diagnostic detail about the self-reflective answer critique/revision
+    stage.
+
+    ``enabled=True`` only means the feature toggle was on for this request -
+    it does **not** imply the query was sampled into the rollout treatment
+    cohort. A query can have ``enabled=True`` and still show
+    ``applied=False, bypass_reason="rollout"`` (control cohort) or
+    ``bypass_reason="emergency_disabled"`` - same enabled/bypass/applied/
+    fallback distinction ``CRAGMetadata``/``HyDEMetadata`` carry.
+    ``final_action`` is ``None`` unless reflection actually ran for this
+    request. Raw critic reasoning, missing-aspect/unsupported-claim text,
+    and revision history are deliberately never included here - only
+    counts, scores, and identifiers (see
+    ``app.rag_services.reflection.reflection.SelfReflectionOutcome``).
+    """
+
+    enabled: bool
+    applied: bool = False
+    accepted: bool = False
+    final_action: Literal["accept", "revise", "retrieve_more", "abstain"] | None = None
+    iterations: int = 0
+    additional_retrievals: int = 0
+    fallback: bool = False
+    abstain: bool = False
+    support_level: Literal["full", "partial", "none"] | None = None
+    answer_relevance: float | None = None
+    citation_completeness: float | None = None
+    utility: int | None = None
+    usage_tokens: int = 0
+    duration_ms: float = 0.0
+    bypass_reason: str | None = None
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
@@ -154,6 +188,7 @@ class ResponseMetadata(BaseModel):
     hyde: HyDEMetadata
     reranking: RerankingMetadata
     crag: CRAGMetadata
+    self_reflection: SelfReflectionMetadata
     # Raw retrieval/reranking output.
     retrieved_chunks: list[RetrievedChunkPreview]
     # Final post-CRAG evidence sent to the answer LLM.

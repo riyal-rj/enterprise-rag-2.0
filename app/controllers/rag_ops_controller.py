@@ -42,6 +42,7 @@ from app.schemas.rag_ops import (
     RagOpsConfigUpdateRequest,
     RagOpsStatusResponse,
     RerankMetrics,
+    SelfReflectionMetrics,
     SemanticCacheMetrics,
 )
 from app.services.rag_metrics_service import RagMetricsService
@@ -78,6 +79,8 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
             crag_shadow_enabled=config.crag_shadow_enabled,
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
         )
     )
 
@@ -169,6 +172,8 @@ class RagOpsController:
             crag_rollout_percentage=payload.crag_rollout_percentage,
             crag_web_enabled=payload.crag_web_enabled,
             crag_shadow_enabled=payload.crag_shadow_enabled,
+            self_reflective_enabled=payload.self_reflective_enabled,
+            self_reflective_rollout_percentage=payload.self_reflective_rollout_percentage,
         )
         self._apply(config)
         return self._to_status(config)
@@ -217,6 +222,7 @@ class RagOpsController:
         hyde_snapshot = self._metrics.hyde_stats()
         crag_snapshot = self._metrics.crag_stats()
         crag_shadow_snapshot = self._metrics.crag_shadow_stats()
+        reflection_snapshot = self._metrics.self_reflection_stats()
         return RagOpsStatusResponse(
             reranking_enabled=config.reranking_enabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
@@ -276,6 +282,22 @@ class RagOpsController:
                 abstention_rate=crag_shadow_snapshot.abstention_rate,
                 web_use_rate=crag_shadow_snapshot.web_use_rate,
                 usage_tokens_total=crag_shadow_snapshot.usage_tokens_total,
+            ),
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            self_reflection_metrics=SelfReflectionMetrics(
+                sample_count=reflection_snapshot.sample_count,
+                p50_latency_ms=reflection_snapshot.p50_latency_ms,
+                p95_latency_ms=reflection_snapshot.p95_latency_ms,
+                first_pass_acceptance_rate=reflection_snapshot.first_pass_acceptance_rate,
+                revision_rate=reflection_snapshot.revision_rate,
+                additional_retrieval_rate=reflection_snapshot.additional_retrieval_rate,
+                abstention_rate=reflection_snapshot.abstention_rate,
+                fallback_rate=reflection_snapshot.fallback_rate,
+                average_iterations=reflection_snapshot.average_iterations,
+                usage_tokens_total=reflection_snapshot.usage_tokens_total,
+                rollout_bypasses=reflection_snapshot.rollout_bypasses,
+                emergency_bypasses=reflection_snapshot.emergency_bypasses,
             ),
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,

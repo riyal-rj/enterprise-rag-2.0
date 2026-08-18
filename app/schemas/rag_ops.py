@@ -85,6 +85,29 @@ class CRAGShadowMetrics(BaseModel):
     usage_tokens_total: int
 
 
+class SelfReflectionMetrics(BaseModel):
+    """Self-reflection performance over the last N *attempted* reflections (a
+    rolling in-memory window - see ``app.services.rag_metrics_service``).
+    ``None`` latencies mean no reflection attempt has happened yet since the
+    process started. ``rollout_bypasses``/``emergency_bypasses`` count
+    requests that never reached the engine at all (sampled out /
+    emergency-disabled), same distinction as ``HyDEMetrics``/``CRAGMetrics``.
+    """
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
 class RagOpsStatusResponse(BaseModel):
     """Everything the RAG Operations panel displays: live config, rolled-up
     metrics, and emergency-disable state."""
@@ -109,6 +132,10 @@ class RagOpsStatusResponse(BaseModel):
     crag_shadow_enabled: bool
     crag_metrics: CRAGMetrics
     crag_shadow_metrics: CRAGShadowMetrics
+
+    self_reflective_enabled: bool
+    self_reflective_rollout_percentage: int
+    self_reflection_metrics: SelfReflectionMetrics
 
     emergency_disabled: bool
     emergency_disabled_reason: str | None
@@ -137,6 +164,8 @@ class RagOpsConfigUpdateRequest(BaseModel):
     crag_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     crag_web_enabled: bool | None = None
     crag_shadow_enabled: bool | None = None
+    self_reflective_enabled: bool | None = None
+    self_reflective_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     reason: str | None = Field(default=None, max_length=500)
 
 

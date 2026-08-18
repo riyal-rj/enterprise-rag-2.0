@@ -80,6 +80,27 @@ class CRAGShadowMetricsSnapshot:
 
 
 @dataclass(frozen=True)
+class SelfReflectionMetricsSnapshot:
+    """Self-reflection performance over the last ``window_size`` *attempted*
+    reflections (the engine was actually invoked - rollout-bypassed and
+    emergency-disabled requests don't count as attempts, same distinction as
+    :class:`HyDEMetricsSnapshot`/:class:`CRAGMetricsSnapshot`)."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
+@dataclass(frozen=True)
 class HyDEMetricsSnapshot:
     """HyDE performance over the last ``window_size`` *attempted* transforms
     (the delegate was actually invoked - rollout-bypassed and
@@ -130,6 +151,19 @@ class RagMetricsService:
             maxlen=window_size
         )
         self._crag_shadow_usage_tokens_total = 0
+        # (duration_ms, final_action, fallback, iterations,
+        # additional_retrievals) - kept together for the same reason as
+        # _crag_samples above: every derived rate must describe the exact
+        # same window. final_action is "accept" or "abstain" - "revise"/
+        # "retrieve_more" never appear here (those are internal loop states,
+        # not a returned outcome's terminal action), kept as str rather than
+        # importing the reflection package's enum to avoid this module
+        # depending on app.rag_services.reflection.
+        self._reflection_samples: deque[tuple[float, str, bool, int, int]] = deque(
+            maxlen=window_size
+        )
+        self._reflection_usage_tokens_total = 0
+        self._reflection_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
 
     def record_rerank(
         self, *, duration_ms: float, fallback: bool, usage_tokens: int | None
@@ -277,6 +311,63 @@ class RagMetricsService:
             abstention_rate=(abstain_count / attempts) if attempts else 0.0,
             web_use_rate=(web_used_count / attempts) if attempts else 0.0,
             usage_tokens_total=tokens,
+        )
+
+    def record_self_reflection_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None:
+        with self._lock:
+            self._reflection_samples.append(
+                (duration_ms, final_action, fallback, iterations, additional_retrievals)
+            )
+            self._reflection_usage_tokens_total += max(usage_tokens, 0)
+
+    def record_self_reflection_bypass(self, *, reason: str) -> None:
+        with self._lock:
+            self._reflection_bypass_counts[reason] = (
+                self._reflection_bypass_counts.get(reason, 0) + 1
+            )
+
+    def self_reflection_stats(self) -> SelfReflectionMetricsSnapshot:
+        with self._lock:
+            samples = list(self._reflection_samples)
+            tokens = self._reflection_usage_tokens_total
+            bypasses = dict(self._reflection_bypass_counts)
+
+        durations = sorted(duration for duration, *_rest in samples)
+        attempts = len(samples)
+        first_pass_accept_count = sum(
+            1
+            for _d, action, _f, iterations, _r in samples
+            if action == "accept" and iterations <= 1
+        )
+        revised_count = sum(1 for _d, _a, _f, iterations, _r in samples if iterations > 1)
+        additional_retrieval_count = sum(
+            1 for _d, _a, _f, _i, retrievals in samples if retrievals > 0
+        )
+        abstain_count = sum(1 for _d, action, _f, _i, _r in samples if action == "abstain")
+        fallback_count = sum(1 for _d, _a, fallback, _i, _r in samples if fallback)
+        total_iterations = sum(iterations for _d, _a, _f, iterations, _r in samples)
+        return SelfReflectionMetricsSnapshot(
+            sample_count=attempts,
+            p50_latency_ms=_percentile(durations, 0.50),
+            p95_latency_ms=_percentile(durations, 0.95),
+            first_pass_acceptance_rate=(first_pass_accept_count / attempts) if attempts else 0.0,
+            revision_rate=(revised_count / attempts) if attempts else 0.0,
+            additional_retrieval_rate=(additional_retrieval_count / attempts) if attempts else 0.0,
+            abstention_rate=(abstain_count / attempts) if attempts else 0.0,
+            fallback_rate=(fallback_count / attempts) if attempts else 0.0,
+            average_iterations=(total_iterations / attempts) if attempts else 0.0,
+            usage_tokens_total=tokens,
+            rollout_bypasses=bypasses.get("rollout", 0),
+            emergency_bypasses=bypasses.get("emergency_disabled", 0),
         )
 
 

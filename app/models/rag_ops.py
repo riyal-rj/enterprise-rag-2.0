@@ -42,6 +42,11 @@ class RagOpsConfig:
     # pre-existing construction site (tests, PostgresRagOpsRepository rows
     # from before this column existed) keeps working unchanged.
     crag_shadow_enabled: bool = False
+    # Self-reflective answer critique/revision stage - see
+    # app.rag_services.reflection.dynamic_self_reflection. Defaulted for the
+    # same reason as crag_shadow_enabled above.
+    self_reflective_enabled: bool = False
+    self_reflective_rollout_percentage: int = 0
 
 
 def validate_crag_state(
