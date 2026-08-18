@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 from app.models.retrieved_chunk import RetrievedChunk
@@ -10,10 +11,55 @@ from app.rag_services.crag.crag import (
     CRAGOutcome,
     EvidenceChunk,
     KnowledgeRefiner,
+    RetrievalGrade,
     RetrievalGrader,
     SourceScopePolicy,
     WebRetriever,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _log_chunk_grading(chunks: list[RetrievedChunk], grade: RetrievalGrade) -> None:
+    """Per-chunk grading trail: initial retrieval score, source/page, the
+    grader's relevance/support/reason-code decision for every graded chunk,
+    and whether it cleared the bar `refine_local` extracts evidence from
+    (``supports_question and relevance >= min_relevance`` - the exact
+    predicate `refine_local` applies, duplicated here only for visibility,
+    never as a second source of truth). Deliberately omits chunk text and
+    the question - source/page/scores/reason codes are enough to diagnose a
+    bad grade without logging retrieval content (matching the CRAGMetadata
+    API contract's same restriction, see ``app.schemas.chat``)."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    graded_by_index = {item.index: item for item in grade.chunks}
+    rows = [
+        {
+            "index": index,
+            "source": chunk.source,
+            "page_number": chunk.page_number,
+            "retrieval_score": round(chunk.score, 4),
+            "graded": index in graded_by_index,
+            "grader_relevance": (
+                graded_by_index[index].relevance if index in graded_by_index else None
+            ),
+            "supports_question": (
+                graded_by_index[index].supports_question if index in graded_by_index else None
+            ),
+            "reason_code": (
+                graded_by_index[index].reason_code if index in graded_by_index else None
+            ),
+        }
+        for index, chunk in enumerate(chunks)
+    ]
+    logger.debug(
+        "rag.crag_chunk_grading",
+        extra={
+            "coverage": grade.coverage,
+            "overall_decision": grade.decision.value,
+            "chunks": rows,
+        },
+    )
 
 
 def _evidence_as_retrieved(evidence: tuple[EvidenceChunk, ...]) -> list[RetrievedChunk]:
@@ -66,8 +112,31 @@ class ProductionCorrectiveRetriever:
         grade = self._grader.grade(question, chunks)
         local, refinement_tokens = self._refiner.refine_local(question, chunks, grade)
         tokens = grade.usage_tokens + refinement_tokens
+        _log_chunk_grading(chunks, grade)
 
-        if grade.decision is CRAGDecision.CORRECT and len(local) >= self._min_evidence:
+        # Gate on extracted evidence, not on the overall coverage-based
+        # decision. `grade.decision` answers "does the retrieved set fully
+        # cover every material part of the question" (CORRECT requires
+        # coverage >= correct_threshold) - a multi-part question answered by
+        # one genuinely relevant, on-point document (e.g. "does overdue
+        # re-KYC freeze every transaction" answered by the re-KYC policy's
+        # debit-restriction clause, with nothing retrieved about credits)
+        # lands AMBIGUOUS on coverage alone even though `refine_local`
+        # already extracted real, grader-approved supporting evidence for
+        # it. Discarding that evidence and abstaining just because the
+        # question wasn't *completely* covered was the bug: it silently
+        # threw away correct retrieval + correct grading. `local` is only
+        # ever non-empty when at least one chunk cleared
+        # `supports_question and relevance >= min_relevance` (see
+        # `refine_local`), which by construction can't happen when
+        # `grade.decision is INCORRECT` (INCORRECT requires zero such
+        # chunks) - so this check is exactly "is there enough real,
+        # extracted, approved evidence to answer from", independent of
+        # whether that evidence happens to cover the whole question. The
+        # answer LLM's system prompt already distinguishes "mandatory now"
+        # from "not established by the supplied context" per claim, so
+        # partial coverage is surfaced there, not manufactured here.
+        if len(local) >= self._min_evidence:
             return CRAGOutcome(
                 evidence=local,
                 decision=grade.decision,

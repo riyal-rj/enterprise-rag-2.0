@@ -21,6 +21,17 @@ class CRAGDecision(StrEnum):
     INCORRECT = "incorrect"
 
 
+class GraderParseError(Exception):
+    """The grader's structured output was malformed or failed its own
+    business-rule validation (e.g. wrong/duplicate chunk indices) after
+    exhausting its own retry budget - see
+    ``StructuredLLMRetrievalGrader.grade``. Caught specifically by
+    ``FailSafeCorrectiveRetriever`` so this failure mode surfaces as
+    ``bypass_reason="grader_parse_error"`` instead of being lumped into the
+    generic ``"crag_error"`` fallback bucket alongside LLM timeouts, network
+    errors, and everything else."""
+
+
 class EvidenceOrigin(StrEnum):
     POLICY = "policy"
     REGULATORY_WEB = "regulatory_web"
@@ -207,6 +218,19 @@ class FailSafeCorrectiveRetriever:
     ) -> CRAGOutcome:
         try:
             return self._delegate.correct(question, chunks, allow_web=allow_web)
+        except GraderParseError as exc:
+            logger.warning(
+                "rag.crag_fallback",
+                extra={"error_type": type(exc).__name__, "bypass_reason": "grader_parse_error"},
+            )
+            return CRAGOutcome(
+                evidence=local_evidence(chunks),
+                decision=None,
+                applied=False,
+                fallback=True,
+                abstain=not chunks,
+                bypass_reason="grader_parse_error",
+            )
         except Exception as exc:  # noqa: BLE001 - deliberate service boundary
             logger.warning(
                 "rag.crag_fallback",
