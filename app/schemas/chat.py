@@ -72,7 +72,7 @@ class RerankingMetadata(BaseModel):
     (``enabled=False``) from "reranking is on but degraded to retrieval
     order" (``enabled=True, applied=False, fallback=True``) - the same
     distinction ``FailOpenReranker``/``ReRankOutcome`` already carry
-    internally (see ``app.rag_services.reranker``), now surfaced instead
+    internally (see ``app.rag_services.reranker.reranker``), now surfaced instead
     of being discarded at the API boundary.
     """
 
@@ -94,14 +94,14 @@ class HyDEMetadata(BaseModel):
     ``applied=False, bypass_reason="rollout"`` (sampled into the control
     cohort) or ``bypass_reason="emergency_disabled"`` (kill switch active) -
     see ``DynamicQueryTransformer.plan`` in
-    ``app.rag_services.dynamic_query_transformer`` for how the
+    ``app.rag_services.hyde.dynamic_query_transformer`` for how the
     disabled/control/treatment cohort is actually decided. ``bypass_reason``
     is the field that distinguishes those cases; ``enabled`` alone does not.
     This mirrors the disabled/bypass/applied/fallback distinction
     ``RerankingMetadata`` carries for reranking. Hypothetical passage text
     itself is never included here - it's a retrieval probe, not evidence,
     and must not leak into the response, logs, or cache (see
-    ``app.rag_services.hyde_query_transformer``).
+    ``app.rag_services.hyde.hyde_query_transformer``).
     """
 
     enabled: bool

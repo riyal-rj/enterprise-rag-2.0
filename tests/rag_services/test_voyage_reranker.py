@@ -8,7 +8,7 @@ import pytest
 import voyageai
 
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.voyage_reranker import VoyageReranker
+from app.rag_services.reranker.voyage_reranker import VoyageReranker
 
 
 class _FakeClient:

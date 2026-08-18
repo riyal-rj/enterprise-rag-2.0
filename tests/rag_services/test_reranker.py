@@ -4,7 +4,7 @@ import pytest
 
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.rag_runtime_config import RagRuntimeConfig
-from app.rag_services.reranker import (
+from app.rag_services.reranker.reranker import (
     FailOpenReranker,
     NoOpReranker,
     PlannedNoOpReranker,

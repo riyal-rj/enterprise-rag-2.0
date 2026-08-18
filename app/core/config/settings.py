@@ -36,9 +36,7 @@ class Settings(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    environment: Environment = Field(
-        default_factory=lambda: EnvironmentSettings().environment
-    )
+    environment: Environment = Field(default_factory=lambda: EnvironmentSettings().environment)
 
     llm: LLMSettings = Field(default_factory=LLMSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)

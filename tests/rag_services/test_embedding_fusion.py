@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from app.rag_services.embedding_fusion import mean_pool_and_normalize
+from app.rag_services.fusion.embedding_fusion import mean_pool_and_normalize
 
 
 def test_mean_pool_and_normalize_returns_unit_vector() -> None:

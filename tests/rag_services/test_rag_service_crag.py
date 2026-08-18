@@ -34,7 +34,12 @@ from app.rag_services.crag import (
 from app.rag_services.crag.dynamic_corrective_retriever import DynamicCorrectiveRetriever
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import PlannedReranker, ReRankedChunk, ReRankOutcome, RerankPlan
+from app.rag_services.reranker.reranker import (
+    PlannedReranker,
+    ReRankedChunk,
+    ReRankOutcome,
+    RerankPlan,
+)
 from app.rag_services.retrieval_strategy import DenseRetrievalStrategy, RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.repositories.vector_repository import VectorRepository

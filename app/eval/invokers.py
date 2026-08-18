@@ -49,9 +49,9 @@ from app.core.config import get_settings
 from app.core.exceptions import EvaluationPipelineError
 from app.eval.profiles import PipelineProfile
 from app.eval.schemas import Intent
-from app.rag_services.query_transformer import StaticPlannedQueryTransformer
+from app.rag_services.hyde.query_transformer import StaticPlannedQueryTransformer
 from app.rag_services.rag_service import RAGService
-from app.rag_services.reranker import StaticPlannedReranker
+from app.rag_services.reranker.reranker import StaticPlannedReranker
 
 
 class SkippedIntent(Exception):
@@ -152,7 +152,7 @@ class ServiceInvoker:
             # reranker or production's DynamicReranker - always reranks for
             # real when flags.enable_rerank is on, ignoring admin
             # rollout%/emergency-disable state (see StaticPlannedReranker's
-            # docstring in app.rag_services.reranker).
+            # docstring in app.rag_services.reranker.reranker).
             reranker=StaticPlannedReranker(get_reranker()),
             reranker_initial_top_k=rag_settings.reranker_initial_top_k,
             # Same reasoning as the reranker above, for HyDE: the eval-only

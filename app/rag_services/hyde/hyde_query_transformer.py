@@ -6,8 +6,8 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from app.core.llm.chat_client import LLMClient
-from app.rag_services.embedding_fusion import FUSION_ALGORITHM_VERSION
-from app.rag_services.query_transformer import QueryTransformOutcome
+from app.rag_services.fusion.embedding_fusion import FUSION_ALGORITHM_VERSION
+from app.rag_services.hyde.query_transformer import QueryTransformOutcome
 
 # Bump whenever HyDEDocuments' shape or _SYSTEM_PROMPT's contract changes in
 # a way that could change what a given query produces - referenced by

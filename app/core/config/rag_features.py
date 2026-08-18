@@ -67,7 +67,12 @@ class RAGFeatureSettings(EnvBaseSettings):
 
     crag_enabled_by_default: bool = Field(default=False)
     crag_grader_model: str = Field(default="gpt-4o-mini", min_length=1)
-    crag_prompt_version: str = Field(default="bank-policy-v1", min_length=1)
+    # v2: grader system prompt tightened to stop conflating "wrong_policy"
+    # with "on-topic chunk that doesn't restate the question's exact
+    # scenario" - bumped so a stale cached CRAG answer computed under v1's
+    # over-eager wrong_policy behavior can't keep being served under an
+    # unchanged cache identity (see StructuredLLMRetrievalGrader.cache_namespace).
+    crag_prompt_version: str = Field(default="bank-policy-v2", min_length=1)
     crag_relevance_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
     crag_ambiguous_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
     crag_max_chunks_to_grade: int = Field(default=8, ge=1, le=20)

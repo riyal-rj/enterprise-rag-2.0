@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.core.llm.chat_client import StructuredLLMResponse, TokenUsage
 from app.models.retrieved_chunk import RetrievedChunk
-from app.rag_services.crag.crag import CRAGDecision
+from app.rag_services.crag.crag import CRAGDecision, GraderParseError
 from app.rag_services.crag.crag_retrieval_grader import StructuredLLMRetrievalGrader
 
 
@@ -52,6 +52,40 @@ class _RaisingLLMClient:
 
     def generate_structured(self, *args: object, **kwargs: object) -> None:
         raise TimeoutError("grader call timed out")
+
+
+class _FlakyLLMClient:
+    """Returns a malformed payload on its first call, a valid one on every
+    call after - lets tests prove the grader's single retry actually
+    recovers instead of merely re-raising the same failure."""
+
+    def __init__(self, *, bad_payload: dict[str, object], good_payload: dict[str, object]) -> None:
+        self._bad_payload = bad_payload
+        self._good_payload = good_payload
+        self.calls: list[dict[str, object]] = []
+
+    def generate(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    def generate_json(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        response_model: type,
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_completion_tokens: int = 1_000,
+        timeout_seconds: float = 30.0,
+        max_attempts: int = 2,
+    ) -> StructuredLLMResponse:
+        self.calls.append({"system_prompt": system_prompt, "user_message": user_message})
+        payload = self._bad_payload if len(self.calls) == 1 else self._good_payload
+        value = response_model(**payload)
+        return StructuredLLMResponse(value=value, usage=TokenUsage(total_tokens=5))
 
 
 def _grader(llm_client: object, **overrides: object) -> StructuredLLMRetrievalGrader:
@@ -143,7 +177,10 @@ def test_middle_coverage_maps_to_ambiguous() -> None:
 def test_missing_index_is_rejected() -> None:
     """Two chunks selected, grader only graded index 0 - the completeness
     check must catch this even though nothing about a single valid index is
-    individually invalid."""
+    individually invalid. The grader deterministically returns the same bad
+    payload every call, so both the initial attempt and its one retry fail
+    identically, and the failure surfaces as GraderParseError (not a bare
+    ValueError) once the retry budget is exhausted."""
     llm_client = _FakeLLMClient(
         payload={
             "coverage": 0.9,
@@ -152,8 +189,9 @@ def test_missing_index_is_rejected() -> None:
     )
     grader = _grader(llm_client)
 
-    with pytest.raises(ValueError, match="exactly indices"):
+    with pytest.raises(GraderParseError, match="unparseable/invalid output"):
         grader.grade("q", [_chunk("a"), _chunk("b")])
+    assert len(llm_client.calls) == 2  # initial attempt + one retry
 
 
 def test_out_of_range_index_is_rejected() -> None:
@@ -165,8 +203,9 @@ def test_out_of_range_index_is_rejected() -> None:
     )
     grader = _grader(llm_client)
 
-    with pytest.raises(ValueError, match="exactly indices"):
+    with pytest.raises(GraderParseError, match="unparseable/invalid output"):
         grader.grade("q", [_chunk()])
+    assert len(llm_client.calls) == 2
 
 
 def test_duplicate_indices_are_rejected() -> None:
@@ -181,8 +220,10 @@ def test_duplicate_indices_are_rejected() -> None:
     )
     grader = _grader(llm_client)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(GraderParseError) as exc_info:
         grader.grade("q", [_chunk()])
+    assert isinstance(exc_info.value.__cause__, ValidationError)
+    assert len(llm_client.calls) == 2
 
 
 def test_extra_response_fields_are_rejected() -> None:
@@ -195,8 +236,9 @@ def test_extra_response_fields_are_rejected() -> None:
     )
     grader = _grader(llm_client)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(GraderParseError) as exc_info:
         grader.grade("q", [_chunk()])
+    assert isinstance(exc_info.value.__cause__, ValidationError)
 
 
 def test_chunk_payload_extra_fields_are_rejected() -> None:
@@ -216,8 +258,32 @@ def test_chunk_payload_extra_fields_are_rejected() -> None:
     )
     grader = _grader(llm_client)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(GraderParseError) as exc_info:
         grader.grade("q", [_chunk()])
+    assert isinstance(exc_info.value.__cause__, ValidationError)
+
+
+def test_malformed_output_recovers_if_the_retry_succeeds() -> None:
+    """The one-retry budget exists to smooth over a single flaky/malformed
+    generation, not just to fail slower - a bad first attempt followed by a
+    valid second must return a real grade, not exhaust into
+    GraderParseError."""
+    llm_client = _FlakyLLMClient(
+        bad_payload={
+            "coverage": 0.9,
+            "chunks": [_chunk_payload(5, relevance=0.9, supports_question=True)],
+        },
+        good_payload={
+            "coverage": 0.9,
+            "chunks": [_chunk_payload(0, relevance=0.9, supports_question=True)],
+        },
+    )
+    grader = _grader(llm_client)
+
+    grade = grader.grade("q", [_chunk()])
+
+    assert grade.decision is CRAGDecision.CORRECT
+    assert len(llm_client.calls) == 2
 
 
 def test_provider_timeout_propagates_for_the_fail_safe_wrapper_to_catch() -> None:

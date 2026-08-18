@@ -150,9 +150,41 @@ def test_correct_local_evidence_returns_without_touching_web() -> None:
     assert web.calls == []  # never touched - CORRECT with enough local evidence stops early
 
 
-def test_ambiguous_internal_question_abstains_when_web_not_permitted() -> None:
+def test_ambiguous_with_sufficient_local_evidence_answers_without_web() -> None:
+    """Regression: AMBIGUOUS means the retrieved set doesn't *fully* cover
+    every part of the question (coverage < correct_threshold) - it does not
+    mean there's no usable evidence. A multi-part question answered by one
+    genuinely relevant, grader-approved document (e.g. a re-KYC policy's
+    debit-restriction clause, with nothing retrieved about credits) must
+    still answer from that evidence instead of discarding it and abstaining
+    just because the question wasn't completely covered. This was the CRAG
+    abstention bug: correct retrieval + correct grading was thrown away."""
     grader = _FakeGrader([_grade(CRAGDecision.AMBIGUOUS, coverage=0.6)])
     refiner = _FakeRefiner(local_evidence=_local_evidence(1))
+    retriever = ProductionCorrectiveRetriever(
+        grader=grader,
+        refiner=refiner,
+        scope_policy=_FakeScopePolicy(permits=False),
+        web_retriever=None,
+    )
+
+    outcome = retriever.correct(
+        "q", [RetrievedChunk(text="x", source="a.pdf", score=0.9)], allow_web=True
+    )
+
+    assert outcome.abstain is False
+    assert outcome.applied is True
+    assert outcome.web_used is False
+    assert outcome.evidence == refiner._local_evidence
+
+
+def test_ambiguous_with_insufficient_local_evidence_abstains_when_web_not_permitted() -> None:
+    """Contrast with the test above: when the refiner genuinely extracted
+    nothing usable (not just "coverage wasn't complete"), and web correction
+    isn't permitted, abstention is still correct - there's no evidence to
+    answer from at all."""
+    grader = _FakeGrader([_grade(CRAGDecision.AMBIGUOUS, coverage=0.6)])
+    refiner = _FakeRefiner(local_evidence=())
     retriever = ProductionCorrectiveRetriever(
         grader=grader,
         refiner=refiner,
@@ -187,7 +219,11 @@ def test_incorrect_internal_question_abstains_when_web_not_permitted() -> None:
 
 def test_empty_web_result_abstains_without_a_second_grade_call() -> None:
     grader = _FakeGrader([_grade(CRAGDecision.AMBIGUOUS, coverage=0.6)])
-    refiner = _FakeRefiner(local_evidence=_local_evidence(1), web_evidence=())
+    # Empty local evidence, not _local_evidence(1): sufficient local
+    # evidence now short-circuits before the web branch is ever reached
+    # (see test_ambiguous_with_sufficient_local_evidence_answers_without_web) -
+    # this test needs the web path to actually run.
+    refiner = _FakeRefiner(local_evidence=(), web_evidence=())
     web = _FakeWebRetriever(results=[])
     retriever = ProductionCorrectiveRetriever(
         grader=grader,
@@ -217,7 +253,11 @@ def test_non_correct_regrade_of_combined_evidence_abstains() -> None:
             _grade(CRAGDecision.AMBIGUOUS, coverage=0.65),
         ]
     )
-    refiner = _FakeRefiner(local_evidence=_local_evidence(1), web_evidence=_web_evidence(1))
+    # Empty local evidence: sufficient local evidence now short-circuits
+    # before the web branch is ever reached (see
+    # test_ambiguous_with_sufficient_local_evidence_answers_without_web) -
+    # this test needs the web-correction path to actually run.
+    refiner = _FakeRefiner(local_evidence=(), web_evidence=_web_evidence(1))
     web = _FakeWebRetriever(
         results=[
             WebEvidence(
@@ -245,8 +285,8 @@ def test_non_correct_regrade_of_combined_evidence_abstains() -> None:
     assert outcome.abstain is True
     assert outcome.bypass_reason == "corrected_evidence_insufficient"
     assert (
-        len(outcome.evidence) == 2
-    )  # combined local + web is still returned, just not served as resolved
+        len(outcome.evidence) == 1
+    )  # combined local (empty) + web (1) is still returned, just not served as resolved
     assert len(grader.calls) == 2
 
 
@@ -285,7 +325,11 @@ def test_verified_corrected_evidence_may_answer() -> None:
     grader = _FakeGrader(
         [_grade(CRAGDecision.AMBIGUOUS, coverage=0.6), _grade(CRAGDecision.CORRECT, coverage=0.9)]
     )
-    refiner = _FakeRefiner(local_evidence=_local_evidence(1), web_evidence=_web_evidence(1))
+    # Empty local evidence: sufficient local evidence now short-circuits
+    # before the web branch is ever reached (see
+    # test_ambiguous_with_sufficient_local_evidence_answers_without_web) -
+    # this test needs the web-correction/re-grade path to actually run.
+    refiner = _FakeRefiner(local_evidence=(), web_evidence=_web_evidence(1))
     web = _FakeWebRetriever(
         results=[
             WebEvidence(
@@ -312,12 +356,15 @@ def test_verified_corrected_evidence_may_answer() -> None:
     assert outcome.abstain is False
     assert outcome.web_used is True
     assert outcome.bypass_reason is None
-    assert len(outcome.evidence) == 2
+    assert len(outcome.evidence) == 1  # local (empty) + web (1)
 
 
 def test_web_provider_error_returns_fail_safe_fallback_with_local_chunks() -> None:
     grader = _FakeGrader([_grade(CRAGDecision.AMBIGUOUS, coverage=0.6)])
-    refiner = _FakeRefiner(local_evidence=_local_evidence(1))
+    # Empty local evidence: sufficient local evidence now short-circuits
+    # before the web branch (where the raising web retriever lives) is ever
+    # reached (see test_ambiguous_with_sufficient_local_evidence_answers_without_web).
+    refiner = _FakeRefiner(local_evidence=())
     web = _FakeWebRetriever(raise_error=True)
     delegate = ProductionCorrectiveRetriever(
         grader=grader,
