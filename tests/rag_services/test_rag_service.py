@@ -362,13 +362,18 @@ def test_hybrid_mode_confidence_uses_hybrid_calibration_not_dense() -> None:
 
 
 def test_answer_builds_context_with_source_citations() -> None:
+    """Regression: context is now built from CRAG's evidence output (see
+    RAGService._build_evidence_context), not the raw chunk list directly -
+    but with CRAG disabled/control (the default here), that evidence is an
+    identity-wrapped pass-through of the same chunks/sources (see
+    PlannedNoOpCorrectiveRetriever/local_evidence)."""
     chunks = [RetrievedChunk(text="refunds within 30 days", source="policy.pdf", score=0.9)]
     service, _, _, llm_client = _service(results=chunks)
 
     service.answer("what is the refund policy?")
 
     user_message = cast(str, llm_client.calls[0]["user_message"])
-    assert "[policy.pdf]" in user_message
+    assert '"source": "policy.pdf"' in user_message
     assert "refunds within 30 days" in user_message
     assert "what is the refund policy?" in user_message
 
@@ -1062,6 +1067,9 @@ def _config_store(*, corpus_version: int = 1) -> RagRuntimeConfigStore:
             corpus_version=corpus_version,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
 
@@ -1105,6 +1113,9 @@ def test_corpus_version_bump_makes_a_previously_cached_answer_unreachable() -> N
             corpus_version=2,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
     after_bump = service.answer("q", top_k=1)
@@ -1139,18 +1150,18 @@ def test_per_call_reranking_override_disables_reranking_for_a_single_request() -
     assert response.metadata.reranking.enabled is False
 
 
-def test_cache_key_uses_the_v5_prefix() -> None:
+def test_cache_key_uses_the_v6_prefix() -> None:
     """Regression: the merged cache-key format combines candidate-pool-size
-    versioning (v3), HyDE identity (v4), and now cohort-isolation for both
-    reranking and HyDE - it must not collide with either predecessor
-    format for the same question/namespace."""
+    versioning (v3), HyDE identity (v4), cohort-isolation for reranking and
+    HyDE (v5), and now cohort-isolation for CRAG too - it must not collide
+    with any predecessor format for the same question/namespace."""
     import hashlib
 
     service, *_ = _service()
 
     key = service._cache_key("q", 5, "dense:v1:corpus=1")
 
-    expected = hashlib.sha256(b"rag:v5:dense:v1:corpus=1:5:q").hexdigest()
+    expected = hashlib.sha256(b"rag:v6:dense:v1:corpus=1:5:q").hexdigest()
     assert key == expected
 
 
@@ -1176,6 +1187,9 @@ def test_rollout_control_cohort_never_widens_the_candidate_pool_or_calls_the_bac
             corpus_version=1,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
     # A NoOpReranker "local" delegate is fine here - the whole point of this
@@ -1221,6 +1235,9 @@ def test_semantic_cache_partitions_control_and_treatment_reranker_cohorts_separa
             corpus_version=1,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
     reranker = DynamicReranker(local=NoOpReranker(), voyage=None, metrics=RagMetricsService())
@@ -1273,6 +1290,9 @@ def test_config_store_current_is_read_exactly_once_per_answer_call() -> None:
             corpus_version=1,
             hyde_enabled=False,
             hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
         )
     )
     read_count = 0

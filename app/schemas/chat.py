@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 RetrievalMode = Literal["dense", "hybrid"]
+EvidenceOriginValue = Literal["policy", "regulatory_web"]
 
 
 class ChatRequest(BaseModel):
@@ -43,6 +44,25 @@ class RetrievedChunkPreview(BaseModel):
     page_number: int | None = None
     rerank_score: float | None = None
     original_rank: int | None = None
+
+
+class EvidencePreview(BaseModel):
+    """Final evidence actually supplied to the answer model.
+
+    Distinct from ``RetrievedChunkPreview``: that field reflects raw
+    retrieval/reranking output, while this reflects CRAG's post-grading,
+    post-refinement, possibly web-augmented evidence set - the exact
+    context the answer LLM saw. ``canonical_url``/``retrieved_at_iso`` are
+    only set for ``origin="regulatory_web"`` items.
+    """
+
+    text: str
+    source: str
+    page_number: int | None = None
+    score: float
+    origin: EvidenceOriginValue
+    canonical_url: str | None = None
+    retrieved_at_iso: str | None = None
 
 
 class RerankingMetadata(BaseModel):
@@ -94,6 +114,33 @@ class HyDEMetadata(BaseModel):
     bypass_reason: str | None = None
 
 
+class CRAGMetadata(BaseModel):
+    """Diagnostic detail about the Corrective-RAG stage.
+
+    ``enabled=True`` only means the CRAG feature toggle was on for this
+    request - it does **not** imply the query was sampled into the rollout
+    treatment cohort. A query can have ``enabled=True`` and still show
+    ``applied=False, bypass_reason="rollout"`` (sampled into the control
+    cohort) or ``bypass_reason="emergency_disabled"`` - same
+    enabled/bypass/applied/fallback distinction ``HyDEMetadata`` carries for
+    HyDE. ``decision`` is ``None`` unless CRAG actually graded retrieval for
+    this request. Raw grader reasons, refiner selections, and web snippet
+    text are deliberately never included here - only counts and identifiers
+    (see ``app.rag_services.rag_service._build_evidence_context``).
+    """
+
+    enabled: bool
+    applied: bool = False
+    decision: Literal["correct", "ambiguous", "incorrect"] | None = None
+    fallback: bool = False
+    abstain: bool = False
+    web_used: bool = False
+    evidence_count: int = 0
+    usage_tokens: int = 0
+    duration_ms: float = 0.0
+    bypass_reason: str | None = None
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
@@ -106,7 +153,11 @@ class ResponseMetadata(BaseModel):
     retrieval_mode: str = "dense"
     hyde: HyDEMetadata
     reranking: RerankingMetadata
+    crag: CRAGMetadata
+    # Raw retrieval/reranking output.
     retrieved_chunks: list[RetrievedChunkPreview]
+    # Final post-CRAG evidence sent to the answer LLM.
+    final_evidence: list[EvidencePreview] = Field(default_factory=list)
     flagged_claims: list[str] = Field(default_factory=list)
 
 

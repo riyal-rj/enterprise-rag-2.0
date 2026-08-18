@@ -15,6 +15,7 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
+    CRAGMetadata,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -130,6 +131,7 @@ def _response(answer: str = "hello") -> ChatResponse:
             route="rag",
             hyde=HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
+            crag=CRAGMetadata(enabled=False),
             retrieved_chunks=[],
         ),
     )

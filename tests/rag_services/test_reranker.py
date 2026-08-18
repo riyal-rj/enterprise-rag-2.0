@@ -110,6 +110,9 @@ def _config() -> RagRuntimeConfig:
         corpus_version=1,
         hyde_enabled=False,
         hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
 
@@ -155,6 +158,9 @@ def test_static_planned_reranker_is_always_treatment_when_enabled_regardless_of_
         corpus_version=1,
         hyde_enabled=False,
         hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
     plan = reranker.plan("q", hostile_config, enabled=True)

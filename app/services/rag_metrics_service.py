@@ -39,6 +39,47 @@ class SemanticCacheMetricsSnapshot:
 
 
 @dataclass(frozen=True)
+class CRAGMetricsSnapshot:
+    """CRAG performance over the last ``window_size`` *attempted*
+    corrections (the corrective retriever was actually invoked -
+    rollout-bypassed and emergency-disabled requests don't count as
+    attempts, same distinction as :class:`HyDEMetricsSnapshot`)."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    correct_count: int
+    ambiguous_count: int
+    incorrect_count: int
+    fallback_rate: float
+    abstention_rate: float
+    web_use_rate: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
+@dataclass(frozen=True)
+class CRAGShadowMetricsSnapshot:
+    """Shadow-cohort CRAG performance over the last ``window_size``
+    observations - never served to a real user (see RAGService.answer's
+    "shadow" cohort handling), tracked separately from
+    :class:`CRAGMetricsSnapshot` so a shadow regression is visible without
+    being confused with what traffic is actually experiencing."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    correct_count: int
+    ambiguous_count: int
+    incorrect_count: int
+    fallback_rate: float
+    abstention_rate: float
+    web_use_rate: float
+    usage_tokens_total: int
+
+
+@dataclass(frozen=True)
 class HyDEMetricsSnapshot:
     """HyDE performance over the last ``window_size`` *attempted* transforms
     (the delegate was actually invoked - rollout-bypassed and
@@ -74,6 +115,21 @@ class RagMetricsService:
         self._hyde_samples: deque[tuple[float, bool]] = deque(maxlen=window_size)
         self._hyde_usage_tokens_total = 0
         self._hyde_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
+        # (duration_ms, decision, fallback, abstain, web_used) - kept
+        # together for the same reason as _rerank_samples/_hyde_samples:
+        # every derived rate below must describe the exact same window.
+        self._crag_samples: deque[tuple[float, str | None, bool, bool, bool]] = deque(
+            maxlen=window_size
+        )
+        self._crag_usage_tokens_total = 0
+        self._crag_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
+        # Same per-sample shape as _crag_samples, kept in a fully separate
+        # window/counter set - shadow observations must never blend into
+        # the served-traffic CRAG stats above.
+        self._crag_shadow_samples: deque[tuple[float, str | None, bool, bool, bool]] = deque(
+            maxlen=window_size
+        )
+        self._crag_shadow_usage_tokens_total = 0
 
     def record_rerank(
         self, *, duration_ms: float, fallback: bool, usage_tokens: int | None
@@ -139,6 +195,88 @@ class RagMetricsService:
             usage_tokens_total=tokens,
             rollout_bypasses=bypasses.get("rollout", 0),
             emergency_bypasses=bypasses.get("emergency_disabled", 0),
+        )
+
+    def record_crag_outcome(
+        self,
+        *,
+        duration_ms: float,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        usage_tokens: int,
+    ) -> None:
+        with self._lock:
+            self._crag_samples.append((duration_ms, decision, fallback, abstain, web_used))
+            self._crag_usage_tokens_total += max(usage_tokens, 0)
+
+    def record_crag_bypass(self, *, reason: str) -> None:
+        with self._lock:
+            self._crag_bypass_counts[reason] = self._crag_bypass_counts.get(reason, 0) + 1
+
+    def crag_stats(self) -> CRAGMetricsSnapshot:
+        with self._lock:
+            samples = list(self._crag_samples)
+            tokens = self._crag_usage_tokens_total
+            bypasses = dict(self._crag_bypass_counts)
+
+        durations = sorted(duration for duration, *_rest in samples)
+        attempts = len(samples)
+        fallback_count = sum(1 for _d, _dec, fallback, _a, _w in samples if fallback)
+        abstain_count = sum(1 for _d, _dec, _f, abstain, _w in samples if abstain)
+        web_used_count = sum(1 for _d, _dec, _f, _a, web_used in samples if web_used)
+        return CRAGMetricsSnapshot(
+            sample_count=attempts,
+            p50_latency_ms=_percentile(durations, 0.50),
+            p95_latency_ms=_percentile(durations, 0.95),
+            correct_count=sum(1 for _d, decision, *_r in samples if decision == "correct"),
+            ambiguous_count=sum(1 for _d, decision, *_r in samples if decision == "ambiguous"),
+            incorrect_count=sum(1 for _d, decision, *_r in samples if decision == "incorrect"),
+            fallback_rate=(fallback_count / attempts) if attempts else 0.0,
+            abstention_rate=(abstain_count / attempts) if attempts else 0.0,
+            web_use_rate=(web_used_count / attempts) if attempts else 0.0,
+            usage_tokens_total=tokens,
+            rollout_bypasses=bypasses.get("rollout", 0),
+            emergency_bypasses=bypasses.get("emergency_disabled", 0),
+        )
+
+    def record_crag_shadow_decision(
+        self,
+        *,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        evidence_count: int,
+        duration_ms: float,
+        usage_tokens: int,
+    ) -> None:
+        with self._lock:
+            self._crag_shadow_samples.append((duration_ms, decision, fallback, abstain, web_used))
+            self._crag_shadow_usage_tokens_total += max(usage_tokens, 0)
+
+    def crag_shadow_stats(self) -> CRAGShadowMetricsSnapshot:
+        with self._lock:
+            samples = list(self._crag_shadow_samples)
+            tokens = self._crag_shadow_usage_tokens_total
+
+        durations = sorted(duration for duration, *_rest in samples)
+        attempts = len(samples)
+        fallback_count = sum(1 for _d, _dec, fallback, _a, _w in samples if fallback)
+        abstain_count = sum(1 for _d, _dec, _f, abstain, _w in samples if abstain)
+        web_used_count = sum(1 for _d, _dec, _f, _a, web_used in samples if web_used)
+        return CRAGShadowMetricsSnapshot(
+            sample_count=attempts,
+            p50_latency_ms=_percentile(durations, 0.50),
+            p95_latency_ms=_percentile(durations, 0.95),
+            correct_count=sum(1 for _d, decision, *_r in samples if decision == "correct"),
+            ambiguous_count=sum(1 for _d, decision, *_r in samples if decision == "ambiguous"),
+            incorrect_count=sum(1 for _d, decision, *_r in samples if decision == "incorrect"),
+            fallback_rate=(fallback_count / attempts) if attempts else 0.0,
+            abstention_rate=(abstain_count / attempts) if attempts else 0.0,
+            web_use_rate=(web_used_count / attempts) if attempts else 0.0,
+            usage_tokens_total=tokens,
         )
 
 

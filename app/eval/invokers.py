@@ -27,14 +27,16 @@ through a real call.
 ``_call_pipeline`` calls the real :class:`~app.rag_services.rag_service.RAGService`,
 via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override,
 ``PipelineProfile.enable_rerank`` as a per-call ``reranking_enabled``
-override, and ``PipelineProfile.enable_hyde`` as a per-call
-``hyde_enabled`` override (see ``RAGService.answer``) - dense/sparse/hybrid,
-reranking, and HyDE all run for real, through
-``app.api.deps.get_eval_hyde_transformer`` (never the production
-admin-rollout-controlled transformer - see ``_rag_service`` below).
-CRAG/self-reflective profiles still skip cleanly: neither exists in the
-pipeline yet (see ``app.rag_services.rag_service``'s module docstring), so
-silently ignoring those flags would produce misleading pass/fail results.
+override, ``PipelineProfile.enable_hyde`` as a per-call ``hyde_enabled``
+override, and ``PipelineProfile.enable_crag`` as a per-call
+``crag_enabled`` override (see ``RAGService.answer``) - dense/sparse/hybrid,
+reranking, HyDE, and CRAG all run for real, through
+``app.api.deps.get_eval_hyde_transformer``/``get_eval_crag`` (never the
+production admin-rollout-controlled transformer/corrective retriever - see
+``_rag_service`` below). Self-reflective profiles still skip cleanly: it
+doesn't exist in the pipeline yet (see ``app.rag_services.rag_service``'s
+module docstring), so silently ignoring that flag would produce misleading
+pass/fail results.
 """
 
 from __future__ import annotations
@@ -123,6 +125,7 @@ class ServiceInvoker:
         from app.api.deps import (
             get_default_retrieval_mode,
             get_embedding_client,
+            get_eval_crag,
             get_eval_hyde_transformer,
             get_llm_client,
             get_reranker,
@@ -160,6 +163,19 @@ class ServiceInvoker:
             # admin's live rollout percentage or emergency-disable state.
             query_transformer=StaticPlannedQueryTransformer(get_eval_hyde_transformer()),
             hyde_enabled=False,
+            # Same reasoning as the reranker/HyDE overrides above, for CRAG:
+            # the eval-only corrective retriever (never the admin-rollout-
+            # controlled production one), already wrapped in
+            # StaticPlannedCorrectiveRetriever by get_eval_crag() so it
+            # always attempts CRAG for real when flags.enable_crag (a
+            # per-call override, see _call_pipeline) is on - never
+            # inheriting an admin's live rollout percentage or
+            # emergency-disable state. Web correction stays off for every
+            # eval case (StaticPlannedCorrectiveRetriever.plan always sets
+            # allow_web=False) so an offline run never depends on a live
+            # Tavily call.
+            corrective_retriever=get_eval_crag(),
+            crag_enabled=False,
         )
 
     def invoke(
@@ -177,10 +193,10 @@ class ServiceInvoker:
     def _call_pipeline(
         self, question: str, flags: PipelineProfile
     ) -> tuple[InvokeResponse, list[RetrievedChunk]]:
-        if flags.enable_crag or flags.enable_self_reflective:
+        if flags.enable_self_reflective:
             raise SkippedIntent(
-                f"{flags.name}: CRAG/self-reflective aren't implemented "
-                "in the pipeline yet, only search_mode, reranking, and HyDE are wired"
+                f"{flags.name}: self-reflective isn't implemented "
+                "in the pipeline yet, only search_mode, reranking, HyDE, and CRAG are wired"
             )
 
         response = self._rag_service.answer(
@@ -189,6 +205,7 @@ class ServiceInvoker:
             retrieval_mode=flags.search_mode,
             reranking_enabled=flags.enable_rerank,
             hyde_enabled=flags.enable_hyde,
+            crag_enabled=flags.enable_crag,
         )
 
         if flags.enable_hyde:
@@ -206,7 +223,35 @@ class ServiceInvoker:
                     f"bypass_reason={hyde.bypass_reason!r})"
                 )
 
+        if flags.enable_crag:
+            crag = response.metadata.crag
+            if not crag.applied or crag.fallback:
+                # Same reasoning as the HyDE check above: a case that asked
+                # for CRAG and silently got baseline (ungraded) evidence
+                # would score as if CRAG were under test when it never
+                # actually ran cleanly.
+                raise EvaluationPipelineError(
+                    f"{flags.name}: CRAG was requested but not cleanly applied "
+                    f"(applied={crag.applied}, fallback={crag.fallback}, "
+                    f"bypass_reason={crag.bypass_reason!r})"
+                )
+
+        if flags.enable_crag and not response.metadata.final_evidence:
+            # A CRAG-enabled case that produced no final evidence would
+            # otherwise silently score RAGAS against an empty context list -
+            # indistinguishable from "CRAG correctly found nothing" versus
+            # "final_evidence metadata was never populated". Fail loudly
+            # instead.
+            raise EvaluationPipelineError(f"{flags.name}: CRAG returned no final-evidence metadata")
+
+        # RAGAS must score exactly the context the answer model saw - CRAG's
+        # final evidence when CRAG ran, never the pre-CRAG retrieved/
+        # reranked chunks (see app.rag_services.rag_service.RAGService.answer).
+        # A web item's canonical URL is preferred as `source` so its
+        # ranked_sources entry matches ChatResponse.sources (see
+        # RAGService._public_source_identifier).
         chunks = [
-            RetrievedChunk(text=c.text, source=c.source) for c in response.metadata.retrieved_chunks
+            RetrievedChunk(text=item.text, source=item.canonical_url or item.source)
+            for item in response.metadata.final_evidence
         ]
         return InvokeResponse(answer=response.answer, sources=response.sources), chunks

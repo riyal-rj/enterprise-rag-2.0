@@ -26,6 +26,9 @@ class RagOpsConfig:
     semantic_cache_threshold: float
     hyde_enabled: bool
     hyde_rollout_percentage: int
+    crag_enabled: bool
+    crag_rollout_percentage: int
+    crag_web_enabled: bool
     emergency_disabled: bool
     emergency_disabled_reason: str | None
     emergency_disabled_at: datetime | None
@@ -34,6 +37,23 @@ class RagOpsConfig:
     last_cache_invalidated_at: datetime | None
     updated_at: datetime
     updated_by: str | None
+    # Observe-only rollout stage - see app.rag_services.crag.dynamic_corrective_retriever
+    # and RAGService.answer's "shadow" cohort handling. Defaulted so every
+    # pre-existing construction site (tests, PostgresRagOpsRepository rows
+    # from before this column existed) keeps working unchanged.
+    crag_shadow_enabled: bool = False
+
+
+def validate_crag_state(
+    *, crag_enabled: bool, crag_web_enabled: bool, crag_shadow_enabled: bool = False
+) -> None:
+    """Invariant shared by every write path that can change these fields
+    (API request payload, DB row after a concurrent write) - web correction
+    and shadow mode must never be enabled while CRAG itself is off."""
+    if crag_web_enabled and not crag_enabled:
+        raise ValueError("crag_web_enabled requires crag_enabled")
+    if crag_shadow_enabled and not crag_enabled:
+        raise ValueError("crag_shadow_enabled requires crag_enabled")
 
 
 @dataclass(frozen=True)

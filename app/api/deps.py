@@ -35,6 +35,23 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.rag_services.crag import (
+    CorrectiveRetriever,
+    FailSafeCorrectiveRetriever,
+    KnowledgeRefiner,
+    PlannedCorrectiveRetriever,
+    RetrievalGrader,
+    StaticPlannedCorrectiveRetriever,
+    WebRetriever,
+)
+from app.rag_services.crag.corrective_retriever import ProductionCorrectiveRetriever
+from app.rag_services.crag.crag_refiner import ExtractiveKnowledgeRefiner
+from app.rag_services.crag.crag_retrieval_grader import StructuredLLMRetrievalGrader
+from app.rag_services.crag.dynamic_corrective_retriever import DynamicCorrectiveRetriever
+from app.rag_services.crag.web_retriever import (
+    KeywordRegulatoryScopePolicy,
+    TavilyRegulatoryWebRetriever,
+)
 from app.rag_services.cross_encoder_reranker import LocalCrossEncoderReranker
 from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
 from app.rag_services.dynamic_reranker import DynamicReranker
@@ -184,6 +201,106 @@ def get_dynamic_hyde_transformer() -> DynamicQueryTransformer:
 
 
 @lru_cache(maxsize=1)
+def get_crag_grader() -> RetrievalGrader:
+    """Structured LLM retrieval-quality grader shared by production and eval
+    CRAG wiring - see ``app.rag_services.crag.crag_retrieval_grader``."""
+    settings = get_settings().rag
+    return StructuredLLMRetrievalGrader(
+        llm_client=get_llm_client(),
+        model=settings.crag_grader_model,
+        correct_threshold=settings.crag_relevance_threshold,
+        ambiguous_threshold=settings.crag_ambiguous_threshold,
+        max_chunks=settings.crag_max_chunks_to_grade,
+        timeout_seconds=settings.crag_grader_timeout_seconds,
+        max_completion_tokens=settings.crag_max_completion_tokens,
+        max_attempts=settings.crag_max_attempts,
+        prompt_version=settings.crag_prompt_version,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_crag_refiner() -> KnowledgeRefiner:
+    """Extractive knowledge refiner - see
+    ``app.rag_services.crag.crag_refiner``."""
+    settings = get_settings().rag
+    return ExtractiveKnowledgeRefiner(
+        llm_client=get_llm_client(),
+        model=settings.crag_grader_model,
+        min_relevance=settings.crag_ambiguous_threshold,
+        max_documents=settings.crag_max_documents_to_refine,
+        max_sentences_per_document=settings.crag_max_sentences_per_document,
+        timeout_seconds=settings.crag_refiner_timeout_seconds,
+        max_completion_tokens=settings.crag_max_completion_tokens,
+        prompt_version=settings.crag_prompt_version,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_regulatory_web_retriever() -> WebRetriever | None:
+    """Allowlisted Tavily web retriever for CRAG's public-regulatory
+    correction path, or ``None`` if this deployment has no Tavily API key
+    and/or no approved regulatory-domain allowlist configured - see
+    ``app.rag_services.crag.web_retriever``. CRAG web correction stays
+    unavailable (rejected by ``RagOpsController.update_config``) until both
+    are set for this deployment."""
+    settings = get_settings().external_apis
+    if not settings.crag_web_guardrails_ready:
+        return None
+    api_key = settings.tavily_api_key.get_secret_value()
+    domains = settings.allowed_regulatory_domains
+    if not api_key or not domains:
+        return None
+    return TavilyRegulatoryWebRetriever(
+        api_key=api_key,
+        allowed_domains=domains,
+        max_results=settings.crag_web_max_results,
+        max_content_chars=settings.crag_web_max_content_chars,
+        max_total_chars=settings.crag_web_total_content_chars,
+        connect_timeout_seconds=settings.crag_web_connect_timeout_seconds,
+        read_timeout_seconds=settings.crag_web_read_timeout_seconds,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_crag_delegate() -> CorrectiveRetriever:
+    """Raw CRAG correct/ambiguous/incorrect orchestrator, no rollout/
+    emergency state - see ``get_dynamic_crag`` (production) and
+    ``get_eval_crag`` (offline eval) below, which each wrap this for the
+    availability/isolation guarantees their callers need, matching
+    ``get_hyde_transformer``'s shape."""
+    settings = get_settings().rag
+    return ProductionCorrectiveRetriever(
+        grader=get_crag_grader(),
+        refiner=get_crag_refiner(),
+        scope_policy=KeywordRegulatoryScopePolicy(policy_version=settings.crag_policy_version),
+        web_retriever=get_regulatory_web_retriever(),
+        min_evidence_chunks=settings.crag_min_evidence_chunks,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_eval_crag() -> PlannedCorrectiveRetriever:
+    """CRAG for the offline eval harness only - always attempts CRAG for
+    real when a case's ``PipelineProfile.enable_crag`` is on, ignoring
+    admin rollout%/emergency state entirely, matching
+    ``get_eval_hyde_transformer``'s guarantee. Web correction stays off for
+    eval cases unless a case explicitly wants it (not yet modeled), since
+    offline runs must not depend on live web calls by default - see
+    ``StaticPlannedCorrectiveRetriever.plan``, which always sets
+    ``allow_web=False``."""
+    return StaticPlannedCorrectiveRetriever(FailSafeCorrectiveRetriever(get_crag_delegate()))
+
+
+@lru_cache(maxsize=1)
+def get_dynamic_crag() -> PlannedCorrectiveRetriever:
+    """The CRAG stage that actually serves real ``/chat`` traffic - admin-
+    mutable (rollout%/web-enabled/emergency-disable) via the RAG Operations
+    panel. Holds no config state of its own - ``RAGService.answer`` passes
+    in the one ``RagRuntimeConfig`` snapshot it captures per request."""
+    return DynamicCorrectiveRetriever(delegate=get_crag_delegate())
+
+
+@lru_cache(maxsize=1)
 def get_embedding_client() -> EmbeddingClient:
     return OpenAIEmbeddingClient(
         client=get_openai_client(),
@@ -296,6 +413,10 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             corpus_version=config.corpus_version,
             hyde_enabled=config.hyde_enabled,
             hyde_rollout_percentage=config.hyde_rollout_percentage,
+            crag_enabled=config.crag_enabled,
+            crag_rollout_percentage=config.crag_rollout_percentage,
+            crag_web_enabled=config.crag_web_enabled,
+            crag_shadow_enabled=config.crag_shadow_enabled,
         )
     )
 
@@ -381,6 +502,7 @@ def get_rag_service() -> RAGService:
         semantic_cache=get_semantic_query_cache(),
         metrics=get_rag_metrics_service(),
         query_transformer=get_dynamic_hyde_transformer(),
+        corrective_retriever=get_dynamic_crag(),
         config_store=get_rag_runtime_config_store(),
     )
 
@@ -530,4 +652,10 @@ def get_rag_ops_controller(
     reranker: DynamicReranker = Depends(get_dynamic_reranker),
     metrics: RagMetricsService = Depends(get_rag_metrics_service),
 ) -> RagOpsController:
-    return RagOpsController(repository, config_store, reranker, metrics)
+    return RagOpsController(
+        repository,
+        config_store,
+        reranker,
+        metrics,
+        crag_web_available=get_regulatory_web_retriever() is not None,
+    )

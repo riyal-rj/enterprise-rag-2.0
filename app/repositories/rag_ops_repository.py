@@ -17,14 +17,17 @@ from psycopg2.extensions import cursor as PgCursor
 from psycopg2.extras import Json
 
 from app.core.db import PostgresConnectionPool
+from app.core.exceptions import InvalidRagOpsConfigError
 from app.models.rag_ops import RagOpsAuditEntry, RagOpsConfig
 
 _CONFIG_COLUMNS = (
     "id, reranking_enabled, reranker_backend, reranker_rollout_percentage, "
     "semantic_cache_enabled, semantic_cache_threshold, hyde_enabled, "
-    "hyde_rollout_percentage, emergency_disabled, "
+    "hyde_rollout_percentage, crag_enabled, crag_rollout_percentage, "
+    "crag_web_enabled, emergency_disabled, "
     "emergency_disabled_reason, emergency_disabled_at, emergency_disabled_by, "
-    "corpus_version, last_cache_invalidated_at, updated_at, updated_by"
+    "corpus_version, last_cache_invalidated_at, updated_at, updated_by, "
+    "crag_shadow_enabled"
 )
 
 _DIFF_FIELDS = (
@@ -35,6 +38,10 @@ _DIFF_FIELDS = (
     "semantic_cache_threshold",
     "hyde_enabled",
     "hyde_rollout_percentage",
+    "crag_enabled",
+    "crag_rollout_percentage",
+    "crag_web_enabled",
+    "crag_shadow_enabled",
 )
 
 
@@ -55,6 +62,10 @@ class RagOpsRepository(Protocol):
         semantic_cache_threshold: float | None = None,
         hyde_enabled: bool | None = None,
         hyde_rollout_percentage: int | None = None,
+        crag_enabled: bool | None = None,
+        crag_rollout_percentage: int | None = None,
+        crag_web_enabled: bool | None = None,
+        crag_shadow_enabled: bool | None = None,
     ) -> RagOpsConfig:
         """Partial update: ``None`` fields are left unchanged. Writes an
         audit row iff at least one field actually changed value."""
@@ -103,6 +114,10 @@ class PostgresRagOpsRepository:
         semantic_cache_threshold: float | None = None,
         hyde_enabled: bool | None = None,
         hyde_rollout_percentage: int | None = None,
+        crag_enabled: bool | None = None,
+        crag_rollout_percentage: int | None = None,
+        crag_web_enabled: bool | None = None,
+        crag_shadow_enabled: bool | None = None,
     ) -> RagOpsConfig:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -116,6 +131,27 @@ class PostgresRagOpsRepository:
                     raise RuntimeError("rag_ops_config has no row - run migrations")
                 old = _row_to_config(old_row)
 
+                # Revalidate the merged state while the singleton row is
+                # locked (FOR UPDATE above) - the controller's own
+                # pre-persistence check (see
+                # RagOpsController.update_config) reads an unlocked snapshot
+                # and so cannot see a concurrent writer's in-flight change;
+                # this is the actual backstop against two racing admin
+                # requests each individually valid but jointly leaving
+                # crag_web_enabled/crag_shadow_enabled=True with
+                # crag_enabled=False.
+                next_crag_enabled = old.crag_enabled if crag_enabled is None else crag_enabled
+                next_crag_web_enabled = (
+                    old.crag_web_enabled if crag_web_enabled is None else crag_web_enabled
+                )
+                next_crag_shadow_enabled = (
+                    old.crag_shadow_enabled if crag_shadow_enabled is None else crag_shadow_enabled
+                )
+                if next_crag_web_enabled and not next_crag_enabled:
+                    raise InvalidRagOpsConfigError("crag_web_enabled requires crag_enabled")
+                if next_crag_shadow_enabled and not next_crag_enabled:
+                    raise InvalidRagOpsConfigError("crag_shadow_enabled requires crag_enabled")
+
                 cur.execute(
                     f"""
                     UPDATE rag_ops_config SET
@@ -126,6 +162,10 @@ class PostgresRagOpsRepository:
                         semantic_cache_threshold = COALESCE(%s, semantic_cache_threshold),
                         hyde_enabled = COALESCE(%s, hyde_enabled),
                         hyde_rollout_percentage = COALESCE(%s, hyde_rollout_percentage),
+                        crag_enabled = COALESCE(%s, crag_enabled),
+                        crag_rollout_percentage = COALESCE(%s, crag_rollout_percentage),
+                        crag_web_enabled = COALESCE(%s, crag_web_enabled),
+                        crag_shadow_enabled = COALESCE(%s, crag_shadow_enabled),
                         updated_at = now(),
                         updated_by = %s
                     WHERE id = 1
@@ -139,6 +179,10 @@ class PostgresRagOpsRepository:
                         semantic_cache_threshold,
                         hyde_enabled,
                         hyde_rollout_percentage,
+                        crag_enabled,
+                        crag_rollout_percentage,
+                        crag_web_enabled,
+                        crag_shadow_enabled,
                         actor,
                     ),
                 )
@@ -279,12 +323,16 @@ def _row_to_config(row: tuple[Any, ...]) -> RagOpsConfig:
         semantic_cache_threshold=row[5],
         hyde_enabled=row[6],
         hyde_rollout_percentage=row[7],
-        emergency_disabled=row[8],
-        emergency_disabled_reason=row[9],
-        emergency_disabled_at=row[10],
-        emergency_disabled_by=row[11],
-        corpus_version=row[12],
-        last_cache_invalidated_at=row[13],
-        updated_at=row[14],
-        updated_by=row[15],
+        crag_enabled=row[8],
+        crag_rollout_percentage=row[9],
+        crag_web_enabled=row[10],
+        emergency_disabled=row[11],
+        emergency_disabled_reason=row[12],
+        emergency_disabled_at=row[13],
+        emergency_disabled_by=row[14],
+        corpus_version=row[15],
+        last_cache_invalidated_at=row[16],
+        updated_at=row[17],
+        updated_by=row[18],
+        crag_shadow_enabled=row[19],
     )

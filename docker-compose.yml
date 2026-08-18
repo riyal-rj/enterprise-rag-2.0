@@ -61,6 +61,30 @@ services:
       - HYDE_MAX_COMPLETION_TOKENS=${HYDE_MAX_COMPLETION_TOKENS:-600}
       - HYDE_TIMEOUT_SECONDS=${HYDE_TIMEOUT_SECONDS:-12}
       - HYDE_MAX_ATTEMPTS=${HYDE_MAX_ATTEMPTS:-2}
+      # CRAG tuning (overridable via host .env) - enabled/rollout%/web-enabled
+      # live in the rag_ops_config DB row, not here (see
+      # app/seed/migrations/008_add_crag_rag_ops_config.sql); only static
+      # budgets and the web-correction domain allowlist are deployment
+      # settings.
+      - CRAG_GRADER_MODEL=${CRAG_GRADER_MODEL:-gpt-4o-mini}
+      - CRAG_PROMPT_VERSION=${CRAG_PROMPT_VERSION:-bank-policy-v1}
+      - CRAG_RELEVANCE_THRESHOLD=${CRAG_RELEVANCE_THRESHOLD:-0.70}
+      - CRAG_AMBIGUOUS_THRESHOLD=${CRAG_AMBIGUOUS_THRESHOLD:-0.50}
+      - CRAG_MAX_CHUNKS_TO_GRADE=${CRAG_MAX_CHUNKS_TO_GRADE:-8}
+      - CRAG_MAX_DOCUMENTS_TO_REFINE=${CRAG_MAX_DOCUMENTS_TO_REFINE:-5}
+      - CRAG_MAX_SENTENCES_PER_DOCUMENT=${CRAG_MAX_SENTENCES_PER_DOCUMENT:-80}
+      - CRAG_GRADER_TIMEOUT_SECONDS=${CRAG_GRADER_TIMEOUT_SECONDS:-10}
+      - CRAG_REFINER_TIMEOUT_SECONDS=${CRAG_REFINER_TIMEOUT_SECONDS:-10}
+      - CRAG_MAX_COMPLETION_TOKENS=${CRAG_MAX_COMPLETION_TOKENS:-800}
+      - CRAG_MAX_ATTEMPTS=${CRAG_MAX_ATTEMPTS:-2}
+      - CRAG_MIN_EVIDENCE_CHUNKS=${CRAG_MIN_EVIDENCE_CHUNKS:-1}
+      - CRAG_POLICY_VERSION=${CRAG_POLICY_VERSION:-crag-policy-v1}
+      # Approved regulatory-web domains for CRAG's public-correction path -
+      # empty by default (web correction stays unavailable, see
+      # app.api.deps.get_regulatory_web_retriever) until Legal/Compliance
+      # approves a real allowlist for this deployment.
+      - CRAG_ALLOWED_REGULATORY_DOMAINS=${CRAG_ALLOWED_REGULATORY_DOMAINS:-}
+      - CRAG_WEB_MAX_RESULTS=${CRAG_WEB_MAX_RESULTS:-5}
 
     depends_on:
       postgres:

@@ -61,6 +61,9 @@ def _config(*, rollout_percentage: int = 100, emergency_disabled: bool = False) 
         corpus_version=1,
         hyde_enabled=True,
         hyde_rollout_percentage=rollout_percentage,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
 
@@ -126,6 +129,9 @@ def test_hyde_and_reranker_cohorts_are_not_forced_identical_by_a_shared_salt() -
         corpus_version=1,
         hyde_enabled=True,
         hyde_rollout_percentage=50,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
     )
 
     questions = [f"question {i}" for i in range(50)]
