@@ -9,9 +9,10 @@ doesn't newly depend on a running Postgres container.
 Exercises what a hand-rolled fake repository can't: the actual
 ``SELECT ... FOR UPDATE`` revalidation in
 ``PostgresRagOpsRepository.update_config`` (see app.repositories.rag_ops_repository)
-and the ``rag_ops_config_crag_web_requires_crag_check`` CHECK constraint
-added in migration 008 - the final backstop against any writer, including
-one that bypasses the application layer entirely.
+and the ``rag_ops_config_crag_web_requires_crag_check``/
+``rag_ops_config_crag_shadow_requires_crag_check`` CHECK constraints added in
+migrations 008/009 - the final backstop against any writer, including one
+that bypasses the application layer entirely.
 
 Run explicitly once the local Postgres container (see docker-compose.yml)
 is up and migrated:
@@ -60,7 +61,8 @@ def repository():
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE rag_ops_config SET crag_enabled = FALSE, crag_web_enabled = FALSE, "
-            "crag_rollout_percentage = 0, updated_by = %s WHERE id = 1",
+            "crag_shadow_enabled = FALSE, crag_rollout_percentage = 0, updated_by = %s "
+            "WHERE id = 1",
             (actor,),
         )
         conn.commit()
@@ -68,7 +70,7 @@ def repository():
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE rag_ops_config SET crag_enabled = FALSE, crag_web_enabled = FALSE, "
-            "crag_rollout_percentage = 0 WHERE id = 1"
+            "crag_shadow_enabled = FALSE, crag_rollout_percentage = 0 WHERE id = 1"
         )
         conn.commit()
     pool.close()
@@ -116,12 +118,28 @@ def test_valid_transition_enabling_both_together_succeeds(repository) -> None:  
     assert config.crag_web_enabled is True
 
 
-def test_db_constraint_rejects_invalid_state_bypassing_the_application_layer(repository) -> None:  # noqa: ANN001
+def test_db_constraint_rejects_invalid_web_state_bypassing_the_application_layer(
+    repository,  # noqa: ANN001
+) -> None:
     _, pool = repository
 
     with pool.connection() as conn, conn.cursor() as cur:
         with pytest.raises(psycopg2.errors.CheckViolation):
             cur.execute(
                 "UPDATE rag_ops_config SET crag_enabled = FALSE, crag_web_enabled = TRUE WHERE id = 1"
+            )
+        conn.rollback()
+
+
+def test_db_constraint_rejects_invalid_shadow_state_bypassing_the_application_layer(
+    repository,  # noqa: ANN001
+) -> None:
+    _, pool = repository
+
+    with pool.connection() as conn, conn.cursor() as cur:
+        with pytest.raises(psycopg2.errors.CheckViolation):
+            cur.execute(
+                "UPDATE rag_ops_config SET crag_enabled = FALSE, crag_shadow_enabled = TRUE "
+                "WHERE id = 1"
             )
         conn.rollback()

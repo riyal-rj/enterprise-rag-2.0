@@ -71,7 +71,11 @@ class TimeoutSession(requests.Session):
         self._timeout = (connect_timeout, read_timeout)
 
     def request(self, method: str, url: str, **kwargs: object) -> requests.Response:  # type: ignore[override]
-        kwargs.setdefault("timeout", self._timeout)
+        # Force the override, not setdefault(): the Tavily SDK explicitly
+        # passes its own timeout=60 on every call, so a "fill in if absent"
+        # merge would leave that value in place and silently never apply
+        # connect_timeout_seconds/read_timeout_seconds at all.
+        kwargs["timeout"] = self._timeout
         return super().request(method, url, **kwargs)  # type: ignore[arg-type]
 
 

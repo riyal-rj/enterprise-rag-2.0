@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import requests
+
 from app.rag_services.crag.web_retriever import (
     KeywordRegulatoryScopePolicy,
     TavilyRegulatoryWebRetriever,
+    TimeoutSession,
     _normalize_external_text,
     _validated_canonical_url,
 )
@@ -18,6 +21,28 @@ def test_search_depth_is_passed_to_tavily() -> None:
         search_depth="advanced",
     )
     assert retriever.cache_namespace.startswith("tavily:depth=advanced")
+
+
+def test_timeout_session_overrides_a_default_timeout_the_caller_already_set(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """Regression: the Tavily SDK explicitly passes its own timeout=60 on
+    every call - kwargs.setdefault("timeout", ...) is therefore a no-op
+    (the key is already present) and connect_timeout_seconds/
+    read_timeout_seconds would silently never apply. The configured tuple
+    must win regardless of what the caller already put in kwargs."""
+    captured: dict[str, object] = {}
+
+    def fake_request(self: requests.Session, method: str, url: str, **kwargs: object) -> str:
+        captured.update(kwargs)
+        return "response"
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+
+    session = TimeoutSession(connect_timeout=3.0, read_timeout=8.0)
+    session.request("POST", "https://api.tavily.com/search", timeout=60)
+
+    assert captured["timeout"] == (3.0, 8.0)
 
 
 def _retriever(**overrides: object) -> TavilyRegulatoryWebRetriever:
