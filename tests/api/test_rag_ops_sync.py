@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
@@ -140,6 +140,46 @@ async def test_poll_reapplies_when_config_changes_on_a_later_poll(
     await poller._poll_once()
 
     assert config_store.current.reranking_enabled is True
+
+
+async def test_poll_applies_all_three_crag_fields_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_store = RagRuntimeConfigStore()
+    updated_at = datetime.now(UTC)
+    repository = _FakeRepository(
+        RagOpsConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+            crag_enabled=True,
+            crag_rollout_percentage=33,
+            crag_web_enabled=True,
+            emergency_disabled=False,
+            emergency_disabled_reason=None,
+            emergency_disabled_at=None,
+            emergency_disabled_by=None,
+            corpus_version=1,
+            last_cache_invalidated_at=None,
+            updated_at=updated_at,
+            updated_by=None,
+        )
+    )
+
+    monkeypatch.setattr(rag_ops_sync, "get_rag_runtime_config_store", lambda: config_store)
+    monkeypatch.setattr(rag_ops_sync, "get_rag_ops_repository", lambda: repository)
+
+    poller = rag_ops_sync.RagOpsConfigPoller()
+    await poller._poll_once()
+
+    current = config_store.current
+    assert current.crag_enabled is True
+    assert current.crag_rollout_percentage == 33
+    assert current.crag_web_enabled is True
 
 
 async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_poll(

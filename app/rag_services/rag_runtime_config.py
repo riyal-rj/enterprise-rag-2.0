@@ -55,6 +55,11 @@ class RagRuntimeConfig:
     crag_enabled: bool
     crag_rollout_percentage: int
     crag_web_enabled: bool
+    # Observe-only rollout stage, ahead of a real (web-eligible) treatment
+    # rollout - see DynamicCorrectiveRetriever.plan and RAGService.answer's
+    # "shadow" cohort handling. Defaulted so every pre-existing construction
+    # site (deps.py, RagOpsController, tests) keeps working unchanged.
+    crag_shadow_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.reranker_rollout_percentage <= 100:
@@ -69,6 +74,8 @@ class RagRuntimeConfig:
             raise ValueError("crag_rollout_percentage must be between 0 and 100")
         if self.crag_web_enabled and not self.crag_enabled:
             raise ValueError("crag_web_enabled requires crag_enabled")
+        if self.crag_shadow_enabled and not self.crag_enabled:
+            raise ValueError("crag_shadow_enabled requires crag_enabled")
 
 
 _DEFAULT_CONFIG = RagRuntimeConfig(

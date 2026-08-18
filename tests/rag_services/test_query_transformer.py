@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from app.rag_services.query_transformer import (
     FailOpenQueryTransformer,

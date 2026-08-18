@@ -68,6 +68,23 @@ class CRAGMetrics(BaseModel):
     emergency_bypasses: int
 
 
+class CRAGShadowMetrics(BaseModel):
+    """Shadow-cohort CRAG performance - never served to a real user, tracked
+    separately from ``CRAGMetrics`` so a shadow regression is visible
+    without being confused with what traffic is actually experiencing."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    correct_count: int
+    ambiguous_count: int
+    incorrect_count: int
+    fallback_rate: float
+    abstention_rate: float
+    web_use_rate: float
+    usage_tokens_total: int
+
+
 class RagOpsStatusResponse(BaseModel):
     """Everything the RAG Operations panel displays: live config, rolled-up
     metrics, and emergency-disable state."""
@@ -89,7 +106,9 @@ class RagOpsStatusResponse(BaseModel):
     crag_rollout_percentage: int
     crag_web_enabled: bool
     crag_web_available: bool
+    crag_shadow_enabled: bool
     crag_metrics: CRAGMetrics
+    crag_shadow_metrics: CRAGShadowMetrics
 
     emergency_disabled: bool
     emergency_disabled_reason: str | None
@@ -117,6 +136,7 @@ class RagOpsConfigUpdateRequest(BaseModel):
     crag_enabled: bool | None = None
     crag_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     crag_web_enabled: bool | None = None
+    crag_shadow_enabled: bool | None = None
     reason: str | None = Field(default=None, max_length=500)
 
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import pytest
 
@@ -87,3 +87,25 @@ def test_store_default_construction_uses_a_safe_default_snapshot() -> None:
     assert config.semantic_cache_enabled is False
     assert config.hyde_enabled is False
     assert config.emergency_disabled is False
+    assert config.crag_shadow_enabled is False
+
+
+def test_crag_shadow_enabled_defaults_to_false_for_existing_call_sites() -> None:
+    config = RagRuntimeConfig(**_valid_kwargs())  # type: ignore[arg-type]
+
+    assert config.crag_shadow_enabled is False
+
+
+def test_crag_shadow_enabled_requires_crag_enabled() -> None:
+    with pytest.raises(ValueError, match="crag_shadow_enabled"):
+        RagRuntimeConfig(
+            **_valid_kwargs(crag_enabled=False, crag_shadow_enabled=True)  # type: ignore[arg-type]
+        )
+
+
+def test_crag_shadow_enabled_is_accepted_alongside_crag_enabled() -> None:
+    config = RagRuntimeConfig(
+        **_valid_kwargs(crag_enabled=True, crag_shadow_enabled=True)  # type: ignore[arg-type]
+    )
+
+    assert config.crag_shadow_enabled is True

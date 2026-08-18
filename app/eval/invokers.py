@@ -236,7 +236,22 @@ class ServiceInvoker:
                     f"bypass_reason={crag.bypass_reason!r})"
                 )
 
+        if flags.enable_crag and not response.metadata.final_evidence:
+            # A CRAG-enabled case that produced no final evidence would
+            # otherwise silently score RAGAS against an empty context list -
+            # indistinguishable from "CRAG correctly found nothing" versus
+            # "final_evidence metadata was never populated". Fail loudly
+            # instead.
+            raise EvaluationPipelineError(f"{flags.name}: CRAG returned no final-evidence metadata")
+
+        # RAGAS must score exactly the context the answer model saw - CRAG's
+        # final evidence when CRAG ran, never the pre-CRAG retrieved/
+        # reranked chunks (see app.rag_services.rag_service.RAGService.answer).
+        # A web item's canonical URL is preferred as `source` so its
+        # ranked_sources entry matches ChatResponse.sources (see
+        # RAGService._public_source_identifier).
         chunks = [
-            RetrievedChunk(text=c.text, source=c.source) for c in response.metadata.retrieved_chunks
+            RetrievedChunk(text=item.text, source=item.canonical_url or item.source)
+            for item in response.metadata.final_evidence
         ]
         return InvokeResponse(answer=response.answer, sources=response.sources), chunks

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.dynamic_reranker import DynamicReranker

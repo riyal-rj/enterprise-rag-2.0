@@ -17,6 +17,7 @@ from app.repositories.vector_repository import VectorRepository
 from app.schemas.chat import (
     ChatResponse,
     CRAGMetadata,
+    EvidencePreview,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -75,7 +76,16 @@ def _response(
     *,
     hyde: HyDEMetadata | None = None,
     crag: CRAGMetadata | None = None,
+    final_evidence: list[EvidencePreview] | None = None,
 ) -> ChatResponse:
+    # RAGService always populates final_evidence from CRAG's outcome - even
+    # identity-wrapped local chunks when CRAG never actually ran (see
+    # PlannedNoOpCorrectiveRetriever) - so a realistic fixture must too, or
+    # ServiceInvoker._call_pipeline's final-evidence chunks (see
+    # app.eval.invokers) silently diverge from retrieved_chunks in tests.
+    default_final_evidence = [
+        EvidencePreview(text="hi", source="a.pdf", score=0.9, page_number=None, origin="policy")
+    ]
     return ChatResponse(
         answer=answer,
         sources=["a.pdf"],
@@ -89,6 +99,7 @@ def _response(
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
+            final_evidence=(default_final_evidence if final_evidence is None else final_evidence),
         ),
         conversation_id=1,
     )

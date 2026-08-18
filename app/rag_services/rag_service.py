@@ -51,9 +51,14 @@ from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
 from app.rag_services.crag import (
+    CRAGOutcome,
+    CRAGTelemetry,
     EvidenceChunk,
+    EvidenceOrigin,
+    NoOpCRAGTelemetry,
     PlannedCorrectiveRetriever,
     PlannedNoOpCorrectiveRetriever,
+    local_evidence,
 )
 from app.rag_services.embedding_fusion import mean_pool_and_normalize
 from app.rag_services.query_transformer import (
@@ -69,6 +74,7 @@ from app.repositories.semantic_cache_repository import SemanticQueryCache
 from app.schemas.chat import (
     ChatResponse,
     CRAGMetadata,
+    EvidencePreview,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -107,6 +113,17 @@ class _RagServiceMetricsRecorder(Protocol):
         usage_tokens: int,
     ) -> None: ...
     def record_crag_bypass(self, *, reason: str) -> None: ...
+    def record_crag_shadow_decision(
+        self,
+        *,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        evidence_count: int,
+        duration_ms: float,
+        usage_tokens: int,
+    ) -> None: ...
 
 
 class _NoOpRagServiceMetrics:
@@ -136,6 +153,19 @@ class _NoOpRagServiceMetrics:
         pass
 
     def record_crag_bypass(self, *, reason: str) -> None:
+        pass
+
+    def record_crag_shadow_decision(
+        self,
+        *,
+        decision: str | None,
+        fallback: bool,
+        abstain: bool,
+        web_used: bool,
+        evidence_count: int,
+        duration_ms: float,
+        usage_tokens: int,
+    ) -> None:
         pass
 
 
@@ -238,6 +268,7 @@ class RAGService:
         corrective_retriever: PlannedCorrectiveRetriever | None = None,
         crag_enabled: bool = False,
         config_store: RagRuntimeConfigStore | None = None,
+        crag_telemetry: CRAGTelemetry | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -267,6 +298,12 @@ class RAGService:
         self._metrics = metrics or _NoOpRagServiceMetrics()
         self._query_transformer = query_transformer or PlannedNoOpQueryTransformer()
         self._corrective_retriever = corrective_retriever or PlannedNoOpCorrectiveRetriever()
+        # Fleet-wide (cross-worker/cross-process) exporter - see
+        # app.rag_services.crag.telemetry. Distinct from `metrics` above
+        # (process-local, powers the admin panel): this is the seam for a
+        # real Prometheus/OpenTelemetry backend, and is a no-op unless a
+        # deployment actually wires one in.
+        self._crag_telemetry = crag_telemetry or NoOpCRAGTelemetry()
         # A caller that cares about atomic cross-object config application
         # (app.api.deps.get_rag_service) passes the same config_store this
         # process's DynamicReranker/DynamicQueryTransformer read from (see
@@ -290,6 +327,7 @@ class RAGService:
                 crag_enabled=crag_enabled,
                 crag_rollout_percentage=100,
                 crag_web_enabled=False,
+                crag_shadow_enabled=False,
             )
         )
 
@@ -526,56 +564,132 @@ class RAGService:
         # ``local_evidence`` - so evidence-context construction below never
         # needs to branch on whether CRAG actually ran.
         crag_started = time.perf_counter()
-        crag_outcome = self._corrective_retriever.execute(question, chunks, crag_plan)
-        if crag_plan.cohort == "treatment":
-            crag_outcome = replace(
-                crag_outcome, duration_ms=(time.perf_counter() - crag_started) * 1000
+        if crag_plan.cohort == "shadow":
+            # Observe-only: the real corrective retriever actually runs (for
+            # measurement - see DynamicCorrectiveRetriever.execute treating
+            # "shadow" like "treatment"), but its evidence is never served.
+            # A shadow miss/regression must never change what a real user
+            # sees, and web must stay impossible in shadow regardless of
+            # crag_web_enabled - crag_plan.allow_web is always False here
+            # (see DynamicCorrectiveRetriever.plan).
+            shadow_outcome = self._corrective_retriever.execute(question, chunks, crag_plan)
+            shadow_outcome = replace(
+                shadow_outcome, duration_ms=(time.perf_counter() - crag_started) * 1000
             )
-            self._metrics.record_crag_outcome(
-                duration_ms=crag_outcome.duration_ms,
-                decision=(crag_outcome.decision.value if crag_outcome.decision else None),
-                fallback=crag_outcome.fallback,
-                abstain=crag_outcome.abstain,
-                web_used=crag_outcome.web_used,
-                usage_tokens=crag_outcome.usage_tokens,
+            self._metrics.record_crag_shadow_decision(
+                decision=(shadow_outcome.decision.value if shadow_outcome.decision else None),
+                fallback=shadow_outcome.fallback,
+                abstain=shadow_outcome.abstain,
+                web_used=shadow_outcome.web_used,
+                evidence_count=len(shadow_outcome.evidence),
+                duration_ms=shadow_outcome.duration_ms,
+                usage_tokens=shadow_outcome.usage_tokens,
             )
-            log_fields = {
-                "decision": (crag_outcome.decision.value if crag_outcome.decision else None),
-                "applied": crag_outcome.applied,
-                "fallback": crag_outcome.fallback,
-                "abstain": crag_outcome.abstain,
-                "web_used": crag_outcome.web_used,
-                "evidence_count": len(crag_outcome.evidence),
-                "duration_ms": round(crag_outcome.duration_ms, 2),
-            }
-            if crag_outcome.fallback:
-                logger.warning("rag.crag_fallback_applied", extra=log_fields)
-            else:
-                logger.debug("rag.crag_applied", extra=log_fields)
-        elif crag_plan.bypass_reason in ("rollout", "emergency_disabled"):
-            # "disabled" (feature toggle fully off) isn't a canary bucket
-            # worth counting - only rollout-control and emergency bypasses
-            # are, matching HyDE's identical distinction above.
-            self._metrics.record_crag_bypass(reason=crag_plan.bypass_reason)
+            self._crag_telemetry.record_attempt(
+                cohort=crag_plan.cohort,
+                decision=(shadow_outcome.decision.value if shadow_outcome.decision else None),
+                fallback=shadow_outcome.fallback,
+                abstain=shadow_outcome.abstain,
+                web_used=shadow_outcome.web_used,
+                duration_ms=shadow_outcome.duration_ms,
+                usage_tokens=shadow_outcome.usage_tokens,
+                served=False,
+            )
+            logger.debug(
+                "rag.crag_shadow_observed",
+                extra={
+                    "decision": (
+                        shadow_outcome.decision.value if shadow_outcome.decision else None
+                    ),
+                    "applied": shadow_outcome.applied,
+                    "fallback": shadow_outcome.fallback,
+                    "abstain": shadow_outcome.abstain,
+                    "web_used": shadow_outcome.web_used,
+                    "evidence_count": len(shadow_outcome.evidence),
+                    "duration_ms": round(shadow_outcome.duration_ms, 2),
+                },
+            )
+            crag_outcome = CRAGOutcome(
+                evidence=local_evidence(chunks),
+                decision=None,
+                applied=False,
+                bypass_reason="shadow_not_served",
+            )
+        else:
+            crag_outcome = self._corrective_retriever.execute(question, chunks, crag_plan)
+            if crag_plan.cohort == "treatment":
+                crag_outcome = replace(
+                    crag_outcome, duration_ms=(time.perf_counter() - crag_started) * 1000
+                )
+                self._metrics.record_crag_outcome(
+                    duration_ms=crag_outcome.duration_ms,
+                    decision=(crag_outcome.decision.value if crag_outcome.decision else None),
+                    fallback=crag_outcome.fallback,
+                    abstain=crag_outcome.abstain,
+                    web_used=crag_outcome.web_used,
+                    usage_tokens=crag_outcome.usage_tokens,
+                )
+                self._crag_telemetry.record_attempt(
+                    cohort=crag_plan.cohort,
+                    decision=(crag_outcome.decision.value if crag_outcome.decision else None),
+                    fallback=crag_outcome.fallback,
+                    abstain=crag_outcome.abstain,
+                    web_used=crag_outcome.web_used,
+                    duration_ms=crag_outcome.duration_ms,
+                    usage_tokens=crag_outcome.usage_tokens,
+                    served=True,
+                )
+                log_fields = {
+                    "decision": (crag_outcome.decision.value if crag_outcome.decision else None),
+                    "applied": crag_outcome.applied,
+                    "fallback": crag_outcome.fallback,
+                    "abstain": crag_outcome.abstain,
+                    "web_used": crag_outcome.web_used,
+                    "evidence_count": len(crag_outcome.evidence),
+                    "duration_ms": round(crag_outcome.duration_ms, 2),
+                }
+                if crag_outcome.fallback:
+                    logger.warning("rag.crag_fallback_applied", extra=log_fields)
+                else:
+                    logger.debug("rag.crag_applied", extra=log_fields)
+            elif crag_plan.bypass_reason in ("rollout", "emergency_disabled"):
+                # "disabled" (feature toggle fully off) isn't a canary
+                # bucket worth counting - only rollout-control and
+                # emergency bypasses are, matching HyDE's identical
+                # distinction above.
+                self._metrics.record_crag_bypass(reason=crag_plan.bypass_reason)
 
         # Abstention is a deterministic response, never an LLM guess filling
         # an evidence gap - see module docstring's non-negotiable #4 and
         # ``ProductionCorrectiveRetriever.correct``'s internal-policy branch.
         if crag_outcome.abstain:
-            answer_text = (
-                "The supplied approved evidence is insufficient to determine this point. "
-                "No external source was used to fill the gap."
-            )
+            if crag_outcome.web_used:
+                answer_text = (
+                    "The available approved internal and regulatory evidence "
+                    "is insufficient to determine this point."
+                )
+            else:
+                answer_text = (
+                    "The supplied approved internal evidence is insufficient "
+                    "to determine this point. No external evidence was used."
+                )
         else:
             user_message = (
                 f"{self._build_evidence_context(crag_outcome.evidence)}\n\nQuestion: {question}"
             )
             answer_text = self._llm_client.generate(_SYSTEM_PROMPT, user_message).text
 
+        # Confidence and claim-checking must see exactly what the answer LLM
+        # saw - CRAG's final evidence, not the pre-CRAG retrieved/reranked
+        # `chunks` - or a corrected/web-augmented answer would be scored
+        # against evidence it was never actually generated from.
+        final_evidence_chunks = self._evidence_as_retrieved_chunks(crag_outcome.evidence)
+
         confidence = compute_confidence_breakdown(
-            chunks,
+            final_evidence_chunks,
             answer_text,
             retrieval_mode=strategy.name,
+            # Preserve original retrieval-strength calculation separately.
             retrieval_ordered_chunks=retrieval_ordered_top_k,
         )
         logger.debug(
@@ -590,16 +704,25 @@ class RAGService:
             },
         )
 
-        flagged_claims = find_unsupported_claims(answer_text, chunks)
+        flagged_claims = find_unsupported_claims(answer_text, final_evidence_chunks)
         if flagged_claims:
+            # Never log raw questions or unsupported claim text - both can
+            # contain sensitive policy/customer detail.
             logger.warning(
                 "rag.unsupported_claim_flagged",
-                extra={"question": question, "flagged_claims": flagged_claims},
+                extra={
+                    "flagged_claim_count": len(flagged_claims),
+                    "crag_decision": (
+                        crag_outcome.decision.value if crag_outcome.decision is not None else None
+                    ),
+                },
             )
 
         response = ChatResponse(
             answer=answer_text,
-            sources=sorted({item.source for item in crag_outcome.evidence}),
+            sources=sorted(
+                {self._public_source_identifier(item) for item in crag_outcome.evidence}
+            ),
             confidence=confidence.total,
             metadata=ResponseMetadata(
                 route="rag",
@@ -637,6 +760,7 @@ class RAGService:
                     bypass_reason=crag_outcome.bypass_reason,
                 ),
                 retrieved_chunks=self._build_chunk_previews(chunks, rerank_items),
+                final_evidence=self._build_evidence_previews(crag_outcome.evidence),
                 flagged_claims=flagged_claims,
             ),
         )
@@ -694,6 +818,48 @@ class RAGService:
             )
             for c in chunks
         ]
+
+    @staticmethod
+    def _build_evidence_previews(
+        evidence: tuple[EvidenceChunk, ...],
+    ) -> list[EvidencePreview]:
+        return [
+            EvidencePreview(
+                text=item.text,
+                source=item.source,
+                page_number=item.page_number,
+                score=item.retrieval_score,
+                origin=item.origin.value,
+                canonical_url=item.canonical_url,
+                retrieved_at_iso=item.retrieved_at_iso,
+            )
+            for item in evidence
+        ]
+
+    @staticmethod
+    def _evidence_as_retrieved_chunks(
+        evidence: tuple[EvidenceChunk, ...],
+    ) -> list[RetrievedChunk]:
+        """CRAG's final evidence, reshaped for the confidence/claim-checking
+        code paths that only know about ``RetrievedChunk`` - preferring a
+        web item's canonical URL as its ``source`` so those downstream
+        checks (and the eval harness, see ``app.eval.invokers``) see the
+        same trusted identifier the API response does."""
+        return [
+            RetrievedChunk(
+                text=item.text,
+                source=item.canonical_url or item.source,
+                score=item.retrieval_score,
+                page_number=item.page_number,
+            )
+            for item in evidence
+        ]
+
+    @staticmethod
+    def _public_source_identifier(item: EvidenceChunk) -> str:
+        if item.origin is EvidenceOrigin.REGULATORY_WEB and item.canonical_url is not None:
+            return item.canonical_url
+        return item.source
 
     def _build_evidence_context(self, evidence: tuple[EvidenceChunk, ...]) -> str:
         """Render CRAG-approved evidence for the answer LLM.

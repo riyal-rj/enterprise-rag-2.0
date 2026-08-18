@@ -244,6 +244,8 @@ def get_regulatory_web_retriever() -> WebRetriever | None:
     unavailable (rejected by ``RagOpsController.update_config``) until both
     are set for this deployment."""
     settings = get_settings().external_apis
+    if not settings.crag_web_guardrails_ready:
+        return None
     api_key = settings.tavily_api_key.get_secret_value()
     domains = settings.allowed_regulatory_domains
     if not api_key or not domains:
@@ -252,6 +254,10 @@ def get_regulatory_web_retriever() -> WebRetriever | None:
         api_key=api_key,
         allowed_domains=domains,
         max_results=settings.crag_web_max_results,
+        max_content_chars=settings.crag_web_max_content_chars,
+        max_total_chars=settings.crag_web_total_content_chars,
+        connect_timeout_seconds=settings.crag_web_connect_timeout_seconds,
+        read_timeout_seconds=settings.crag_web_read_timeout_seconds,
     )
 
 
@@ -266,7 +272,7 @@ def get_crag_delegate() -> CorrectiveRetriever:
     return ProductionCorrectiveRetriever(
         grader=get_crag_grader(),
         refiner=get_crag_refiner(),
-        scope_policy=KeywordRegulatoryScopePolicy(),
+        scope_policy=KeywordRegulatoryScopePolicy(policy_version=settings.crag_policy_version),
         web_retriever=get_regulatory_web_retriever(),
         min_evidence_chunks=settings.crag_min_evidence_chunks,
     )
@@ -410,6 +416,7 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             crag_enabled=config.crag_enabled,
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
+            crag_shadow_enabled=config.crag_shadow_enabled,
         )
     )
 

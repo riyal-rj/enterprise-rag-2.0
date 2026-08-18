@@ -56,7 +56,7 @@ eval-hyde:
 	uv run python -m app.eval.run_ragas --profile hybrid+rerank+hyde --filter hyde
 
 eval-crag:
-	uv run python -m app.eval.run_ragas --profile hybrid+rerank+crag --filter crag
+	uv run python -m app.eval.run_ragas --profile hybrid+rerank+crag --filter crag --fail-on-skip
 
 eval-all:
 	uv run python -m app.eval.run_ragas --profile all

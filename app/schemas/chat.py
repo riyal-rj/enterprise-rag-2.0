@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 RetrievalMode = Literal["dense", "hybrid"]
+EvidenceOriginValue = Literal["policy", "regulatory_web"]
 
 
 class ChatRequest(BaseModel):
@@ -43,6 +44,25 @@ class RetrievedChunkPreview(BaseModel):
     page_number: int | None = None
     rerank_score: float | None = None
     original_rank: int | None = None
+
+
+class EvidencePreview(BaseModel):
+    """Final evidence actually supplied to the answer model.
+
+    Distinct from ``RetrievedChunkPreview``: that field reflects raw
+    retrieval/reranking output, while this reflects CRAG's post-grading,
+    post-refinement, possibly web-augmented evidence set - the exact
+    context the answer LLM saw. ``canonical_url``/``retrieved_at_iso`` are
+    only set for ``origin="regulatory_web"`` items.
+    """
+
+    text: str
+    source: str
+    page_number: int | None = None
+    score: float
+    origin: EvidenceOriginValue
+    canonical_url: str | None = None
+    retrieved_at_iso: str | None = None
 
 
 class RerankingMetadata(BaseModel):
@@ -134,7 +154,10 @@ class ResponseMetadata(BaseModel):
     hyde: HyDEMetadata
     reranking: RerankingMetadata
     crag: CRAGMetadata
+    # Raw retrieval/reranking output.
     retrieved_chunks: list[RetrievedChunkPreview]
+    # Final post-CRAG evidence sent to the answer LLM.
+    final_evidence: list[EvidencePreview] = Field(default_factory=list)
     flagged_claims: list[str] = Field(default_factory=list)
 
 

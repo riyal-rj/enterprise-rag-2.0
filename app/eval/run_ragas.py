@@ -48,6 +48,11 @@ def _parse_args() -> argparse.Namespace:
         "--mode", default="service", choices=["service", "api"], help="Invocation mode"
     )
     parser.add_argument(
+        "--fail-on-skip",
+        action="store_true",
+        help="Fail when any selected case is skipped.",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Output JSON path (default: eval/results/<timestamp>_<profile>.json)",
@@ -216,13 +221,24 @@ def main() -> None:
     print_table(payload)
     print(f"\nWrote: {out_path}")
 
+    failed = False
     if errors:
         # Non-zero exit so CI actually fails on a broken profile, instead
         # of a run that errored on every case looking like "0 applicable
         # cases, all clean" (see _invoke_all's docstring).
+        failed = True
         print(f"\n{len(errors)} case(s) errored (not skipped):", file=sys.stderr)
         for entry in errors:
             print(f"  {entry['id']}: {entry['reason']}", file=sys.stderr)
+    if cases and not rows:
+        failed = True
+        print("\nNo selected case reached scoring.", file=sys.stderr)
+    if args.fail_on_skip and skipped:
+        failed = True
+        print(f"\n{len(skipped)} selected case(s) were skipped:", file=sys.stderr)
+        for entry in skipped:
+            print(f"  {entry['id']}: {entry['reason']}", file=sys.stderr)
+    if failed:
         sys.exit(1)
 
 

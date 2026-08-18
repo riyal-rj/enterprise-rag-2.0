@@ -27,7 +27,7 @@ interval instead of only the worker an admin happened to hit.
 from __future__ import annotations
 
 from app.core.exceptions import InvalidRagOpsConfigError
-from app.models.rag_ops import RagOpsConfig
+from app.models.rag_ops import RagOpsConfig, validate_crag_state
 from app.rag_services.dynamic_reranker import DynamicReranker
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.repositories.rag_ops_repository import RagOpsRepository
@@ -35,6 +35,7 @@ from app.schemas.rag_ops import (
     AuditLogEntryResponse,
     AuditLogResponse,
     CRAGMetrics,
+    CRAGShadowMetrics,
     EmergencyDisableRequest,
     EmergencyEnableRequest,
     HyDEMetrics,
@@ -76,6 +77,7 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             crag_enabled=config.crag_enabled,
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
+            crag_shadow_enabled=config.crag_shadow_enabled,
         )
     )
 
@@ -117,10 +119,40 @@ class RagOpsController:
                 "Cannot switch to the Voyage reranker backend: no VOYAGE_API_KEY is "
                 "configured for this deployment."
             )
-        if payload.crag_web_enabled is True and not self._crag_web_available:
+        # Validate the *effective* post-update state, not just the fields
+        # this payload happens to touch - a partial update (e.g. only
+        # crag_enabled=False in a request) must be rejected if it would
+        # leave the merged row with crag_web_enabled=True and
+        # crag_enabled=False, even though this payload alone never
+        # mentioned crag_web_enabled.
+        current = self._repository.get_config()
+        effective_crag_enabled = (
+            current.crag_enabled if payload.crag_enabled is None else payload.crag_enabled
+        )
+        effective_crag_web_enabled = (
+            current.crag_web_enabled
+            if payload.crag_web_enabled is None
+            else payload.crag_web_enabled
+        )
+        effective_crag_shadow_enabled = (
+            current.crag_shadow_enabled
+            if payload.crag_shadow_enabled is None
+            else payload.crag_shadow_enabled
+        )
+        try:
+            validate_crag_state(
+                crag_enabled=effective_crag_enabled,
+                crag_web_enabled=effective_crag_web_enabled,
+                crag_shadow_enabled=effective_crag_shadow_enabled,
+            )
+        except ValueError as exc:
             raise InvalidRagOpsConfigError(
-                "Cannot enable CRAG web correction: this deployment has no Tavily "
-                "credentials and/or approved regulatory-domain allowlist configured."
+                "CRAG web correction and shadow mode cannot remain enabled while CRAG is disabled."
+            ) from exc
+        if effective_crag_web_enabled and not self._crag_web_available:
+            raise InvalidRagOpsConfigError(
+                "CRAG web correction requires guardrails, Tavily credentials, "
+                "and an approved regulatory-domain allowlist."
             )
 
         config = self._repository.update_config(
@@ -136,6 +168,7 @@ class RagOpsController:
             crag_enabled=payload.crag_enabled,
             crag_rollout_percentage=payload.crag_rollout_percentage,
             crag_web_enabled=payload.crag_web_enabled,
+            crag_shadow_enabled=payload.crag_shadow_enabled,
         )
         self._apply(config)
         return self._to_status(config)
@@ -183,6 +216,7 @@ class RagOpsController:
         semantic_snapshot = self._metrics.semantic_cache_stats()
         hyde_snapshot = self._metrics.hyde_stats()
         crag_snapshot = self._metrics.crag_stats()
+        crag_shadow_snapshot = self._metrics.crag_shadow_stats()
         return RagOpsStatusResponse(
             reranking_enabled=config.reranking_enabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
@@ -216,6 +250,7 @@ class RagOpsController:
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
             crag_web_available=self._crag_web_available,
+            crag_shadow_enabled=config.crag_shadow_enabled,
             crag_metrics=CRAGMetrics(
                 sample_count=crag_snapshot.sample_count,
                 p50_latency_ms=crag_snapshot.p50_latency_ms,
@@ -229,6 +264,18 @@ class RagOpsController:
                 usage_tokens_total=crag_snapshot.usage_tokens_total,
                 rollout_bypasses=crag_snapshot.rollout_bypasses,
                 emergency_bypasses=crag_snapshot.emergency_bypasses,
+            ),
+            crag_shadow_metrics=CRAGShadowMetrics(
+                sample_count=crag_shadow_snapshot.sample_count,
+                p50_latency_ms=crag_shadow_snapshot.p50_latency_ms,
+                p95_latency_ms=crag_shadow_snapshot.p95_latency_ms,
+                correct_count=crag_shadow_snapshot.correct_count,
+                ambiguous_count=crag_shadow_snapshot.ambiguous_count,
+                incorrect_count=crag_shadow_snapshot.incorrect_count,
+                fallback_rate=crag_shadow_snapshot.fallback_rate,
+                abstention_rate=crag_shadow_snapshot.abstention_rate,
+                web_use_rate=crag_shadow_snapshot.web_use_rate,
+                usage_tokens_total=crag_shadow_snapshot.usage_tokens_total,
             ),
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,

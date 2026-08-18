@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  # Paths touched by the CRAG hardening work - kept 100% ruff/mypy clean.
+  # The rest of the repository currently has pre-existing full-repository
+  # ruff (~236 findings) and mypy (2 findings) failures that predate this
+  # work and are out of scope to fix here - see the "full repo lint/type
+  # debt" follow-up ticket. Widen this list (or drop it and lint app/tests
+  # directly) once that's paid down.
+  CRAG_QUALITY_PATHS: >-
+    app/rag_services/crag
+    app/rag_services/rag_service.py
+    app/rag_services/rag_runtime_config.py
+    app/schemas/chat.py
+    app/schemas/rag_ops.py
+    app/models/rag_ops.py
+    app/controllers/rag_ops_controller.py
+    app/repositories/rag_ops_repository.py
+    app/services/rag_metrics_service.py
+    app/core/config/external_apis.py
+    app/api/deps.py
+    app/eval/invokers.py
+    app/eval/run_ragas.py
+    app/eval/recorded_web_retriever.py
+    tests/api/test_rag_ops_sync.py
+    tests/controllers/test_admin_controller.py
+    tests/controllers/test_rag_ops_controller.py
+    tests/controllers/test_rag_ops_crag.py
+    tests/eval/test_invokers.py
+    tests/eval/test_run_ragas.py
+    tests/eval/test_crag_eval_pipeline.py
+    tests/rag_services/test_dynamic_query_transformer.py
+    tests/rag_services/test_dynamic_reranker.py
+    tests/rag_services/test_query_transformer.py
+    tests/rag_services/test_rag_runtime_config.py
+    tests/rag_services/test_rag_service.py
+    tests/rag_services/test_reranker.py
+    tests/rag_services/test_corrective_retriever.py
+    tests/rag_services/test_crag_refiner.py
+    tests/rag_services/test_crag_retrieval_grader.py
+    tests/rag_services/test_crag_web_retriever.py
+    tests/rag_services/test_dynamic_corrective_retriever.py
+    tests/rag_services/test_rag_service_crag.py
+    tests/repositories/test_rag_ops_crag_integration.py
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - name: ruff check (CRAG-touched paths)
+        run: uv run ruff check $CRAG_QUALITY_PATHS
+      - name: ruff format --check (CRAG-touched paths)
+        run: uv run ruff format --check $CRAG_QUALITY_PATHS
+      - name: mypy (CRAG-touched app paths)
+        run: |
+          uv run mypy \
+            app/rag_services/crag \
+            app/rag_services/rag_service.py \
+            app/rag_services/rag_runtime_config.py \
+            app/schemas/chat.py \
+            app/schemas/rag_ops.py \
+            app/models/rag_ops.py \
+            app/controllers/rag_ops_controller.py \
+            app/repositories/rag_ops_repository.py \
+            app/services/rag_metrics_service.py \
+            app/core/config/external_apis.py \
+            app/api/deps.py \
+            app/eval/invokers.py \
+            app/eval/run_ragas.py \
+            app/eval/recorded_web_retriever.py
+      - run: uv run pytest -q
+
+  crag-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - run: uv run pytest tests/rag_services/test_crag_retrieval_grader.py -q
+      - run: uv run pytest tests/rag_services/test_crag_refiner.py -q
+      - run: uv run pytest tests/rag_services/test_corrective_retriever.py -q
+      - run: uv run pytest tests/rag_services/test_dynamic_corrective_retriever.py -q
+      - run: uv run pytest tests/rag_services/test_crag_web_retriever.py -q
+      - run: uv run pytest tests/rag_services/test_rag_service_crag.py -q
+      - run: uv run pytest tests/controllers/test_rag_ops_crag.py -q
+      - run: uv run pytest tests/eval/test_crag_eval_pipeline.py -q

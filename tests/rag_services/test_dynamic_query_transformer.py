@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from app.rag_services.dynamic_query_transformer import DynamicQueryTransformer
 from app.rag_services.dynamic_reranker import DynamicReranker

@@ -23,18 +23,21 @@ from app.rag_services.crag.crag import (
     WebRetriever,
     local_evidence,
 )
+from app.rag_services.crag.telemetry import CRAGTelemetry, NoOpCRAGTelemetry
 
 __all__ = [
     "CRAGCohort",
     "CRAGDecision",
     "CRAGOutcome",
     "CRAGPlan",
+    "CRAGTelemetry",
     "ChunkGrade",
     "CorrectiveRetriever",
     "EvidenceChunk",
     "EvidenceOrigin",
     "FailSafeCorrectiveRetriever",
     "KnowledgeRefiner",
+    "NoOpCRAGTelemetry",
     "PlannedCorrectiveRetriever",
     "PlannedNoOpCorrectiveRetriever",
     "RetrievalGrade",

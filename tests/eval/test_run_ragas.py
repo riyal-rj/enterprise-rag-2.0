@@ -151,9 +151,15 @@ def test_main_exits_nonzero_when_any_case_errors(monkeypatch: pytest.MonkeyPatch
     assert payload["rows"] == []
 
 
-def test_main_exits_zero_when_only_intentional_skips_occur(
+def test_main_exits_nonzero_when_no_selected_case_reaches_scoring(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    """A run where every selected case is (intentionally) skipped still
+    means nothing was actually evaluated - CI must fail rather than report
+    an empty-but-passing run (see run_ragas.main's "No selected case
+    reached scoring" gate). Distinct from --fail-on-skip: this check is
+    unconditional, since zero scored rows is never a meaningful result on
+    its own."""
     out_path = tmp_path / "out.json"
     monkeypatch.setattr(sys, "argv", ["run_ragas", "--profile", "naive", "--output", str(out_path)])
     monkeypatch.setattr(run_ragas, "_load_cases", lambda *args, **kwargs: [_case("q-991")])
@@ -164,11 +170,75 @@ def test_main_exits_zero_when_only_intentional_skips_occur(
     )
     monkeypatch.setattr(run_ragas, "score_with_ragas", lambda rows: [])
 
+    with pytest.raises(SystemExit) as exc_info:
+        run_ragas.main()
+
+    assert exc_info.value.code == 1
+    payload = json.loads(out_path.read_text())
+    assert payload["errors"] == []
+    assert payload["skipped"] == [{"id": "q-991", "reason": "not applicable"}]
+
+
+def test_main_exits_nonzero_with_fail_on_skip_even_when_some_rows_score(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """--fail-on-skip must fail the run even when other cases scored fine -
+    used by ``make eval-crag`` so a silently-skipped CRAG case doesn't hide
+    behind an otherwise-green run (see Makefile's eval-crag target)."""
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_ragas", "--profile", "naive", "--output", str(out_path), "--fail-on-skip"],
+    )
+    monkeypatch.setattr(
+        run_ragas, "_load_cases", lambda *args, **kwargs: [_case("q-991"), _case("q-992")]
+    )
+    monkeypatch.setattr(
+        run_ragas,
+        "_select_invoker",
+        lambda mode: _FakeInvoker(
+            {
+                "question for q-991": InvokeResponse(answer="ok", sources=["doc.pdf"]),
+                "question for q-992": SkippedIntent("not applicable"),
+            }
+        ),
+    )
+    monkeypatch.setattr(run_ragas, "score_with_ragas", lambda rows: [{} for _ in rows])
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_ragas.main()
+
+    assert exc_info.value.code == 1
+    payload = json.loads(out_path.read_text())
+    assert [row["id"] for row in payload["rows"]] == ["q-991"]
+    assert payload["skipped"] == [{"id": "q-992", "reason": "not applicable"}]
+
+
+def test_main_exits_zero_with_fail_on_skip_when_nothing_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_ragas", "--profile", "naive", "--output", str(out_path), "--fail-on-skip"],
+    )
+    monkeypatch.setattr(run_ragas, "_load_cases", lambda *args, **kwargs: [_case("q-991")])
+    monkeypatch.setattr(
+        run_ragas,
+        "_select_invoker",
+        lambda mode: _FakeInvoker(
+            {"question for q-991": InvokeResponse(answer="ok", sources=["doc.pdf"])}
+        ),
+    )
+    monkeypatch.setattr(run_ragas, "score_with_ragas", lambda rows: [{} for _ in rows])
+
     run_ragas.main()  # must not raise SystemExit
 
     payload = json.loads(out_path.read_text())
     assert payload["errors"] == []
-    assert payload["skipped"] == [{"id": "q-991", "reason": "not applicable"}]
+    assert payload["skipped"] == []
 
 
 def test_resolve_output_path_defaults_to_timestamped_results_path() -> None:

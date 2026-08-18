@@ -23,3 +23,21 @@ BEGIN
             CHECK (crag_rollout_percentage BETWEEN 0 AND 100);
     END IF;
 END $$;
+
+-- Final concurrency/alternate-writer backstop: application validation
+-- (RagOpsController.update_config, PostgresRagOpsRepository.update_config)
+-- gives a clean API error, but this constraint is what actually guarantees
+-- the invariant against any writer, including one that bypasses the
+-- application layer entirely.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'rag_ops_config_crag_web_requires_crag_check'
+    ) THEN
+        ALTER TABLE rag_ops_config
+            ADD CONSTRAINT rag_ops_config_crag_web_requires_crag_check
+            CHECK (NOT crag_web_enabled OR crag_enabled);
+    END IF;
+END $$;

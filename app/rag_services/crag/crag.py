@@ -101,6 +101,9 @@ class KnowledgeRefiner(Protocol):
 
 
 class SourceScopePolicy(Protocol):
+    @property
+    def cache_namespace(self) -> str: ...
+
     def permits_public_regulatory_web(self, question: str) -> bool: ...
 
 
@@ -120,7 +123,7 @@ class CorrectiveRetriever(Protocol):
     ) -> CRAGOutcome: ...
 
 
-CRAGCohort = Literal["disabled", "control", "treatment"]
+CRAGCohort = Literal["disabled", "control", "shadow", "treatment"]
 
 
 @dataclass(frozen=True)
