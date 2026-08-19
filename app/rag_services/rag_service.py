@@ -279,6 +279,12 @@ Do not generate an arbitrary numeric confidence score. Confidence should be calc
 
 """
 
+_SELF_REFLECTION_FALLBACK_ABSTENTION = (
+    "An internal error prevented full verification of this answer against "
+    "approved evidence, and part of the draft could not be confirmed. "
+    "Please retry your question."
+)
+
 
 class _CallableEvidenceAugmenter:
     """Adapts a bound closure to the ``EvidenceAugmenter`` protocol -
@@ -503,7 +509,17 @@ class RAGService:
             question, config, enabled=effective_self_reflective_enabled
         )
         if effective_self_reflective_enabled:
-            cache_namespace = f"{cache_namespace}:{self_reflection_plan.cache_namespace}"
+            # reflection_retrieval_top_k is a RAGService-level knob (used
+            # only when building the bounded evidence augmenter below, see
+            # _retrieve_reflection_evidence) that none of the reflection
+            # collaborators' own cache_namespace strings know about - fold it
+            # in here, the same way candidate_top_k is folded in for
+            # reranking above, so a deploy that changes it can't serve a
+            # stale answer computed under a different retrieval width.
+            cache_namespace = (
+                f"{cache_namespace}:{self_reflection_plan.cache_namespace}:"
+                f"reflection_top_k={self._reflection_retrieval_top_k}"
+            )
 
         cache_key = self._cache_key(question, top_k, cache_namespace)
         cached = self._get_cached(cache_key)
@@ -825,6 +841,35 @@ class RAGService:
                     reason=self_reflection_plan.bypass_reason
                 )
 
+        # A reflection *failure* (LLM/schema/retrieval error) falls back to
+        # the untouched pre-reflection draft - exactly the answer that would
+        # have been served had self-reflection never run. But an operator
+        # who turned self-reflection on for a banking-policy system opted
+        # into an extra layer of assurance against unsupported claims;
+        # silently reverting to "no safety net" on a technical hiccup
+        # defeats that. Gate the fallback draft on the same deterministic,
+        # zero-LLM-cost check the response already computes for every answer
+        # (see flagged_claims below) - if it flags anything, force a
+        # deterministic abstention instead of serving unverified content.
+        # fallback=True already keeps this out of the cache either way (see
+        # pipeline_fallback below); this only changes what's served to the
+        # caller for *this* request.
+        if self_reflection_outcome.fallback:
+            fallback_claims = find_unsupported_claims(
+                self_reflection_outcome.answer,
+                self._evidence_as_retrieved_chunks(self_reflection_outcome.evidence),
+            )
+            if fallback_claims:
+                logger.warning(
+                    "rag.self_reflection_fallback_unsafe_draft",
+                    extra={"flagged_claim_count": len(fallback_claims)},
+                )
+                self_reflection_outcome = replace(
+                    self_reflection_outcome,
+                    answer=_SELF_REFLECTION_FALLBACK_ABSTENTION,
+                    abstain=True,
+                )
+
         # Everything downstream (confidence, claim-checking, sources,
         # final-evidence preview) must see exactly what was actually
         # returned - the post-reflection answer/evidence when reflection ran
@@ -958,6 +1003,12 @@ class RAGService:
             or crag_outcome.abstain
             or self_reflection_outcome.fallback
             or self_reflection_outcome.abstain
+            # Explicit, not merely implied by fallback/abstain above: today
+            # every non-accepted outcome this package produces also sets one
+            # of those two flags, but this must hold even if a future engine
+            # implementation ever sets accepted=False without them - caching
+            # an answer self-reflection didn't actually accept is never safe.
+            or not self_reflection_outcome.accepted
         )
         if not pipeline_fallback:
             cache_written = self._set_cached(cache_key, response)
@@ -1096,14 +1147,16 @@ class RAGService:
     def _cache_key(self, question: str, top_k: int, cache_namespace: str) -> str:
         normalized_question = " ".join(question.split())
 
-        # v7: cache_namespace now folds in per-query self-reflection cohort
-        # isolation too (control vs. treatment, decided from
-        # PlannedSelfReflectionEngine.plan), on top of v6's CRAG cohort
-        # isolation and v5's reranking/HyDE cohort isolation - bumped so a
-        # v6-or-earlier key can't collide with or mask a v7 key for the same
-        # question/config now that self-reflection can revise the answer (or
-        # widen the evidence) that's ultimately served.
-        raw_key = f"rag:v7:{cache_namespace}:{top_k}:{normalized_question}"
+        # v8: reflection/critic/reviser cache_namespace strings now include
+        # every output-affecting setting (max_completion_tokens, max_attempts,
+        # stage/total timeout, schema version), and reflection_retrieval_top_k
+        # is folded into cache_namespace above - none of that was namespaced
+        # under v7, so a v7-or-earlier key could silently collide across a
+        # config change to any of those. On top of v7's self-reflection
+        # cohort isolation, v6's CRAG cohort isolation, and v5's reranking/
+        # HyDE cohort isolation - bumped so a v7-or-earlier key can't collide
+        # with or mask a v8 key for the same question/config.
+        raw_key = f"rag:v8:{cache_namespace}:{top_k}:{normalized_question}"
 
         return hashlib.sha256(raw_key.encode()).hexdigest()
 

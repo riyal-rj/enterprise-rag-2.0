@@ -21,6 +21,7 @@ into ``RAGService.answer()``.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -107,6 +108,8 @@ class ReflectionCritic(Protocol):
         question: str,
         evidence: tuple[EvidenceChunk, ...],
         answer: str,
+        *,
+        timeout_seconds: float | None = None,
     ) -> ReflectionCritique: ...
 
 
@@ -134,6 +137,8 @@ class GroundedAnswerReviser(Protocol):
         evidence: tuple[EvidenceChunk, ...],
         previous_answer: str,
         critique: ReflectionCritique,
+        *,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, int]: ...
 
 
@@ -263,11 +268,17 @@ _FORBIDDEN_QUERY_MARKERS = (
 def validate_reflection_query(value: str) -> str:
     """Sanity/safety check for a critic-generated retrieval query before it
     reaches ``EvidenceAugmenter.retrieve`` - the query is untrusted, model-
-    generated text, not a vetted user query. Rejects instruction-like or
-    URL-bearing content rather than trying to sanitize it; the caller (the
-    reflection engine) treats a ``ValueError`` here the same as any other
-    reflection-stage failure - the outer ``FailSafeSelfReflectionEngine``
-    catches it."""
+    generated text, not a vetted user query. Rejects instruction-like,
+    URL-bearing, or control-character-bearing content rather than trying to
+    sanitize it; the caller (the reflection engine) treats a ``ValueError``
+    here the same as any other reflection-stage failure - the outer
+    ``FailSafeSelfReflectionEngine`` catches it."""
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        # Rejected before whitespace normalization, which only collapses
+        # str.split()'s notion of whitespace - most control characters
+        # (NUL, ESC, ...) aren't whitespace and would otherwise survive
+        # into a query handed to retrieval/embedding/logging untouched.
+        raise ValueError("reflection retrieval query contains a control character")
     normalized = " ".join(value.split())
     if not _MIN_QUERY_LENGTH <= len(normalized) <= _MAX_QUERY_LENGTH:
         raise ValueError("reflection retrieval query length is invalid")

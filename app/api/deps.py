@@ -378,6 +378,7 @@ def get_answer_reviser() -> GroundedAnswerReviser:
         timeout_seconds=settings.reflection_stage_timeout_seconds,
         max_completion_tokens=settings.reflection_max_completion_tokens,
         max_attempts=settings.reflection_max_attempts,
+        max_evidence_chars=settings.reflection_max_evidence_chars,
     )
 
 

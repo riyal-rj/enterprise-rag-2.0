@@ -167,6 +167,42 @@ def test_evidence_is_truncated_to_max_evidence_chars() -> None:
     assert len(sent_payload["evidence"][0]["text"]) == 10
 
 
+def test_timeout_override_is_clamped_to_the_configured_ceiling() -> None:
+    """The engine passes the caller's remaining deadline as an override so
+    a critic call can't outlive the overall reflection budget - but that
+    override must never let a caller extend the timeout past what this
+    critic was configured with either."""
+    captured: dict[str, object] = {}
+
+    class _CapturingLLMClient:
+        def generate(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_json(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_structured(self, *args: object, **kwargs: object) -> StructuredLLMResponse:
+            captured["timeout_seconds"] = kwargs["timeout_seconds"]
+            return StructuredLLMResponse(value=_payload_model(), usage=TokenUsage(total_tokens=1))
+
+    critic = _critic(_CapturingLLMClient(), timeout_seconds=10.0)
+
+    critic.critique("q", (_evidence(),), "answer", timeout_seconds=3.0)
+    assert captured["timeout_seconds"] == 3.0  # remaining is smaller - use it
+
+    critic.critique("q", (_evidence(),), "answer", timeout_seconds=100.0)
+    assert captured["timeout_seconds"] == 10.0  # remaining is bigger - clamp to configured
+
+    critic.critique("q", (_evidence(),), "answer")
+    assert captured["timeout_seconds"] == 10.0  # no override at all - use configured
+
+
+def _payload_model() -> object:
+    from app.rag_services.reflection.reflection_critic import _CritiquePayload
+
+    return _CritiquePayload(**_payload())
+
+
 def test_question_answer_and_evidence_are_data_not_instructions_in_payload() -> None:
     llm_client = _FakeLLMClient(payload=_payload())
     critic = _critic(llm_client)
@@ -183,5 +219,32 @@ def test_cache_namespace_encodes_model_prompt_and_evidence_chars() -> None:
     critic = _critic(_FakeLLMClient(payload=_payload()))
 
     assert critic.cache_namespace == (
-        "critic=gpt-4o-mini:prompt=bank-policy-v1:evidence_chars=30000"
+        "critic=gpt-4o-mini:schema=v1:prompt=bank-policy-v1:evidence_chars=30000:"
+        "max_tokens=800:timeout=10.0:attempts=2"
     )
+
+
+def test_cache_namespace_changes_with_every_output_affecting_setting() -> None:
+    """Regression: two critics that differ in any setting that can change
+    what the critic actually does/returns must never share a cache
+    namespace - each override below must produce a namespace distinct from
+    the baseline."""
+    baseline = _critic(_FakeLLMClient(payload=_payload())).cache_namespace
+
+    assert _critic(_FakeLLMClient(payload=_payload()), model="gpt-4o").cache_namespace != baseline
+    assert (
+        _critic(_FakeLLMClient(payload=_payload()), prompt_version="bank-policy-v2").cache_namespace
+        != baseline
+    )
+    assert (
+        _critic(_FakeLLMClient(payload=_payload()), max_evidence_chars=10_000).cache_namespace
+        != baseline
+    )
+    assert (
+        _critic(_FakeLLMClient(payload=_payload()), max_completion_tokens=400).cache_namespace
+        != baseline
+    )
+    assert (
+        _critic(_FakeLLMClient(payload=_payload()), timeout_seconds=5.0).cache_namespace != baseline
+    )
+    assert _critic(_FakeLLMClient(payload=_payload()), max_attempts=1).cache_namespace != baseline

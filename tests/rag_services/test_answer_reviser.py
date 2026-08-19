@@ -51,6 +51,7 @@ def _reviser(llm_client: object, **overrides: object) -> StructuredGroundedAnswe
         timeout_seconds=10.0,
         max_completion_tokens=1_500,
         max_attempts=2,
+        max_evidence_chars=30_000,
     )
     defaults.update(overrides)
     return StructuredGroundedAnswerReviser(**defaults)  # type: ignore[arg-type]
@@ -137,4 +138,79 @@ def test_payload_carries_evidence_previous_answer_and_feedback() -> None:
 def test_cache_namespace_encodes_model_and_prompt_version() -> None:
     reviser = _reviser(_FakeLLMClient(payload={"answer": "ok"}))
 
-    assert reviser.cache_namespace == "reviser=gpt-4o:prompt=bank-policy-v1"
+    assert reviser.cache_namespace == (
+        "reviser=gpt-4o:schema=v1:prompt=bank-policy-v1:evidence_chars=30000:"
+        "max_tokens=1500:timeout=10.0:attempts=2"
+    )
+
+
+def test_cache_namespace_changes_with_every_output_affecting_setting() -> None:
+    baseline = _reviser(_FakeLLMClient(payload={"answer": "ok"})).cache_namespace
+
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), model="gpt-4o-mini").cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), prompt_version="bank-policy-v2"
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), max_evidence_chars=10_000
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), max_completion_tokens=500
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), timeout_seconds=5.0).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), max_attempts=1).cache_namespace
+        != baseline
+    )
+
+
+def test_evidence_is_truncated_to_max_evidence_chars() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "ok"})
+    reviser = _reviser(llm_client, max_evidence_chars=10)
+
+    reviser.revise("q", (_evidence(text="a" * 50),), "old answer", _critique())
+
+    sent_payload = json.loads(str(llm_client.calls[0]["user_message"]))
+    assert len(sent_payload["evidence"][0]["text"]) == 10
+
+
+def test_timeout_override_is_clamped_to_the_configured_ceiling() -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturingLLMClient:
+        def generate(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_json(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_structured(self, *args: object, **kwargs: object) -> StructuredLLMResponse:
+            captured["timeout_seconds"] = kwargs["timeout_seconds"]
+            from app.rag_services.reflection.answer_reviser import _RevisedAnswerPayload
+
+            return StructuredLLMResponse(
+                value=_RevisedAnswerPayload(answer="ok"), usage=TokenUsage(total_tokens=1)
+            )
+
+    reviser = _reviser(_CapturingLLMClient(), timeout_seconds=10.0)
+
+    reviser.revise("q", (_evidence(),), "old", _critique(), timeout_seconds=3.0)
+    assert captured["timeout_seconds"] == 3.0
+
+    reviser.revise("q", (_evidence(),), "old", _critique(), timeout_seconds=100.0)
+    assert captured["timeout_seconds"] == 10.0

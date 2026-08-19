@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from app.rag_services.crag import EvidenceChunk, EvidenceOrigin
 from app.rag_services.reflection.reflection import (
     ReflectionAction,
@@ -35,15 +37,27 @@ def _critique(**overrides: object) -> ReflectionCritique:
 
 
 class _FakeCritic:
-    def __init__(self, critiques: list[ReflectionCritique]) -> None:
+    def __init__(self, critiques: list[ReflectionCritique], *, sleep_seconds: float = 0.0) -> None:
         self._critiques = critiques
+        self._sleep_seconds = sleep_seconds
         self.calls = 0
+        self.received_timeouts: list[float | None] = []
 
     @property
     def cache_namespace(self) -> str:
         return "critic:fake:v1"
 
-    def critique(self, question: str, evidence: object, answer: str) -> ReflectionCritique:
+    def critique(
+        self,
+        question: str,
+        evidence: object,
+        answer: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ReflectionCritique:
+        self.received_timeouts.append(timeout_seconds)
+        if self._sleep_seconds:
+            time.sleep(self._sleep_seconds)
         result = self._critiques[self.calls]
         self.calls += 1
         return result
@@ -72,9 +86,10 @@ class _FakePolicy:
 
 
 class _FakeReviser:
-    def __init__(self, answers: list[str], tokens: int = 5) -> None:
+    def __init__(self, answers: list[str], tokens: int = 5, *, sleep_seconds: float = 0.0) -> None:
         self._answers = answers
         self._tokens = tokens
+        self._sleep_seconds = sleep_seconds
         self.calls = 0
 
     @property
@@ -82,20 +97,31 @@ class _FakeReviser:
         return "reviser:fake:v1"
 
     def revise(
-        self, question: str, evidence: object, previous_answer: str, critique: object
+        self,
+        question: str,
+        evidence: object,
+        previous_answer: str,
+        critique: object,
+        *,
+        timeout_seconds: float | None = None,
     ) -> tuple[str, int]:
+        if self._sleep_seconds:
+            time.sleep(self._sleep_seconds)
         result = self._answers[self.calls]
         self.calls += 1
         return result, self._tokens
 
 
 class _FakeAugmenter:
-    def __init__(self, evidence: tuple[EvidenceChunk, ...]) -> None:
+    def __init__(self, evidence: tuple[EvidenceChunk, ...], *, sleep_seconds: float = 0.0) -> None:
         self._evidence = evidence
+        self._sleep_seconds = sleep_seconds
         self.queries: list[str] = []
 
     def retrieve(self, query: str) -> tuple[EvidenceChunk, ...]:
         self.queries.append(query)
+        if self._sleep_seconds:
+            time.sleep(self._sleep_seconds)
         return self._evidence
 
 
@@ -244,7 +270,11 @@ def test_deadline_exhaustion_abstains_without_calling_the_critic() -> None:
 
 def test_iteration_cap_terminates_even_if_the_policy_never_stops() -> None:
     """Defense-in-depth: the engine itself must bound iterations, not rely
-    solely on a policy correctly respecting its budget."""
+    solely on a policy correctly respecting its budget. The backstop fires
+    *before* executing a REVISE/RETRIEVE_MORE the policy requested past
+    budget, not just on a later loop pass - so with max_iterations=2, only
+    2 revisions ever actually execute, even though a 3rd critique still
+    happens (to see whether the 2nd revision is now acceptable)."""
     critic = _FakeCritic([_critique(answer_relevance=0.1)] * 10)
     policy = _FakePolicy([ReflectionAction.REVISE] * 10)  # never accepts/abstains on its own
     reviser = _FakeReviser(["revised"] * 10)
@@ -254,8 +284,115 @@ def test_iteration_cap_terminates_even_if_the_policy_never_stops() -> None:
 
     assert outcome.abstain is True
     assert outcome.bypass_reason == "budget_exhausted_iterations"
-    # max_iterations=2 permits iteration 0, 1, 2 to each run a full
-    # critique+revise round (3 critic calls); the 4th loop pass sees
-    # state.iteration=3 > 2 and abstains before critiquing again.
     assert critic.calls == 3
-    assert reviser.calls == 3
+    assert reviser.calls == 2
+
+
+def test_zero_max_iterations_never_executes_a_single_revision() -> None:
+    """Regression for the exact off-by-one a non-compliant policy could
+    exploit: with max_iterations=0, a policy that returns REVISE anyway must
+    never reach the reviser - not even once. The old top-of-loop-only check
+    (`state.iteration > max_iterations`) let exactly one revision slip
+    through here, since it only blocked the *next* loop pass, not the
+    REVISE this pass already decided on."""
+    critic = _FakeCritic([_critique(answer_relevance=0.1)])
+    policy = _FakePolicy([ReflectionAction.REVISE])  # non-compliant: ignores budget.max_iterations
+    reviser = _FakeReviser(["should never be returned"])
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, max_iterations=0)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert outcome.abstain is True
+    assert outcome.bypass_reason == "budget_exhausted_iterations"
+    assert outcome.answer != "should never be returned"
+    assert reviser.calls == 0
+
+
+def test_retrieve_more_past_retrieval_budget_degrades_to_revise() -> None:
+    """A non-compliant policy that keeps returning RETRIEVE_MORE after the
+    retrieval budget is spent must not call the augmenter again - the engine
+    degrades the action to a plain REVISE over the existing evidence
+    instead (still gated by the iteration backstop above)."""
+    critic = _FakeCritic(
+        [
+            _critique(retrieval_needed=True, retrieval_query="q1", evidence_relevance=0.2),
+            _critique(),
+        ]
+    )
+    policy = _FakePolicy([ReflectionAction.RETRIEVE_MORE, ReflectionAction.ACCEPT])
+    reviser = _FakeReviser(["revised without a second retrieval"])
+    augmenter = _FakeAugmenter((_evidence(text="extra", source="b.pdf"),))
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, max_additional_retrievals=0)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", augmenter)
+
+    assert augmenter.queries == []  # retrieval budget was already 0 - never called
+    assert outcome.answer == "revised without a second retrieval"
+    assert outcome.additional_retrievals == 0
+
+
+# ---- Deadline enforcement around every collaborator call, not just at the
+# top of the loop - regression coverage for a real repro: a critic call
+# that itself takes longer than the total deadline must never let the loop
+# reach ACCEPT, because the only check used to happen before the call, not
+# after it returned. ----
+
+
+def test_slow_critic_call_that_overruns_the_deadline_is_not_accepted() -> None:
+    critic = _FakeCritic([_critique()], sleep_seconds=0.05)
+    policy = _FakePolicy([ReflectionAction.ACCEPT])
+    reviser = _FakeReviser([])
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, total_timeout_seconds=0.01)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert outcome.accepted is False
+    assert outcome.abstain is True
+    assert outcome.bypass_reason == "budget_exhausted_deadline"
+
+
+def test_critic_receives_the_remaining_deadline_not_the_full_stage_timeout() -> None:
+    critic = _FakeCritic([_critique()])
+    policy = _FakePolicy([ReflectionAction.ACCEPT])
+    reviser = _FakeReviser([])
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, total_timeout_seconds=5.0)
+
+    engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert critic.received_timeouts[0] is not None
+    assert critic.received_timeouts[0] <= 5.0
+
+
+def test_slow_reviser_call_that_overruns_the_deadline_aborts() -> None:
+    critic = _FakeCritic([_critique(answer_relevance=0.1)])
+    policy = _FakePolicy([ReflectionAction.REVISE])
+    reviser = _FakeReviser(["should never be reported as the final answer"], sleep_seconds=0.05)
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, total_timeout_seconds=0.02)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert outcome.abstain is True
+    assert outcome.bypass_reason == "budget_exhausted_deadline"
+    assert outcome.answer != "should never be reported as the final answer"
+
+
+def test_slow_augmenter_retrieve_that_overruns_the_deadline_aborts() -> None:
+    critic = _FakeCritic(
+        [
+            _critique(
+                retrieval_needed=True,
+                retrieval_query="missing evidence query",
+                evidence_relevance=0.2,
+            )
+        ]
+    )
+    policy = _FakePolicy([ReflectionAction.RETRIEVE_MORE])
+    reviser = _FakeReviser(["should never be reached"])
+    augmenter = _FakeAugmenter((_evidence(text="extra", source="b.pdf"),), sleep_seconds=0.05)
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, total_timeout_seconds=0.02)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", augmenter)
+
+    assert outcome.abstain is True
+    assert outcome.bypass_reason == "budget_exhausted_deadline"
+    assert reviser.calls == 0  # never reached the reviser after the slow retrieval

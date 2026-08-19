@@ -430,3 +430,83 @@ def test_bounded_evidence_augmentation_uses_dense_retrieval_only() -> None:
     assert [e.text for e in evidence] == ["initial"]  # same fake vector repo results
     assert all(e.origin is EvidenceOrigin.POLICY for e in evidence)
     assert vector_repository.search_calls[-1]["top_k"] == 5
+
+
+class _CountingConfigStore(RagRuntimeConfigStore):
+    def __init__(self, initial: RagRuntimeConfig) -> None:
+        super().__init__(initial)
+        self.read_count = 0
+
+    @property
+    def current(self) -> RagRuntimeConfig:  # type: ignore[override]
+        self.read_count += 1
+        return super().current
+
+
+def test_answer_reads_the_config_store_exactly_once_per_request() -> None:
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    config_store = _CountingConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
+            self_reflective_enabled=True,
+            self_reflective_rollout_percentage=100,
+        )
+    )
+    service, _ = _reflection_service(chunks, delegate, config_store=config_store)
+    config_store.read_count = 0  # reset after construction-time reads, if any
+
+    service.answer("q", top_k=1)
+
+    assert config_store.read_count == 1
+
+
+def test_fallback_with_flagged_claims_forces_deterministic_abstention() -> None:
+    """A reflection failure alone must not be enough to serve an unverified
+    draft - if the untouched pre-reflection answer trips the existing
+    deterministic unsupported-claim check, the request must abstain
+    instead, even though self-reflection itself never got to run."""
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate(raise_error=True)
+    llm_client = _FakeLLMClient(
+        answer="Customers must never receive any international wire transfers."
+    )
+    service, _ = _reflection_service(chunks, delegate, llm_client=llm_client)
+
+    response = service.answer("q", top_k=1)
+
+    assert response.metadata.self_reflection.fallback is True
+    assert response.metadata.self_reflection.abstain is True
+    assert response.answer != "Customers must never receive any international wire transfers."
+    assert "internal error" in response.answer.lower()
+    assert response.cache_hit is False
+
+
+def test_fallback_without_flagged_claims_still_serves_the_draft() -> None:
+    """The fallback gate is precise, not a blanket "reflection failed -> always
+    abstain": a fallback draft that passes the deterministic check (the same
+    one every answer is already scored against) is still served, matching
+    pre-self-reflection baseline behavior."""
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate(raise_error=True)
+    llm_client = _FakeLLMClient(
+        answer="This section describes general account opening considerations."
+    )
+    service, _ = _reflection_service(chunks, delegate, llm_client=llm_client)
+
+    response = service.answer("q", top_k=1)
+
+    assert response.metadata.self_reflection.fallback is True
+    assert response.metadata.self_reflection.abstain is False
+    assert response.answer == "This section describes general account opening considerations."

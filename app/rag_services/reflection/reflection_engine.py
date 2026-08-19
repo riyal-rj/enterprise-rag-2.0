@@ -84,7 +84,8 @@ class StructuredSelfReflectionEngine:
             f"self-reflection:v1:{self._critic.cache_namespace}:"
             f"{self._policy.cache_namespace}:{self._reviser.cache_namespace}:"
             f"iterations={self._max_iterations}:retrievals={self._max_retrievals}:"
-            f"tokens={self._max_total_tokens}:evidence={self._max_evidence}"
+            f"tokens={self._max_total_tokens}:evidence={self._max_evidence}:"
+            f"deadline={self._total_timeout:.1f}"
         )
 
     def reflect(
@@ -99,20 +100,28 @@ class StructuredSelfReflectionEngine:
         state = ReflectionState(answer=initial_answer, evidence=evidence)
 
         while True:
-            if time.perf_counter() >= deadline:
+            if self._deadline_exceeded(deadline):
                 return self._abstain_budget(state, started, reason="budget_exhausted_deadline")
             if state.total_tokens > self._max_total_tokens:
                 return self._abstain_budget(state, started, reason="budget_exhausted_tokens")
-            # Defense-in-depth iteration cap, independent of whatever the
-            # decision policy itself does with ``budget.max_iterations`` -
-            # guarantees this loop terminates after at most
-            # ``max_iterations + 1`` critique calls even if a future/custom
-            # policy implementation doesn't respect the budget it's handed.
-            if state.iteration > self._max_iterations:
-                return self._abstain_budget(state, started, reason="budget_exhausted_iterations")
 
-            critique = self._critic.critique(question, state.evidence, state.answer)
+            remaining = self._remaining_seconds(deadline)
+            if remaining <= 0:
+                return self._abstain_budget(state, started, reason="budget_exhausted_deadline")
+
+            critique = self._critic.critique(
+                question, state.evidence, state.answer, timeout_seconds=remaining
+            )
             state = replace(state, total_tokens=state.total_tokens + critique.usage_tokens)
+            # Checked immediately after the call returns, not just at the top
+            # of the next loop pass - a call that itself overran its
+            # timeout_seconds budget (SDK/network jitter, a provider that
+            # doesn't strictly enforce the requested timeout) must not be
+            # allowed to reach ACCEPT/REVISE/RETRIEVE_MORE execution below.
+            if self._deadline_exceeded(deadline):
+                return self._abstain_policy(
+                    state, started, critique, reason="budget_exhausted_deadline"
+                )
             if state.total_tokens > self._max_total_tokens:
                 return self._abstain_policy(
                     state, started, critique, reason="budget_exhausted_tokens"
@@ -146,6 +155,15 @@ class StructuredSelfReflectionEngine:
             )
 
             if action is ReflectionAction.ACCEPT:
+                # Re-checked one last time: the critique that led to ACCEPT
+                # may itself have taken long enough to blow the deadline (see
+                # the post-critique check above's rationale) - an accept
+                # decided after the caller's budget already ran out must not
+                # be returned as a clean success.
+                if self._deadline_exceeded(deadline):
+                    return self._abstain_policy(
+                        state, started, critique, reason="budget_exhausted_deadline"
+                    )
                 return SelfReflectionOutcome(
                     answer=state.answer,
                     evidence=state.evidence,
@@ -165,26 +183,74 @@ class StructuredSelfReflectionEngine:
             if action is ReflectionAction.ABSTAIN:
                 return self._abstain_policy(state, started, critique, reason=None)
 
-            current_evidence = state.evidence
-            retrievals = state.additional_retrievals
+            # Engine-level backstop for REVISE/RETRIEVE_MORE, independent of
+            # whatever the decision policy did with ``budget`` - guarantees
+            # at most ``max_iterations`` revision rounds ever execute (and at
+            # most ``max_additional_retrievals`` retrievals), even if a
+            # future/non-compliant policy implementation returns an action
+            # that ignores its own budget. Checked *before* spending any
+            # further tokens/latency on retrieval or revision, not merely
+            # relied upon to be caught on a later loop pass.
+            if state.iteration >= self._max_iterations:
+                return self._abstain_policy(
+                    state, started, critique, reason="budget_exhausted_iterations"
+                )
+            if (
+                action is ReflectionAction.RETRIEVE_MORE
+                and state.additional_retrievals >= self._max_retrievals
+            ):
+                # Retrieval budget already spent - degrade to a plain revise
+                # over the existing evidence rather than erroring or
+                # abstaining outright; the revision budget just checked above
+                # still allows it.
+                action = ReflectionAction.REVISE
+
             if action is ReflectionAction.RETRIEVE_MORE:
+                remaining = self._remaining_seconds(deadline)
+                if remaining <= 0:
+                    return self._abstain_policy(
+                        state, started, critique, reason="budget_exhausted_deadline"
+                    )
                 query = validate_reflection_query(critique.retrieval_query or question)
                 additional = augmenter.retrieve(query)
-                current_evidence = _dedupe_evidence(
-                    current_evidence, additional, max_chunks=self._max_evidence
+                state = replace(
+                    state,
+                    evidence=_dedupe_evidence(
+                        state.evidence, additional, max_chunks=self._max_evidence
+                    ),
+                    additional_retrievals=state.additional_retrievals + 1,
                 )
-                retrievals += 1
+                if self._deadline_exceeded(deadline):
+                    return self._abstain_policy(
+                        state, started, critique, reason="budget_exhausted_deadline"
+                    )
 
+            remaining = self._remaining_seconds(deadline)
+            if remaining <= 0:
+                return self._abstain_policy(
+                    state, started, critique, reason="budget_exhausted_deadline"
+                )
             revised, revision_tokens = self._reviser.revise(
-                question, current_evidence, state.answer, critique
+                question, state.evidence, state.answer, critique, timeout_seconds=remaining
             )
-            state = ReflectionState(
+            if self._deadline_exceeded(deadline):
+                return self._abstain_policy(
+                    state, started, critique, reason="budget_exhausted_deadline"
+                )
+            state = replace(
+                state,
                 answer=revised,
-                evidence=current_evidence,
                 iteration=state.iteration + 1,
-                additional_retrievals=retrievals,
                 total_tokens=state.total_tokens + revision_tokens,
             )
+
+    @staticmethod
+    def _deadline_exceeded(deadline: float) -> bool:
+        return time.perf_counter() >= deadline
+
+    @staticmethod
+    def _remaining_seconds(deadline: float) -> float:
+        return deadline - time.perf_counter()
 
     @staticmethod
     def _abstain_budget(
