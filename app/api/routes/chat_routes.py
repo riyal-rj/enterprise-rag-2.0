@@ -31,7 +31,7 @@ def chat(
     controller: ChatController = Depends(get_chat_controller),
 ) -> ChatResponse:
     """Answer a question via retrieval-augmented generation. Requires login."""
-    return controller.chat(user.username, payload)
+    return controller.chat(user, payload)
 
 
 @router.get("/history", response_model=ChatHistoryResponse)

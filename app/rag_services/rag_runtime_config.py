@@ -68,6 +68,13 @@ class RagRuntimeConfig:
     # construction site keeps working unchanged.
     self_reflective_enabled: bool = False
     self_reflective_rollout_percentage: int = 0
+    # Text-to-SQL routing (app.query_orchestration.query_orchestrator) -
+    # admin-only, proposal-only. Defaulted so every pre-existing
+    # construction site keeps working unchanged, same reasoning as
+    # crag_shadow_enabled/self_reflective_enabled above.
+    sql_enabled: bool = False
+    sql_rollout_percentage: int = 0
+    sql_proposal_only: bool = True
 
     def __post_init__(self) -> None:
         if not 0 <= self.reranker_rollout_percentage <= 100:
@@ -86,6 +93,18 @@ class RagRuntimeConfig:
             raise ValueError("crag_shadow_enabled requires crag_enabled")
         if not 0 <= self.self_reflective_rollout_percentage <= 100:
             raise ValueError("self_reflective_rollout_percentage must be between 0 and 100")
+        if not 0 <= self.sql_rollout_percentage <= 100:
+            raise ValueError("sql_rollout_percentage must be between 0 and 100")
+        if not self.sql_proposal_only:
+            # Non-negotiable for this release (see the architecture
+            # blueprint's "Non-negotiable controls" #7 and rollout gate #9):
+            # there is no automatic-execution code path at all, so nothing
+            # upstream (an admin request, a bad default, a bug) can ever
+            # construct a config that would try to use one.
+            raise ValueError(
+                "sql_proposal_only cannot be disabled - this release has no "
+                "automatic SQL execution path"
+            )
 
 
 _DEFAULT_CONFIG = RagRuntimeConfig(

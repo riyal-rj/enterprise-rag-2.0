@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 
 from app.core.exceptions import ConversationNotFoundError
+from app.models.auth_user import AuthenticatedUser
 from app.models.chat_history import ChatHistoryEntry
-from app.rag_services.rag_service import RAGService
+from app.query_orchestration.query_orchestrator import QueryOrchestrator
 from app.repositories.chat_history_repository import ChatHistoryRepository
 from app.repositories.conversation_repository import ConversationRepository
 from app.schemas.chat import (
@@ -24,22 +25,32 @@ _TITLE_MAX_LENGTH = 60
 
 
 class ChatController:
-    """Orchestrates :class:`RAGService` calls for the ``/chat`` routes."""
+    """Orchestrates :class:`QueryOrchestrator` calls for the ``/chat`` routes.
+
+    Takes the full :class:`AuthenticatedUser` (not just ``username``, as
+    before ``QueryOrchestrator`` existed) - SQL routing needs ``is_admin``
+    to gate proposal creation (see ``QueryOrchestrator.answer``).
+    """
 
     def __init__(
         self,
-        rag_service: RAGService,
+        query_orchestrator: QueryOrchestrator,
         chat_history_repository: ChatHistoryRepository,
         conversation_repository: ConversationRepository,
     ) -> None:
-        self._rag_service = rag_service
+        self._query_orchestrator = query_orchestrator
         self._chat_history_repository = chat_history_repository
         self._conversation_repository = conversation_repository
 
-    def chat(self, username: str, payload: ChatRequest) -> ChatResponse:
+    def chat(self, user: AuthenticatedUser, payload: ChatRequest) -> ChatResponse:
+        username = user.username
         conversation_id = self._resolve_conversation(username, payload)
-        response = self._rag_service.answer(
-            payload.question, top_k=payload.top_k, retrieval_mode=payload.retrieval_mode
+        response = self._query_orchestrator.answer(
+            principal=user,
+            conversation_id=conversation_id,
+            question=payload.question,
+            top_k=payload.top_k,
+            retrieval_mode=payload.retrieval_mode,
         )
         self._save_history(username, conversation_id, payload.question, response)
         return response.model_copy(update={"conversation_id": conversation_id})
@@ -51,9 +62,7 @@ class ChatController:
     def list_conversations(
         self, username: str, search: str | None, limit: int, offset: int
     ) -> ConversationListResponse:
-        conversations = self._conversation_repository.list_by_user(
-            username, search, limit, offset
-        )
+        conversations = self._conversation_repository.list_by_user(username, search, limit, offset)
         return ConversationListResponse(
             items=[
                 ConversationSummary(
@@ -79,9 +88,7 @@ class ChatController:
                 raise ConversationNotFoundError(payload.conversation_id)
             return conversation.id
 
-        conversation = self._conversation_repository.create(
-            username, _make_title(payload.question)
-        )
+        conversation = self._conversation_repository.create(username, _make_title(payload.question))
         return conversation.id
 
     def _save_history(
@@ -101,7 +108,9 @@ class ChatController:
             )
             self._conversation_repository.touch(conversation_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("chat.history_write_failed", extra={"username": username, "error": str(exc)})
+            logger.warning(
+                "chat.history_write_failed", extra={"username": username, "error": str(exc)}
+            )
 
     @staticmethod
     def _to_history_response(entries: list[ChatHistoryEntry]) -> ChatHistoryResponse:

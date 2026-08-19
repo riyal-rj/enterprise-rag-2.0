@@ -81,6 +81,9 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             crag_shadow_enabled=config.crag_shadow_enabled,
             self_reflective_enabled=config.self_reflective_enabled,
             self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
         )
     )
 
@@ -174,6 +177,8 @@ class RagOpsController:
             crag_shadow_enabled=payload.crag_shadow_enabled,
             self_reflective_enabled=payload.self_reflective_enabled,
             self_reflective_rollout_percentage=payload.self_reflective_rollout_percentage,
+            sql_enabled=payload.sql_enabled,
+            sql_rollout_percentage=payload.sql_rollout_percentage,
         )
         self._apply(config)
         return self._to_status(config)
@@ -299,6 +304,9 @@ class RagOpsController:
                 rollout_bypasses=reflection_snapshot.rollout_bypasses,
                 emergency_bypasses=reflection_snapshot.emergency_bypasses,
             ),
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,
             emergency_disabled_at=config.emergency_disabled_at,

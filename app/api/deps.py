@@ -21,6 +21,7 @@ from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
 from app.controllers.chat_controller import ChatController
 from app.controllers.rag_ops_controller import RagOpsController
+from app.controllers.sql_controller import SQLController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
 from app.core.ingestion.document_processor import (
@@ -35,6 +36,8 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.query_orchestration.intent_router import IntentRouter, StructuredIntentRouter
+from app.query_orchestration.query_orchestrator import QueryOrchestrator
 from app.rag_services.crag import (
     CorrectiveRetriever,
     FailSafeCorrectiveRetriever,
@@ -90,6 +93,14 @@ from app.repositories.conversation_repository import (
 )
 from app.repositories.rag_ops_repository import PostgresRagOpsRepository, RagOpsRepository
 from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache, SemanticQueryCache
+from app.repositories.sql_example_repository import (
+    PostgresSQLExampleRepository,
+    SQLExampleRepository,
+)
+from app.repositories.sql_proposal_repository import (
+    PostgresSQLProposalRepository,
+    SQLProposalRepository,
+)
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -109,9 +120,22 @@ from app.services.health_checks import (
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
 from app.services.rag_metrics_service import RagMetricsService
+from app.sql.catalog import StaticSQLCatalog
+from app.sql.sql_answerer import GroundedSQLAnswerer, SQLAnswerer
+from app.sql.sql_executor import (
+    PostgresReadOnlySQLExecutor,
+    SQLExecutionLimits,
+    SQLExecutor,
+    UnavailableSQLExecutor,
+)
+from app.sql.sql_generator import VannaSQLGenerator
+from app.sql.sql_policy import SQLPolicy, SQLPolicyConfig
+from app.sql.sql_result_policy import DefaultSQLResultPolicy, SQLResultPolicy
+from app.sql.sql_service import SQLService
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _POLICY_DIR = _REPO_ROOT / "policy"
+_SQL_CATALOG_DEFINITION_PATH = _REPO_ROOT / "app" / "sql" / "catalog_definition.json"
 
 
 @lru_cache(maxsize=1)
@@ -514,6 +538,9 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             crag_shadow_enabled=config.crag_shadow_enabled,
             self_reflective_enabled=config.self_reflective_enabled,
             self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
         )
     )
 
@@ -607,6 +634,172 @@ def get_rag_service() -> RAGService:
 
 
 @lru_cache(maxsize=1)
+def get_sql_pool() -> PostgresConnectionPool | None:
+    """A **separate** pooled connection to the analytics database SQL
+    queries actually execute against - never ``get_db_pool()`` (the app's
+    own users/history/RAG-Ops database). ``None`` when
+    ``SQLFeatureSettings.sql_database_url`` is unset, which is the default:
+    no analytics database has been provisioned for this deployment yet (see
+    ``scripts/sql/provision_sql_reader_role.sql``). Proposal/example
+    persistence still uses ``get_db_pool()`` - see
+    ``get_sql_proposal_repository``/``get_sql_example_repository`` - since
+    that's app metadata, not analytics data."""
+    settings = get_settings().sql
+    dsn = settings.sql_database_url.get_secret_value()
+    if not dsn:
+        return None
+    return PostgresConnectionPool(
+        dsn, minconn=settings.sql_pool_min_conn, maxconn=settings.sql_pool_max_conn
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_catalog() -> StaticSQLCatalog:
+    """Allowlisted table/column catalog - see ``app.sql.catalog``. Reads its
+    version from ``sql_catalog_state`` in the *app* database (``get_db_pool``),
+    same as the proposal/example repositories - only actual SQL execution
+    uses the separate analytics pool."""
+    return StaticSQLCatalog(pool=get_db_pool(), definition_path=_SQL_CATALOG_DEFINITION_PATH)
+
+
+@lru_cache(maxsize=1)
+def get_sql_generator() -> VannaSQLGenerator:
+    """Vanna-backed SQL generator, trained on the approved catalog/examples
+    only - see ``app.sql.sql_generator``. Reuses this app's existing Qdrant
+    and OpenAI clients rather than building Vanna its own."""
+    settings = get_settings().sql
+    return VannaSQLGenerator(
+        qdrant_client=get_qdrant_client(),
+        openai_client=get_openai_client(),
+        model=settings.sql_generator_model,
+        temperature=settings.sql_generator_temperature,
+        seed=settings.sql_generator_seed,
+        collection_prefix=settings.sql_vanna_collection_prefix,
+        fastembed_model=settings.sql_vanna_fastembed_model,
+        max_examples=settings.sql_max_examples,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_policy() -> SQLPolicy:
+    """AST validation/rewrite policy - see ``app.sql.sql_policy``. One of
+    several independent layers (alongside the database role/RLS and the
+    read-only ``EXPLAIN`` check below); never trusted alone."""
+    settings = get_settings().sql
+    return SQLPolicy(
+        SQLPolicyConfig(
+            policy_version=settings.sql_policy_version,
+            allowed_schemas=settings.sql_allowed_schemas,
+            allowed_functions=settings.sql_allowed_functions,
+            max_joins=settings.sql_max_joins,
+            max_rows=settings.sql_max_result_rows,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_executor() -> SQLExecutor:
+    """Read-only ``EXPLAIN``/execute against the separate analytics pool -
+    see ``app.sql.sql_executor``. Falls back to :class:`UnavailableSQLExecutor`
+    (fails closed on first real use, never silently succeeds) when
+    ``get_sql_pool`` returns ``None`` - matches every other dynamic RAG Ops
+    dependency being always constructible regardless of current feature
+    state."""
+    pool = get_sql_pool()
+    if pool is None:
+        return UnavailableSQLExecutor()
+    settings = get_settings().sql
+    return PostgresReadOnlySQLExecutor(
+        pool=pool,
+        limits=SQLExecutionLimits(
+            statement_timeout_ms=settings.sql_statement_timeout_ms,
+            lock_timeout_ms=settings.sql_lock_timeout_ms,
+            max_plan_cost=settings.sql_max_plan_cost,
+            max_plan_rows=settings.sql_max_plan_rows,
+            max_result_rows=settings.sql_max_result_rows,
+            max_result_bytes=settings.sql_max_result_bytes,
+            max_cell_chars=settings.sql_max_cell_chars,
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_result_policy() -> SQLResultPolicy:
+    return DefaultSQLResultPolicy()
+
+
+@lru_cache(maxsize=1)
+def get_sql_answerer() -> SQLAnswerer:
+    return GroundedSQLAnswerer(
+        llm_client=get_llm_client(), model=get_settings().llm.llm_model_answer
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_proposal_repository() -> SQLProposalRepository:
+    """Proposal state lives in the app database (``get_db_pool``), not the
+    analytics one - it's approval metadata, not analytics data."""
+    return PostgresSQLProposalRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_sql_example_repository() -> SQLExampleRepository:
+    return PostgresSQLExampleRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_sql_service() -> SQLService:
+    settings = get_settings().sql
+    return SQLService(
+        catalog=get_sql_catalog(),
+        generator=get_sql_generator(),
+        policy=get_sql_policy(),
+        executor=get_sql_executor(),
+        result_policy=get_sql_result_policy(),
+        answerer=get_sql_answerer(),
+        proposals=get_sql_proposal_repository(),
+        examples=get_sql_example_repository(),
+        proposal_ttl_seconds=settings.sql_proposal_ttl_seconds,
+        max_generation_attempts=settings.sql_max_generation_attempts,
+        max_examples=settings.sql_max_examples,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_intent_router() -> IntentRouter:
+    settings = get_settings().sql
+    return StructuredIntentRouter(
+        llm_client=get_llm_client(),
+        model=settings.sql_router_model,
+        min_sql_confidence=settings.sql_min_route_confidence,
+        prompt_version=settings.sql_router_prompt_version,
+        timeout_seconds=settings.sql_router_timeout_seconds,
+        max_completion_tokens=settings.sql_router_max_completion_tokens,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_query_orchestrator() -> QueryOrchestrator:
+    """The router ``ChatController`` actually calls - see
+    ``app.query_orchestration.query_orchestrator``. Short-circuits straight
+    to ``get_rag_service()`` whenever ``RagRuntimeConfig.sql_enabled`` is
+    False (the default), so this doesn't change ``/chat``'s behavior or cost
+    for any deployment that hasn't opted into SQL routing."""
+    return QueryOrchestrator(
+        rag_service=get_rag_service(),
+        router=get_intent_router(),
+        sql_service=get_sql_service(),
+        config_store=get_rag_runtime_config_store(),
+    )
+
+
+def get_sql_controller(
+    sql_service: SQLService = Depends(get_sql_service),
+) -> SQLController:
+    return SQLController(sql_service)
+
+
+@lru_cache(maxsize=1)
 def get_document_processor() -> DocumentProcessor:
     settings = get_settings().ingestion
     converter = build_docling_converter(
@@ -695,11 +888,11 @@ def get_conversation_repository(
 
 
 def get_chat_controller(
-    rag_service: RAGService = Depends(get_rag_service),
+    query_orchestrator: QueryOrchestrator = Depends(get_query_orchestrator),
     chat_history_repository: ChatHistoryRepository = Depends(get_chat_history_repository),
     conversation_repository: ConversationRepository = Depends(get_conversation_repository),
 ) -> ChatController:
-    return ChatController(rag_service, chat_history_repository, conversation_repository)
+    return ChatController(query_orchestrator, chat_history_repository, conversation_repository)
 
 
 def get_health_checks(

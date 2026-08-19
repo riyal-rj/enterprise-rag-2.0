@@ -47,6 +47,14 @@ class RagOpsConfig:
     # same reason as crag_shadow_enabled above.
     self_reflective_enabled: bool = False
     self_reflective_rollout_percentage: int = 0
+    # Text-to-SQL routing - see app.query_orchestration.query_orchestrator.
+    # sql_proposal_only is DB-constrained to always be TRUE (migration 011)
+    # and re-validated in RagRuntimeConfig.__post_init__ - this release has
+    # no automatic-execution path. Defaulted for the same reason as
+    # crag_shadow_enabled above.
+    sql_enabled: bool = False
+    sql_rollout_percentage: int = 0
+    sql_proposal_only: bool = True
 
 
 def validate_crag_state(
