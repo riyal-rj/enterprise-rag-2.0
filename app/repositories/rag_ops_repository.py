@@ -27,7 +27,8 @@ _CONFIG_COLUMNS = (
     "crag_web_enabled, emergency_disabled, "
     "emergency_disabled_reason, emergency_disabled_at, emergency_disabled_by, "
     "corpus_version, last_cache_invalidated_at, updated_at, updated_by, "
-    "crag_shadow_enabled, self_reflective_enabled, self_reflective_rollout_percentage"
+    "crag_shadow_enabled, self_reflective_enabled, self_reflective_rollout_percentage, "
+    "sql_enabled, sql_rollout_percentage, sql_proposal_only"
 )
 
 _DIFF_FIELDS = (
@@ -44,6 +45,8 @@ _DIFF_FIELDS = (
     "crag_shadow_enabled",
     "self_reflective_enabled",
     "self_reflective_rollout_percentage",
+    "sql_enabled",
+    "sql_rollout_percentage",
 )
 
 
@@ -70,6 +73,8 @@ class RagOpsRepository(Protocol):
         crag_shadow_enabled: bool | None = None,
         self_reflective_enabled: bool | None = None,
         self_reflective_rollout_percentage: int | None = None,
+        sql_enabled: bool | None = None,
+        sql_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
         """Partial update: ``None`` fields are left unchanged. Writes an
         audit row iff at least one field actually changed value."""
@@ -124,6 +129,8 @@ class PostgresRagOpsRepository:
         crag_shadow_enabled: bool | None = None,
         self_reflective_enabled: bool | None = None,
         self_reflective_rollout_percentage: int | None = None,
+        sql_enabled: bool | None = None,
+        sql_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -176,6 +183,8 @@ class PostgresRagOpsRepository:
                         self_reflective_rollout_percentage = COALESCE(
                             %s, self_reflective_rollout_percentage
                         ),
+                        sql_enabled = COALESCE(%s, sql_enabled),
+                        sql_rollout_percentage = COALESCE(%s, sql_rollout_percentage),
                         updated_at = now(),
                         updated_by = %s
                     WHERE id = 1
@@ -195,6 +204,8 @@ class PostgresRagOpsRepository:
                         crag_shadow_enabled,
                         self_reflective_enabled,
                         self_reflective_rollout_percentage,
+                        sql_enabled,
+                        sql_rollout_percentage,
                         actor,
                     ),
                 )
@@ -349,4 +360,7 @@ def _row_to_config(row: tuple[Any, ...]) -> RagOpsConfig:
         crag_shadow_enabled=row[19],
         self_reflective_enabled=row[20],
         self_reflective_rollout_percentage=row[21],
+        sql_enabled=row[22],
+        sql_rollout_percentage=row[23],
+        sql_proposal_only=row[24],
     )

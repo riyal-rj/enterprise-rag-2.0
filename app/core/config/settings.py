@@ -25,9 +25,9 @@ from app.core.config.log_settings import LoggingSettings
 from app.core.config.rag_features import RAGFeatureSettings
 from app.core.config.safety import SafetySettings
 from app.core.config.security import AuthSettings, RateLimitSettings
+from app.core.config.sql_settings import SQLFeatureSettings
 from app.core.config.storage import StorageSettings
 from app.core.config.token_budget import TokenBudgetSettings
-from app.core.config.vanna_settings import VannaSettings
 from app.core.config.vector_store import QdrantSettings
 
 
@@ -51,7 +51,7 @@ class Settings(BaseModel):
     token_budget: TokenBudgetSettings = Field(default_factory=TokenBudgetSettings)
     safety: SafetySettings = Field(default_factory=SafetySettings)
     rag: RAGFeatureSettings = Field(default_factory=RAGFeatureSettings)
-    vanna: VannaSettings = Field(default_factory=VannaSettings)
+    sql: SQLFeatureSettings = Field(default_factory=SQLFeatureSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
     @model_validator(mode="after")

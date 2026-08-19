@@ -137,6 +137,14 @@ class RagOpsStatusResponse(BaseModel):
     self_reflective_rollout_percentage: int
     self_reflection_metrics: SelfReflectionMetrics
 
+    # Text-to-SQL routing - no metrics sub-object yet (unlike the stages
+    # above): this is an admin-only, proposal-only rollout with no live
+    # traffic path to sample from until an admin turns it on for real. See
+    # app.query_orchestration.query_orchestrator.
+    sql_enabled: bool
+    sql_rollout_percentage: int
+    sql_proposal_only: bool
+
     emergency_disabled: bool
     emergency_disabled_reason: str | None
     emergency_disabled_at: datetime | None
@@ -166,6 +174,12 @@ class RagOpsConfigUpdateRequest(BaseModel):
     crag_shadow_enabled: bool | None = None
     self_reflective_enabled: bool | None = None
     self_reflective_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
+    # sql_proposal_only is deliberately not settable here - it is
+    # DB-CHECK-constrained to always be TRUE (migration 011) and re-verified
+    # in RagRuntimeConfig.__post_init__; this release has no path that would
+    # ever need to change it.
+    sql_enabled: bool | None = None
+    sql_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     reason: str | None = Field(default=None, max_length=500)
 
 

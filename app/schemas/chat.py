@@ -175,12 +175,42 @@ class SelfReflectionMetadata(BaseModel):
     bypass_reason: str | None = None
 
 
+class SQLMetadata(BaseModel):
+    """Diagnostic detail about the Text-to-SQL route.
+
+    ``enabled=True`` only means the SQL feature toggle was on for this
+    request - most fields stay ``None``/empty unless the router actually
+    selected ``sql``/``hybrid_rag_sql`` for this question. ``normalized_sql``
+    (the AST-policy-rewritten query, not the raw model output) is only ever
+    populated for the principal that owns the proposal - see
+    ``app.query_orchestration.query_orchestrator.QueryOrchestrator``. Raw
+    result rows are never included here - only counts and identifiers,
+    same discipline ``CRAGMetadata``/``SelfReflectionMetadata`` apply to
+    their own internals.
+    """
+
+    enabled: bool
+    proposal_id: str | None = None
+    proposal_status: str | None = None
+    normalized_sql: str | None = None
+    referenced_tables: list[str] = Field(default_factory=list)
+    expires_at: datetime | None = None
+    row_count: int | None = None
+    truncated: bool = False
+    execution_ms: float | None = None
+    catalog_version: int | None = None
+    policy_version: str | None = None
+    reason_code: str | None = None
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
-    ``route`` is fixed to ``"rag"`` for now; it exists so later routing
-    (SQL / hybrid intents) can be added without changing the response
-    shape callers already depend on.
+    ``route`` was fixed to ``"rag"`` before ``QueryOrchestrator`` existed;
+    it's now a real routing decision (``"rag"``/``"sql"``/``"hybrid_rag_sql"``/
+    ``"reject"``) whenever SQL routing is enabled, and still ``"rag"``
+    unconditionally when it's not (see
+    ``app.query_orchestration.query_orchestrator.QueryOrchestrator``).
     """
 
     route: str
@@ -194,11 +224,22 @@ class ResponseMetadata(BaseModel):
     # Final post-CRAG evidence sent to the answer LLM.
     final_evidence: list[EvidencePreview] = Field(default_factory=list)
     flagged_claims: list[str] = Field(default_factory=list)
+    # Defaulted (disabled) so every pre-existing construction site
+    # (RAGService.answer, tests) keeps working unchanged - same reasoning as
+    # RagRuntimeConfig's crag_shadow_enabled/self_reflective_enabled fields.
+    sql: SQLMetadata = Field(default_factory=lambda: SQLMetadata(enabled=False))
 
 
 class ChatResponse(BaseModel):
-    """Response for ``POST /chat``."""
+    """Response for ``POST /chat``.
 
+    ``status`` defaults to ``"completed"`` - the only value every existing
+    caller has ever seen, since SQL routing (the only path that can produce
+    ``"approval_required"``/``"rejected"``) is off by default. See
+    ``app.query_orchestration.query_orchestrator.QueryOrchestrator``.
+    """
+
+    status: Literal["completed", "approval_required", "rejected"] = "completed"
     answer: str
     sources: list[str]
     confidence: float

@@ -85,6 +85,24 @@ services:
       # approves a real allowlist for this deployment.
       - CRAG_ALLOWED_REGULATORY_DOMAINS=${CRAG_ALLOWED_REGULATORY_DOMAINS:-}
       - CRAG_WEB_MAX_RESULTS=${CRAG_WEB_MAX_RESULTS:-5}
+      # Text-to-SQL (overridable via host .env) - disabled/unconfigured by
+      # default. SQL_DATABASE_URL is a separate, read-only-role analytics
+      # database (see scripts/sql/provision_sql_reader_role.sql), never this
+      # app's own DATABASE_URL above. sql_enabled/sql_rollout_percentage
+      # still live in the rag_ops_config DB row (see
+      # app/seed/migrations/011_create_text_to_sql.sql), same as CRAG's
+      # rollout flags - only static budgets/models are deployment settings.
+      - SQL_DATABASE_URL=${SQL_DATABASE_URL:-}
+      - SQL_ENABLED_BY_DEFAULT=${SQL_ENABLED_BY_DEFAULT:-false}
+      - SQL_GENERATOR_MODEL=${SQL_GENERATOR_MODEL:-gpt-4o}
+      - SQL_ROUTER_MODEL=${SQL_ROUTER_MODEL:-gpt-4o-mini}
+      - SQL_MIN_ROUTE_CONFIDENCE=${SQL_MIN_ROUTE_CONFIDENCE:-0.90}
+      - SQL_STATEMENT_TIMEOUT_MS=${SQL_STATEMENT_TIMEOUT_MS:-5000}
+      - SQL_LOCK_TIMEOUT_MS=${SQL_LOCK_TIMEOUT_MS:-500}
+      - SQL_MAX_PLAN_COST=${SQL_MAX_PLAN_COST:-100000}
+      - SQL_MAX_RESULT_ROWS=${SQL_MAX_RESULT_ROWS:-200}
+      - SQL_PROPOSAL_TTL_SECONDS=${SQL_PROPOSAL_TTL_SECONDS:-300}
+      - SQL_ALLOWED_SCHEMAS_RAW=${SQL_ALLOWED_SCHEMAS_RAW:-approved_analytics}
 
     depends_on:
       postgres:

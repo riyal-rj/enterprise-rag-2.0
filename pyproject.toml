@@ -21,8 +21,18 @@ dependencies = [
     "qdrant-client>=1.17,<2",
     # Doc parsing
     "docling>=2.9.0",
-    # Text2SQL
-    "vanna[openai,postgres]>=0.7.0",
+    # Text2SQL: Vanna generates candidate SQL (app.sql.sql_generator); pinned
+    # exact minor (not the open-ended >=0.7.0 this repo declared before) per
+    # the architecture blueprint's rule against an unconstrained major
+    # crossing dependency in a security-sensitive path. qdrant extra reuses
+    # this app's existing Qdrant instance as Vanna's example vector store
+    # instead of pulling in a second one (chromadb).
+    "vanna[openai,postgres,qdrant]>=0.7.0,<0.8",
+    # AST parsing/validation for the read-only SQL policy layer
+    # (app.sql.sql_policy) - a transpiler/parser, not a security sandbox by
+    # itself; PostgreSQL's own EXPLAIN in a read-only transaction is the
+    # authoritative validator (see app.sql.sql_executor).
+    "sqlglot>=27,<28",
     # Postgres
     "psycopg2-binary>=2.9.10",
     # Cache
