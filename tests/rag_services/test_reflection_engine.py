@@ -396,3 +396,50 @@ def test_slow_augmenter_retrieve_that_overruns_the_deadline_aborts() -> None:
     assert outcome.abstain is True
     assert outcome.bypass_reason == "budget_exhausted_deadline"
     assert reviser.calls == 0  # never reached the reviser after the slow retrieval
+
+
+def test_critic_and_reviser_disagreement_loop_still_terminates_bounded() -> None:
+    """Uses the *real* ThresholdReflectionDecisionPolicy (not a fake that
+    unconditionally returns REVISE) driven by a critic that cites a
+    genuinely different reason to reject the answer on every round - never
+    the same complaint twice, so nothing about the engine or policy can
+    special-case "the same issue keeps recurring." Round 1: missing an
+    aspect. Round 2 (after the reviser "fixes" that): now an unsupported
+    claim. Round 3: now citation completeness is short. The critic and
+    reviser never converge - proves the engine's own iteration backstop
+    terminates this regardless of how many distinct failure modes a
+    disagreeing critic/reviser pair cycles through."""
+    from app.rag_services.reflection.reflection_critic import ThresholdReflectionDecisionPolicy
+
+    real_policy = ThresholdReflectionDecisionPolicy(
+        min_evidence_relevance=0.70,
+        min_answer_relevance=0.85,
+        min_citation_completeness=0.90,
+        min_utility=4,
+    )
+    critiques = [
+        _critique(missing_aspects=("filing deadline",)),
+        _critique(support_level=SupportLevel.PARTIAL, unsupported_claims=("a wild claim",)),
+        _critique(citation_completeness=0.5),
+        _critique(answer_relevance=0.5),
+        _critique(utility=2),
+    ]
+    critic = _FakeCritic(critiques * 3)  # far more rounds available than any budget allows
+    reviser = _FakeReviser([f"revision {i}" for i in range(15)])
+    engine = _engine(critic=critic, policy=real_policy, reviser=reviser, max_iterations=3)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert outcome.abstain is True
+    # A real, budget-respecting policy recognizes its own revision budget is
+    # exhausted and returns ABSTAIN itself (bypass_reason=None - a policy
+    # decision, not the engine's defense-in-depth backstop, which only ever
+    # fires against a non-compliant policy - see
+    # test_zero_max_iterations_never_executes_a_single_revision for that
+    # case) - either way, the loop is bounded regardless of how many
+    # distinct disagreements the critic raises.
+    assert outcome.bypass_reason is None
+    # max_iterations=3 permits exactly 3 revise rounds (4 critiques total:
+    # the initial one plus one per revision) before the policy itself abstains.
+    assert critic.calls == 4
+    assert reviser.calls == 3

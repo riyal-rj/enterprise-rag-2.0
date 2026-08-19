@@ -22,8 +22,16 @@ class _FakeDelegate:
         evidence: tuple[EvidenceChunk, ...],
         initial_answer: str,
         augmenter: object,
+        *,
+        allow_retrieval: bool = True,
     ) -> SelfReflectionOutcome:
-        self.calls.append({"question": question, "initial_answer": initial_answer})
+        self.calls.append(
+            {
+                "question": question,
+                "initial_answer": initial_answer,
+                "allow_retrieval": allow_retrieval,
+            }
+        )
         return SelfReflectionOutcome(
             answer=initial_answer,
             evidence=evidence,
@@ -150,7 +158,9 @@ def test_changing_config_after_plan_does_not_affect_execute() -> None:
     outcome = engine.execute("q", (), "initial", object(), plan)  # type: ignore[arg-type]
 
     assert outcome.applied is True
-    assert delegate.calls == [{"question": "q", "initial_answer": "initial"}]
+    assert delegate.calls == [
+        {"question": "q", "initial_answer": "initial", "allow_retrieval": False}
+    ]
 
 
 def test_a_reflection_error_falls_back_to_the_initial_answer_not_a_5xx() -> None:
@@ -163,7 +173,13 @@ def test_a_reflection_error_falls_back_to_the_initial_answer_not_a_5xx() -> None
             return "self-reflection:raising:v1"
 
         def reflect(
-            self, question: str, evidence: object, initial_answer: str, augmenter: object
+            self,
+            question: str,
+            evidence: object,
+            initial_answer: str,
+            augmenter: object,
+            *,
+            allow_retrieval: bool = True,
         ) -> SelfReflectionOutcome:
             raise TimeoutError("critic call timed out")
 
@@ -175,3 +191,107 @@ def test_a_reflection_error_falls_back_to_the_initial_answer_not_a_5xx() -> None
     assert outcome.fallback is True
     assert outcome.accepted is False
     assert outcome.answer == "initial answer"
+
+
+def _config_with_shadow(
+    *,
+    shadow_enabled: bool = True,
+    rollout_percentage: int = 0,
+    retrieval_enabled: bool = False,
+    emergency_disabled: bool = False,
+) -> RagRuntimeConfig:
+    return RagRuntimeConfig(
+        reranking_enabled=False,
+        reranker_backend="local",
+        reranker_rollout_percentage=100,
+        emergency_disabled=emergency_disabled,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        corpus_version=1,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
+        self_reflective_enabled=True,
+        self_reflective_rollout_percentage=rollout_percentage,
+        self_reflective_shadow_enabled=shadow_enabled,
+        self_reflective_retrieval_enabled=retrieval_enabled,
+    )
+
+
+def test_shadow_mode_actually_invokes_the_delegate() -> None:
+    """Shadow must run the real reflection (for observation), unlike
+    control/disabled - see RAGService.answer, which discards the served
+    outcome but still needs execute() to return the real one."""
+    delegate = _FakeDelegate()
+    engine = DynamicSelfReflectionEngine(delegate=delegate)
+    config = _config_with_shadow(rollout_percentage=0)  # would be "control" if shadow weren't first
+
+    plan = engine.plan("q", config, enabled=True)
+    outcome = engine.execute("q", (), "initial", object(), plan)  # type: ignore[arg-type]
+
+    assert plan.cohort == "shadow"
+    assert outcome.applied is True
+    assert delegate.calls == [
+        {"question": "q", "initial_answer": "initial", "allow_retrieval": False}
+    ]
+
+
+def test_shadow_mode_never_allows_retrieval_even_if_retrieval_enabled_is_true() -> None:
+    delegate = _FakeDelegate()
+    engine = DynamicSelfReflectionEngine(delegate=delegate)
+    config = _config_with_shadow(retrieval_enabled=True)
+
+    plan = engine.plan("q", config, enabled=True)
+
+    assert plan.cohort == "shadow"
+    assert plan.allow_retrieval is False
+
+
+def test_emergency_disabled_takes_priority_over_shadow_mode() -> None:
+    """Emergency-disable must still win over shadow mode - a kill switch
+    must stop every reflection code path, observation included."""
+    delegate = _FakeDelegate()
+    engine = DynamicSelfReflectionEngine(delegate=delegate)
+    config = _config_with_shadow(emergency_disabled=True)
+
+    plan = engine.plan("q", config, enabled=True)
+    outcome = engine.execute("q", (), "initial", object(), plan)  # type: ignore[arg-type]
+
+    assert plan.cohort == "disabled"
+    assert plan.bypass_reason == "emergency_disabled"
+    assert outcome.applied is False
+    assert delegate.calls == []
+
+
+def test_shadow_cache_namespace_is_stable_and_never_used_for_serving() -> None:
+    engine = DynamicSelfReflectionEngine(delegate=_FakeDelegate())
+    config = _config_with_shadow()
+
+    plan = engine.plan("q", config, enabled=True)
+
+    assert plan.cache_namespace == "self-reflection:shadow:v1"
+
+
+def test_retrieval_enabled_treatment_allows_retrieval_and_is_namespaced_differently() -> None:
+    delegate = _FakeDelegate()
+    engine = DynamicSelfReflectionEngine(delegate=delegate)
+    without_retrieval = _config_with_shadow(
+        shadow_enabled=False, rollout_percentage=100, retrieval_enabled=False
+    )
+    with_retrieval = _config_with_shadow(
+        shadow_enabled=False, rollout_percentage=100, retrieval_enabled=True
+    )
+
+    plan_without = engine.plan("q", without_retrieval, enabled=True)
+    plan_with = engine.plan("q", with_retrieval, enabled=True)
+
+    assert plan_without.cohort == "treatment"
+    assert plan_without.allow_retrieval is False
+    assert plan_with.cohort == "treatment"
+    assert plan_with.allow_retrieval is True
+    # Output-affecting setting - must not share a cache namespace, or a
+    # control/no-retrieval answer could be served to a retrieval-enabled
+    # request or vice versa.
+    assert plan_without.cache_namespace != plan_with.cache_namespace

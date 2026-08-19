@@ -157,9 +157,16 @@ class _FakeReflectionDelegate:
         evidence: tuple[EvidenceChunk, ...],
         initial_answer: str,
         augmenter: object,
+        *,
+        allow_retrieval: bool = True,
     ) -> SelfReflectionOutcome:
         self.calls.append(
-            {"question": question, "evidence": evidence, "initial_answer": initial_answer}
+            {
+                "question": question,
+                "evidence": evidence,
+                "initial_answer": initial_answer,
+                "allow_retrieval": allow_retrieval,
+            }
         )
         if self._raise_error:
             raise RuntimeError("boom")
@@ -185,6 +192,7 @@ def _reflection_service(
     corrective_delegate: object | None = None,
     crag_enabled: bool = False,
     config_store: RagRuntimeConfigStore | None = None,
+    self_reflection_telemetry: object | None = None,
 ) -> tuple[RAGService, _FakeVectorRepository]:
     vector_repository = _FakeVectorRepository(results)
     strategy: RetrievalStrategy = DenseRetrievalStrategy(
@@ -208,6 +216,8 @@ def _reflection_service(
         kwargs["crag_enabled"] = crag_enabled
     if config_store is not None:
         kwargs["config_store"] = config_store
+    if self_reflection_telemetry is not None:
+        kwargs["self_reflection_telemetry"] = self_reflection_telemetry
     service = RAGService(**kwargs)  # type: ignore[arg-type]
     return service, vector_repository
 
@@ -510,3 +520,190 @@ def test_fallback_without_flagged_claims_still_serves_the_draft() -> None:
     assert response.metadata.self_reflection.fallback is True
     assert response.metadata.self_reflection.abstain is False
     assert response.answer == "This section describes general account opening considerations."
+
+
+def _shadow_config_store(*, retrieval_enabled: bool = False) -> RagRuntimeConfigStore:
+    return RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
+            self_reflective_enabled=True,
+            self_reflective_rollout_percentage=0,
+            self_reflective_shadow_enabled=True,
+            self_reflective_retrieval_enabled=retrieval_enabled,
+        )
+    )
+
+
+def test_shadow_mode_runs_reflection_but_never_serves_its_answer() -> None:
+    chunks = _chunks("a")
+
+    def reflection_factory(
+        question: str, evidence: tuple[EvidenceChunk, ...], initial_answer: str
+    ) -> SelfReflectionOutcome:
+        return SelfReflectionOutcome(
+            answer="shadow-only revised answer",
+            evidence=(
+                EvidenceChunk(
+                    text="shadow-only evidence",
+                    source="a.pdf",
+                    page_number=None,
+                    retrieval_score=0.9,
+                    origin=EvidenceOrigin.POLICY,
+                ),
+            ),
+            applied=True,
+            accepted=True,
+            final_action=ReflectionAction.ACCEPT,
+            iterations=1,
+            additional_retrievals=0,
+        )
+
+    delegate = _FakeReflectionDelegate(outcome_factory=reflection_factory)
+    llm_client = _FakeLLMClient(answer="the baseline answer")
+    config_store = _shadow_config_store()
+    service, _ = _reflection_service(
+        chunks, delegate, llm_client=llm_client, config_store=config_store
+    )
+
+    response = service.answer("q", top_k=1)
+
+    # The delegate was actually invoked (observation) ...
+    assert len(delegate.calls) == 1
+    # ... but its answer/evidence never reached the response.
+    assert response.answer == "the baseline answer"
+    assert [e.text for e in response.metadata.final_evidence] == ["a"]
+    assert response.metadata.self_reflection.bypass_reason == "shadow_not_served"
+    assert response.metadata.self_reflection.applied is False
+
+
+def test_shadow_mode_never_allows_retrieval_even_when_retrieval_enabled() -> None:
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    config_store = _shadow_config_store(retrieval_enabled=True)
+    service, _ = _reflection_service(chunks, delegate, config_store=config_store)
+
+    service.answer("q", top_k=1)
+
+    assert delegate.calls[0]["allow_retrieval"] is False
+
+
+def test_shadow_response_is_cacheable_like_the_baseline_it_actually_serves() -> None:
+    """A shadow-cohort response IS the baseline (unreflected) answer - shadow
+    never changes what's served (see the previous test) - so it caches
+    exactly like a baseline answer would, same as CRAG's shadow cohort. A
+    cache hit on a repeated identical question skips re-observation for
+    *that* question, which is fine: it already contributed one shadow data
+    point, and shadow's job is aggregate observation, not exhaustive
+    per-query coverage."""
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    config_store = _shadow_config_store()
+    service, _ = _reflection_service(chunks, delegate, config_store=config_store)
+
+    first = service.answer("q", top_k=1)
+    second = service.answer("q", top_k=1)
+
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert len(delegate.calls) == 1
+
+
+class _FakeSelfReflectionTelemetry:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def record_attempt(
+        self,
+        *,
+        cohort: str,
+        final_action: str | None,
+        fallback: bool,
+        abstain: bool,
+        iterations: int,
+        additional_retrievals: int,
+        duration_ms: float,
+        usage_tokens: int,
+        served: bool,
+    ) -> None:
+        self.calls.append(
+            {
+                "cohort": cohort,
+                "final_action": final_action,
+                "fallback": fallback,
+                "abstain": abstain,
+                "served": served,
+            }
+        )
+
+
+def test_fleet_telemetry_records_a_served_treatment_attempt() -> None:
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    telemetry = _FakeSelfReflectionTelemetry()
+    service, _ = _reflection_service(chunks, delegate, self_reflection_telemetry=telemetry)
+
+    service.answer("q", top_k=1)
+
+    assert len(telemetry.calls) == 1
+    assert telemetry.calls[0]["cohort"] == "treatment"
+    assert telemetry.calls[0]["served"] is True
+    assert telemetry.calls[0]["final_action"] == "accept"
+
+
+def test_fleet_telemetry_records_an_unserved_shadow_attempt() -> None:
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    telemetry = _FakeSelfReflectionTelemetry()
+    config_store = _shadow_config_store()
+    service, _ = _reflection_service(
+        chunks, delegate, config_store=config_store, self_reflection_telemetry=telemetry
+    )
+
+    service.answer("q", top_k=1)
+
+    assert len(telemetry.calls) == 1
+    assert telemetry.calls[0]["cohort"] == "shadow"
+    assert telemetry.calls[0]["served"] is False
+
+
+def test_fleet_telemetry_is_not_called_on_rollout_control_bypass() -> None:
+    chunks = _chunks("a")
+    delegate = _FakeReflectionDelegate()
+    telemetry = _FakeSelfReflectionTelemetry()
+    config_store = RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            emergency_disabled=False,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
+            self_reflective_enabled=True,
+            self_reflective_rollout_percentage=0,
+        )
+    )
+    service, _ = _reflection_service(
+        chunks, delegate, config_store=config_store, self_reflection_telemetry=telemetry
+    )
+
+    service.answer("q", top_k=1)
+
+    assert telemetry.calls == []
+    assert delegate.calls == []

@@ -108,6 +108,24 @@ class SelfReflectionMetrics(BaseModel):
     emergency_bypasses: int
 
 
+class SelfReflectionShadowMetrics(BaseModel):
+    """Shadow-cohort self-reflection performance - never served to a real
+    user, tracked separately from ``SelfReflectionMetrics`` so a shadow
+    regression is visible without being confused with what traffic is
+    actually experiencing."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+
+
 class RagOpsStatusResponse(BaseModel):
     """Everything the RAG Operations panel displays: live config, rolled-up
     metrics, and emergency-disable state."""
@@ -135,7 +153,10 @@ class RagOpsStatusResponse(BaseModel):
 
     self_reflective_enabled: bool
     self_reflective_rollout_percentage: int
+    self_reflective_shadow_enabled: bool
+    self_reflective_retrieval_enabled: bool
     self_reflection_metrics: SelfReflectionMetrics
+    self_reflection_shadow_metrics: SelfReflectionShadowMetrics
 
     # Text-to-SQL routing - no metrics sub-object yet (unlike the stages
     # above): this is an admin-only, proposal-only rollout with no live
@@ -174,6 +195,8 @@ class RagOpsConfigUpdateRequest(BaseModel):
     crag_shadow_enabled: bool | None = None
     self_reflective_enabled: bool | None = None
     self_reflective_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
+    self_reflective_shadow_enabled: bool | None = None
+    self_reflective_retrieval_enabled: bool | None = None
     # sql_proposal_only is deliberately not settable here - it is
     # DB-CHECK-constrained to always be TRUE (migration 011) and re-verified
     # in RagRuntimeConfig.__post_init__; this release has no path that would

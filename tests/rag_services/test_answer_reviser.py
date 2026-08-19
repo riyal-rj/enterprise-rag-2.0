@@ -214,3 +214,92 @@ def test_timeout_override_is_clamped_to_the_configured_ceiling() -> None:
 
     reviser.revise("q", (_evidence(),), "old", _critique(), timeout_seconds=100.0)
     assert captured["timeout_seconds"] == 10.0
+
+
+class TestFindFabricatedCitations:
+    """Unit tests for the standalone deterministic check, independent of
+    any LLM call."""
+
+    def test_citation_matching_a_real_source_is_not_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+        answer = "Customers must complete CDD. [BNK-POL-001_KYC.pdf]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_with_extra_metadata_around_a_real_source_is_not_flagged(self) -> None:
+        """The model may cite with page/section metadata alongside the
+        source, e.g. the system prompt's own suggested format
+        [Policy ID, version, page, section] - a substring match, not exact
+        equality, is required or every real citation would false-positive."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 4, section 3.1]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_to_a_source_not_in_the_supplied_evidence_is_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+        answer = "Customers must complete CDD. [BNK-POL-999_MADEUP.pdf]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-999_MADEUP.pdf",)
+
+    def test_web_citation_matches_on_canonical_url(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            EvidenceChunk(
+                text="text",
+                source="RBI Circular on KYC",
+                page_number=None,
+                retrieval_score=0.9,
+                origin=EvidenceOrigin.REGULATORY_WEB,
+                canonical_url="https://rbi.org.in/circular/123",
+            ),
+        )
+        answer = "Per regulation. [https://rbi.org.in/circular/123]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_answer_with_no_citations_at_all_is_not_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+
+        assert find_fabricated_citations("No brackets here at all.", evidence) == ()
+
+    def test_no_evidence_supplied_means_nothing_can_be_validated_against(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        assert find_fabricated_citations("[SOME.pdf]", ()) == ()
+
+
+def test_revise_raises_when_the_llm_fabricates_a_citation() -> None:
+    """End-to-end through revise() itself, not just the standalone checker -
+    proves the reviser actually enforces this, fails closed (the outer
+    FailSafeSelfReflectionEngine catches the raise and falls back), rather
+    than merely having a checker function nothing calls."""
+    llm_client = _FakeLLMClient(
+        payload={"answer": "This is required. [BNK-POL-999_NEVER_SUPPLIED.pdf]"}
+    )
+    reviser = _reviser(llm_client)
+
+    with pytest.raises(ValueError, match="BNK-POL-999_NEVER_SUPPLIED.pdf"):
+        reviser.revise("q", (_evidence(source="BNK-POL-001_KYC.pdf"),), "old answer", _critique())
+
+
+def test_revise_succeeds_when_citations_are_grounded() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "This is required. [BNK-POL-001_KYC.pdf]"})
+    reviser = _reviser(llm_client)
+
+    answer, _ = reviser.revise(
+        "q", (_evidence(source="BNK-POL-001_KYC.pdf"),), "old answer", _critique()
+    )
+
+    assert answer == "This is required. [BNK-POL-001_KYC.pdf]"

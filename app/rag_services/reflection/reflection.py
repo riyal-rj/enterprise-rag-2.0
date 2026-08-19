@@ -156,10 +156,12 @@ class SelfReflectionEngine(Protocol):
         evidence: tuple[EvidenceChunk, ...],
         initial_answer: str,
         augmenter: EvidenceAugmenter,
+        *,
+        allow_retrieval: bool = True,
     ) -> SelfReflectionOutcome: ...
 
 
-SelfReflectionCohort = Literal["disabled", "control", "treatment"]
+SelfReflectionCohort = Literal["disabled", "control", "shadow", "treatment"]
 
 
 @dataclass(frozen=True)
@@ -167,6 +169,12 @@ class SelfReflectionPlan:
     cohort: SelfReflectionCohort
     bypass_reason: str | None
     cache_namespace: str
+    # Whether the bounded additional-retrieval step (RETRIEVE_MORE) is
+    # available for this request - the revision-only-canary gate, same role
+    # CRAGPlan.allow_web plays for CRAG's web correction. Always False for
+    # every non-treatment cohort (mirrors allow_web always being False in
+    # shadow/control/disabled - see DynamicSelfReflectionEngine.plan).
+    allow_retrieval: bool = False
 
 
 class PlannedSelfReflectionEngine(Protocol):
@@ -231,9 +239,13 @@ class FailSafeSelfReflectionEngine:
         evidence: tuple[EvidenceChunk, ...],
         initial_answer: str,
         augmenter: EvidenceAugmenter,
+        *,
+        allow_retrieval: bool = True,
     ) -> SelfReflectionOutcome:
         try:
-            return self._delegate.reflect(question, evidence, initial_answer, augmenter)
+            return self._delegate.reflect(
+                question, evidence, initial_answer, augmenter, allow_retrieval=allow_retrieval
+            )
         except Exception as exc:  # noqa: BLE001 - deliberate availability boundary
             logger.warning(
                 "rag.self_reflection_fallback",

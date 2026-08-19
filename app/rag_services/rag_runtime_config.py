@@ -68,6 +68,14 @@ class RagRuntimeConfig:
     # construction site keeps working unchanged.
     self_reflective_enabled: bool = False
     self_reflective_rollout_percentage: int = 0
+    # Observe-only rollout stage, ahead of a real treatment rollout - see
+    # DynamicSelfReflectionEngine.plan and RAGService.answer's self-reflection
+    # "shadow" cohort handling. Same role as crag_shadow_enabled.
+    self_reflective_shadow_enabled: bool = False
+    # Revision-only canary gate: RETRIEVE_MORE is unavailable (degrades to
+    # REVISE) until this is turned on separately - see
+    # StructuredSelfReflectionEngine.reflect's allow_retrieval parameter.
+    self_reflective_retrieval_enabled: bool = False
     # Text-to-SQL routing (app.query_orchestration.query_orchestrator) -
     # admin-only, proposal-only. Defaulted so every pre-existing
     # construction site keeps working unchanged, same reasoning as
@@ -93,6 +101,10 @@ class RagRuntimeConfig:
             raise ValueError("crag_shadow_enabled requires crag_enabled")
         if not 0 <= self.self_reflective_rollout_percentage <= 100:
             raise ValueError("self_reflective_rollout_percentage must be between 0 and 100")
+        if self.self_reflective_shadow_enabled and not self.self_reflective_enabled:
+            raise ValueError("self_reflective_shadow_enabled requires self_reflective_enabled")
+        if self.self_reflective_retrieval_enabled and not self.self_reflective_enabled:
+            raise ValueError("self_reflective_retrieval_enabled requires self_reflective_enabled")
         if not 0 <= self.sql_rollout_percentage <= 100:
             raise ValueError("sql_rollout_percentage must be between 0 and 100")
         if not self.sql_proposal_only:

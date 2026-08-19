@@ -75,6 +75,10 @@ from app.rag_services.reflection.reflection import (
     ReflectionAction,
     SelfReflectionOutcome,
 )
+from app.rag_services.reflection.telemetry import (
+    NoOpSelfReflectionTelemetry,
+    SelfReflectionTelemetry,
+)
 from app.rag_services.reranker.reranker import PlannedNoOpReranker, PlannedReranker, ReRankedChunk
 from app.rag_services.retrieval_strategy import RetrievalStrategy
 from app.repositories.semantic_cache_repository import SemanticQueryCache
@@ -143,6 +147,16 @@ class _RagServiceMetricsRecorder(Protocol):
         usage_tokens: int,
     ) -> None: ...
     def record_self_reflection_bypass(self, *, reason: str) -> None: ...
+    def record_self_reflection_shadow_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None: ...
 
 
 class _NoOpRagServiceMetrics:
@@ -200,6 +214,18 @@ class _NoOpRagServiceMetrics:
         pass
 
     def record_self_reflection_bypass(self, *, reason: str) -> None:
+        pass
+
+    def record_self_reflection_shadow_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None:
         pass
 
 
@@ -327,6 +353,7 @@ class RAGService:
         self_reflection_engine: PlannedSelfReflectionEngine | None = None,
         self_reflective_enabled: bool = False,
         reflection_retrieval_top_k: int = 5,
+        self_reflection_telemetry: SelfReflectionTelemetry | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -358,6 +385,9 @@ class RAGService:
         self._corrective_retriever = corrective_retriever or PlannedNoOpCorrectiveRetriever()
         self._self_reflection = self_reflection_engine or PlannedNoOpSelfReflectionEngine()
         self._reflection_retrieval_top_k = reflection_retrieval_top_k
+        # Fleet-wide (cross-worker/cross-process) exporter, same role as
+        # _crag_telemetry below - see app.rag_services.reflection.telemetry.
+        self._self_reflection_telemetry = self_reflection_telemetry or NoOpSelfReflectionTelemetry()
         # Fleet-wide (cross-worker/cross-process) exporter - see
         # app.rag_services.crag.telemetry. Distinct from `metrics` above
         # (process-local, powers the admin panel): this is the seam for a
@@ -390,6 +420,8 @@ class RAGService:
                 crag_shadow_enabled=False,
                 self_reflective_enabled=self_reflective_enabled,
                 self_reflective_rollout_percentage=100,
+                self_reflective_shadow_enabled=False,
+                self_reflective_retrieval_enabled=self_reflective_enabled,
             )
         )
 
@@ -780,6 +812,71 @@ class RAGService:
         reflection_started = time.perf_counter()
         if (
             effective_self_reflective_enabled
+            and self_reflection_plan.cohort == "shadow"
+            and not crag_outcome.abstain
+        ):
+            # Observe-only: the real engine actually runs (for measurement -
+            # see DynamicSelfReflectionEngine.execute treating "shadow" like
+            # "treatment"), but its answer/evidence is never served. A shadow
+            # miss/regression must never change what a real user sees, and
+            # retrieval must stay impossible in shadow regardless of
+            # self_reflective_retrieval_enabled - self_reflection_plan.allow_retrieval
+            # is always False here (see DynamicSelfReflectionEngine.plan).
+            shadow_augmenter: EvidenceAugmenter = _CallableEvidenceAugmenter(
+                lambda query: self._retrieve_reflection_evidence(
+                    query, strategy=strategy, top_k=self._reflection_retrieval_top_k
+                )
+            )
+            shadow_reflection_outcome = self._self_reflection.execute(
+                question, crag_outcome.evidence, answer_text, shadow_augmenter, self_reflection_plan
+            )
+            shadow_reflection_outcome = replace(
+                shadow_reflection_outcome,
+                duration_ms=(time.perf_counter() - reflection_started) * 1000,
+            )
+            self._metrics.record_self_reflection_shadow_outcome(
+                duration_ms=shadow_reflection_outcome.duration_ms,
+                final_action=shadow_reflection_outcome.final_action.value,
+                fallback=shadow_reflection_outcome.fallback,
+                iterations=shadow_reflection_outcome.iterations,
+                additional_retrievals=shadow_reflection_outcome.additional_retrievals,
+                usage_tokens=shadow_reflection_outcome.usage_tokens,
+            )
+            self._self_reflection_telemetry.record_attempt(
+                cohort=self_reflection_plan.cohort,
+                final_action=shadow_reflection_outcome.final_action.value,
+                fallback=shadow_reflection_outcome.fallback,
+                abstain=shadow_reflection_outcome.abstain,
+                iterations=shadow_reflection_outcome.iterations,
+                additional_retrievals=shadow_reflection_outcome.additional_retrievals,
+                duration_ms=shadow_reflection_outcome.duration_ms,
+                usage_tokens=shadow_reflection_outcome.usage_tokens,
+                served=False,
+            )
+            logger.debug(
+                "rag.self_reflection_shadow_observed",
+                extra={
+                    "final_action": shadow_reflection_outcome.final_action.value,
+                    "accepted": shadow_reflection_outcome.accepted,
+                    "fallback": shadow_reflection_outcome.fallback,
+                    "abstain": shadow_reflection_outcome.abstain,
+                    "iterations": shadow_reflection_outcome.iterations,
+                    "additional_retrievals": shadow_reflection_outcome.additional_retrievals,
+                    "duration_ms": round(shadow_reflection_outcome.duration_ms, 2),
+                },
+            )
+            self_reflection_outcome = SelfReflectionOutcome(
+                answer=answer_text,
+                evidence=crag_outcome.evidence,
+                applied=False,
+                accepted=True,
+                final_action=ReflectionAction.ACCEPT,
+                iterations=0,
+                additional_retrievals=0,
+                bypass_reason="shadow_not_served",
+            )
+        elif (
+            effective_self_reflective_enabled
             and self_reflection_plan.cohort == "treatment"
             and not crag_outcome.abstain
         ):
@@ -802,6 +899,17 @@ class RAGService:
                 iterations=self_reflection_outcome.iterations,
                 additional_retrievals=self_reflection_outcome.additional_retrievals,
                 usage_tokens=self_reflection_outcome.usage_tokens,
+            )
+            self._self_reflection_telemetry.record_attempt(
+                cohort=self_reflection_plan.cohort,
+                final_action=self_reflection_outcome.final_action.value,
+                fallback=self_reflection_outcome.fallback,
+                abstain=self_reflection_outcome.abstain,
+                iterations=self_reflection_outcome.iterations,
+                additional_retrievals=self_reflection_outcome.additional_retrievals,
+                duration_ms=self_reflection_outcome.duration_ms,
+                usage_tokens=self_reflection_outcome.usage_tokens,
+                served=True,
             )
             log_fields = {
                 "final_action": self_reflection_outcome.final_action.value,

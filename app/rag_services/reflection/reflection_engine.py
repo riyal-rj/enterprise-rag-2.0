@@ -94,10 +94,19 @@ class StructuredSelfReflectionEngine:
         evidence: tuple[EvidenceChunk, ...],
         initial_answer: str,
         augmenter: EvidenceAugmenter,
+        *,
+        allow_retrieval: bool = True,
     ) -> SelfReflectionOutcome:
         started = time.perf_counter()
         deadline = started + self._total_timeout
         state = ReflectionState(answer=initial_answer, evidence=evidence)
+        # The revision-only-canary gate: with allow_retrieval=False (control/
+        # shadow/disabled cohorts, or treatment before an admin separately
+        # promotes retrieval - see SelfReflectionPlan.allow_retrieval), the
+        # effective retrieval budget is 0 regardless of this engine's own
+        # configured ceiling, so RETRIEVE_MORE always degrades to REVISE
+        # below - the policy never even needs to know about this gate.
+        effective_max_retrievals = self._max_retrievals if allow_retrieval else 0
 
         while True:
             if self._deadline_exceeded(deadline):
@@ -143,7 +152,7 @@ class StructuredSelfReflectionEngine:
             )
             budget = ReflectionBudget(
                 max_iterations=self._max_iterations,
-                max_additional_retrievals=self._max_retrievals,
+                max_additional_retrievals=effective_max_retrievals,
                 max_total_tokens=self._max_total_tokens,
                 deadline_monotonic=deadline,
             )
@@ -197,7 +206,7 @@ class StructuredSelfReflectionEngine:
                 )
             if (
                 action is ReflectionAction.RETRIEVE_MORE
-                and state.additional_retrievals >= self._max_retrievals
+                and state.additional_retrievals >= effective_max_retrievals
             ):
                 # Retrieval budget already spent - degrade to a plain revise
                 # over the existing evidence rather than erroring or

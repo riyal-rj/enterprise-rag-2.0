@@ -101,6 +101,27 @@ class SelfReflectionMetricsSnapshot:
 
 
 @dataclass(frozen=True)
+class SelfReflectionShadowMetricsSnapshot:
+    """Shadow-cohort self-reflection performance over the last
+    ``window_size`` observations - never served to a real user (see
+    RAGService.answer's self-reflection "shadow" cohort handling), tracked
+    separately from :class:`SelfReflectionMetricsSnapshot` so a shadow
+    regression is visible without being confused with what traffic is
+    actually experiencing. Same shape as :class:`CRAGShadowMetricsSnapshot`."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+
+
+@dataclass(frozen=True)
 class HyDEMetricsSnapshot:
     """HyDE performance over the last ``window_size`` *attempted* transforms
     (the delegate was actually invoked - rollout-bypassed and
@@ -164,6 +185,13 @@ class RagMetricsService:
         )
         self._reflection_usage_tokens_total = 0
         self._reflection_bypass_counts: dict[str, int] = {"rollout": 0, "emergency_disabled": 0}
+        # Same per-sample shape as _reflection_samples, kept in a fully
+        # separate window/counter set - shadow observations must never blend
+        # into the served-traffic reflection stats above.
+        self._reflection_shadow_samples: deque[tuple[float, str, bool, int, int]] = deque(
+            maxlen=window_size
+        )
+        self._reflection_shadow_usage_tokens_total = 0
 
     def record_rerank(
         self, *, duration_ms: float, fallback: bool, usage_tokens: int | None
@@ -368,6 +396,54 @@ class RagMetricsService:
             usage_tokens_total=tokens,
             rollout_bypasses=bypasses.get("rollout", 0),
             emergency_bypasses=bypasses.get("emergency_disabled", 0),
+        )
+
+    def record_self_reflection_shadow_outcome(
+        self,
+        *,
+        duration_ms: float,
+        final_action: str,
+        fallback: bool,
+        iterations: int,
+        additional_retrievals: int,
+        usage_tokens: int,
+    ) -> None:
+        with self._lock:
+            self._reflection_shadow_samples.append(
+                (duration_ms, final_action, fallback, iterations, additional_retrievals)
+            )
+            self._reflection_shadow_usage_tokens_total += max(usage_tokens, 0)
+
+    def self_reflection_shadow_stats(self) -> SelfReflectionShadowMetricsSnapshot:
+        with self._lock:
+            samples = list(self._reflection_shadow_samples)
+            tokens = self._reflection_shadow_usage_tokens_total
+
+        durations = sorted(duration for duration, *_rest in samples)
+        attempts = len(samples)
+        first_pass_accept_count = sum(
+            1
+            for _d, action, _f, iterations, _r in samples
+            if action == "accept" and iterations <= 1
+        )
+        revised_count = sum(1 for _d, _a, _f, iterations, _r in samples if iterations > 1)
+        additional_retrieval_count = sum(
+            1 for _d, _a, _f, _i, retrievals in samples if retrievals > 0
+        )
+        abstain_count = sum(1 for _d, action, _f, _i, _r in samples if action == "abstain")
+        fallback_count = sum(1 for _d, _a, fallback, _i, _r in samples if fallback)
+        total_iterations = sum(iterations for _d, _a, _f, iterations, _r in samples)
+        return SelfReflectionShadowMetricsSnapshot(
+            sample_count=attempts,
+            p50_latency_ms=_percentile(durations, 0.50),
+            p95_latency_ms=_percentile(durations, 0.95),
+            first_pass_acceptance_rate=(first_pass_accept_count / attempts) if attempts else 0.0,
+            revision_rate=(revised_count / attempts) if attempts else 0.0,
+            additional_retrieval_rate=(additional_retrieval_count / attempts) if attempts else 0.0,
+            abstention_rate=(abstain_count / attempts) if attempts else 0.0,
+            fallback_rate=(fallback_count / attempts) if attempts else 0.0,
+            average_iterations=(total_iterations / attempts) if attempts else 0.0,
+            usage_tokens_total=tokens,
         )
 
 

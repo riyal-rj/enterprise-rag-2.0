@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from app.rag_services.reflection.answer_reviser import StructuredGroundedAnswerReviser
+from app.rag_services.reflection.answer_reviser import (
+    StructuredGroundedAnswerReviser,
+    find_fabricated_citations,
+)
 from app.rag_services.reflection.dynamic_self_reflection import (
     DynamicSelfReflectionEngine,
     StaticPlannedSelfReflectionEngine,
@@ -31,12 +34,17 @@ from app.rag_services.reflection.reflection_critic import (
     ThresholdReflectionDecisionPolicy,
 )
 from app.rag_services.reflection.reflection_engine import StructuredSelfReflectionEngine
+from app.rag_services.reflection.telemetry import (
+    NoOpSelfReflectionTelemetry,
+    SelfReflectionTelemetry,
+)
 
 __all__ = [
     "DynamicSelfReflectionEngine",
     "EvidenceAugmenter",
     "FailSafeSelfReflectionEngine",
     "GroundedAnswerReviser",
+    "NoOpSelfReflectionTelemetry",
     "PlannedNoOpSelfReflectionEngine",
     "PlannedSelfReflectionEngine",
     "ReflectionAction",
@@ -49,11 +57,13 @@ __all__ = [
     "SelfReflectionEngine",
     "SelfReflectionOutcome",
     "SelfReflectionPlan",
+    "SelfReflectionTelemetry",
     "StaticPlannedSelfReflectionEngine",
     "StructuredGroundedAnswerReviser",
     "StructuredReflectionCritic",
     "StructuredSelfReflectionEngine",
     "SupportLevel",
     "ThresholdReflectionDecisionPolicy",
+    "find_fabricated_citations",
     "validate_reflection_query",
 ]

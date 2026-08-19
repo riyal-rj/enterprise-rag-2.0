@@ -539,6 +539,8 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             crag_shadow_enabled=config.crag_shadow_enabled,
             self_reflective_enabled=config.self_reflective_enabled,
             self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            self_reflective_shadow_enabled=config.self_reflective_shadow_enabled,
+            self_reflective_retrieval_enabled=config.self_reflective_retrieval_enabled,
             sql_enabled=config.sql_enabled,
             sql_rollout_percentage=config.sql_rollout_percentage,
             sql_proposal_only=config.sql_proposal_only,

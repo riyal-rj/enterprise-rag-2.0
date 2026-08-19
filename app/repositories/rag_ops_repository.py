@@ -28,7 +28,8 @@ _CONFIG_COLUMNS = (
     "emergency_disabled_reason, emergency_disabled_at, emergency_disabled_by, "
     "corpus_version, last_cache_invalidated_at, updated_at, updated_by, "
     "crag_shadow_enabled, self_reflective_enabled, self_reflective_rollout_percentage, "
-    "sql_enabled, sql_rollout_percentage, sql_proposal_only"
+    "sql_enabled, sql_rollout_percentage, sql_proposal_only, "
+    "self_reflective_shadow_enabled, self_reflective_retrieval_enabled"
 )
 
 _DIFF_FIELDS = (
@@ -45,6 +46,8 @@ _DIFF_FIELDS = (
     "crag_shadow_enabled",
     "self_reflective_enabled",
     "self_reflective_rollout_percentage",
+    "self_reflective_shadow_enabled",
+    "self_reflective_retrieval_enabled",
     "sql_enabled",
     "sql_rollout_percentage",
 )
@@ -73,6 +76,8 @@ class RagOpsRepository(Protocol):
         crag_shadow_enabled: bool | None = None,
         self_reflective_enabled: bool | None = None,
         self_reflective_rollout_percentage: int | None = None,
+        self_reflective_shadow_enabled: bool | None = None,
+        self_reflective_retrieval_enabled: bool | None = None,
         sql_enabled: bool | None = None,
         sql_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
@@ -129,6 +134,8 @@ class PostgresRagOpsRepository:
         crag_shadow_enabled: bool | None = None,
         self_reflective_enabled: bool | None = None,
         self_reflective_rollout_percentage: int | None = None,
+        self_reflective_shadow_enabled: bool | None = None,
+        self_reflective_retrieval_enabled: bool | None = None,
         sql_enabled: bool | None = None,
         sql_rollout_percentage: int | None = None,
     ) -> RagOpsConfig:
@@ -165,6 +172,32 @@ class PostgresRagOpsRepository:
                 if next_crag_shadow_enabled and not next_crag_enabled:
                     raise InvalidRagOpsConfigError("crag_shadow_enabled requires crag_enabled")
 
+                # Same lock-protected re-validation as above, for
+                # self-reflection's dependent sub-flags.
+                next_self_reflective_enabled = (
+                    old.self_reflective_enabled
+                    if self_reflective_enabled is None
+                    else self_reflective_enabled
+                )
+                next_self_reflective_shadow_enabled = (
+                    old.self_reflective_shadow_enabled
+                    if self_reflective_shadow_enabled is None
+                    else self_reflective_shadow_enabled
+                )
+                next_self_reflective_retrieval_enabled = (
+                    old.self_reflective_retrieval_enabled
+                    if self_reflective_retrieval_enabled is None
+                    else self_reflective_retrieval_enabled
+                )
+                if next_self_reflective_shadow_enabled and not next_self_reflective_enabled:
+                    raise InvalidRagOpsConfigError(
+                        "self_reflective_shadow_enabled requires self_reflective_enabled"
+                    )
+                if next_self_reflective_retrieval_enabled and not next_self_reflective_enabled:
+                    raise InvalidRagOpsConfigError(
+                        "self_reflective_retrieval_enabled requires self_reflective_enabled"
+                    )
+
                 cur.execute(
                     f"""
                     UPDATE rag_ops_config SET
@@ -182,6 +215,12 @@ class PostgresRagOpsRepository:
                         self_reflective_enabled = COALESCE(%s, self_reflective_enabled),
                         self_reflective_rollout_percentage = COALESCE(
                             %s, self_reflective_rollout_percentage
+                        ),
+                        self_reflective_shadow_enabled = COALESCE(
+                            %s, self_reflective_shadow_enabled
+                        ),
+                        self_reflective_retrieval_enabled = COALESCE(
+                            %s, self_reflective_retrieval_enabled
                         ),
                         sql_enabled = COALESCE(%s, sql_enabled),
                         sql_rollout_percentage = COALESCE(%s, sql_rollout_percentage),
@@ -204,6 +243,8 @@ class PostgresRagOpsRepository:
                         crag_shadow_enabled,
                         self_reflective_enabled,
                         self_reflective_rollout_percentage,
+                        self_reflective_shadow_enabled,
+                        self_reflective_retrieval_enabled,
                         sql_enabled,
                         sql_rollout_percentage,
                         actor,
@@ -363,4 +404,6 @@ def _row_to_config(row: tuple[Any, ...]) -> RagOpsConfig:
         sql_enabled=row[22],
         sql_rollout_percentage=row[23],
         sql_proposal_only=row[24],
+        self_reflective_shadow_enabled=row[25],
+        self_reflective_retrieval_enabled=row[26],
     )
