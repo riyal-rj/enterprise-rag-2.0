@@ -43,6 +43,7 @@ def _completed_answer() -> SQLCompletedAnswer:
         fingerprint=proposal.sql_fingerprint,
         referenced_tables=proposal.referenced_tables,
         referenced_columns=("approved_analytics.accounts.id",),
+        projection_sensitive=(False,),
         row_limit=10,
         policy_version=proposal.policy_version,
     )

@@ -5,6 +5,7 @@ tests/rag_services/test_crag_refiner.py's local _FakeLLMClient)."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid4
@@ -13,6 +14,7 @@ import psycopg2.errors
 import pytest
 
 from app.core.exceptions import SQLGenerationFailedError, SQLProposalStateError
+from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.sql.catalog import StaticSQLCatalog
 from app.sql.models import (
     CatalogSnapshot,
@@ -46,6 +48,7 @@ def _validated(
         fingerprint=fingerprint,
         referenced_tables=("approved_analytics.accounts",),
         referenced_columns=("approved_analytics.accounts.id",),
+        projection_sensitive=(False,),
         row_limit=10,
         policy_version=policy_version,
     )
@@ -133,9 +136,13 @@ class _FakeExecutor:
 
 class _FakeResultPolicy:
     def apply(
-        self, result: SQLExecutionResult, principal: SQLPrincipal, catalog: CatalogSnapshot
+        self,
+        result: SQLExecutionResult,
+        principal: SQLPrincipal,
+        catalog: CatalogSnapshot,
+        validated: ValidatedSQL,
     ) -> SanitizedSQLResult:
-        del principal, catalog
+        del principal, catalog, validated
         return SanitizedSQLResult(
             columns=result.columns,
             rows=result.rows,
@@ -146,8 +153,13 @@ class _FakeResultPolicy:
 
 
 class _FakeAnswerer:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self._error = error
+
     def answer(self, *, question: str, query: ValidatedSQL, result: SanitizedSQLResult) -> str:
         del question, query
+        if self._error is not None:
+            raise self._error
         return f"{result.row_count} row(s) found."
 
 
@@ -208,12 +220,37 @@ class _FakeExampleRepository:
         return []
 
 
+def _config_store(
+    *, sql_enabled: bool = True, emergency_disabled: bool = False
+) -> RagRuntimeConfigStore:
+    return RagRuntimeConfigStore(
+        RagRuntimeConfig(
+            reranking_enabled=False,
+            reranker_backend="local",
+            reranker_rollout_percentage=100,
+            emergency_disabled=emergency_disabled,
+            semantic_cache_enabled=False,
+            semantic_cache_threshold=0.95,
+            corpus_version=1,
+            hyde_enabled=False,
+            hyde_rollout_percentage=0,
+            crag_enabled=False,
+            crag_rollout_percentage=0,
+            crag_web_enabled=False,
+            sql_enabled=sql_enabled,
+            sql_rollout_percentage=100,
+        )
+    )
+
+
 def _service(
     *,
     sql_sequence: list[str] | None = None,
     catalog_version: int = 1,
     execute_error: Exception | None = None,
+    answerer_error: Exception | None = None,
     max_generation_attempts: int = 2,
+    config_store: RagRuntimeConfigStore | None = None,
 ) -> tuple[SQLService, _FakeGenerator, _FakeProposalRepository, _FakeExecutor]:
     generator = _FakeGenerator(sql_sequence or ["SELECT a.id FROM approved_analytics.accounts a"])
     proposals = _FakeProposalRepository()
@@ -224,9 +261,10 @@ def _service(
         policy=cast(object, _FakePolicy()),  # type: ignore[arg-type]
         executor=cast(object, executor),  # type: ignore[arg-type]
         result_policy=cast(object, _FakeResultPolicy()),  # type: ignore[arg-type]
-        answerer=cast(object, _FakeAnswerer()),  # type: ignore[arg-type]
+        answerer=cast(object, _FakeAnswerer(error=answerer_error)),  # type: ignore[arg-type]
         proposals=cast(object, proposals),  # type: ignore[arg-type]
         examples=cast(object, _FakeExampleRepository()),  # type: ignore[arg-type]
+        config_store=config_store or _config_store(),
         proposal_ttl_seconds=300,
         max_generation_attempts=max_generation_attempts,
         max_examples=10,
@@ -287,6 +325,37 @@ def test_approve_and_execute_happy_path() -> None:
     assert len(proposals.mark_executed_calls) == 1
 
 
+def test_approve_and_execute_rejects_when_sql_disabled_after_proposal() -> None:
+    """Regression: a pending proposal must not remain executable after ops
+    disables SQL - re-checked at approval time, not just at proposal time."""
+    store = _config_store(sql_enabled=True)
+    service, _, proposals, executor = _service(config_store=store)
+    proposal = _create_proposal(service)
+    store.replace(replace(store.current, sql_enabled=False))
+
+    with pytest.raises(SQLProposalStateError, match="sql_disabled"):
+        service.approve_and_execute(principal=_principal(), proposal_id=proposal.id)
+
+    assert executor.executed is False
+    # The proposal is left exactly as it was, not marked failed - it stays
+    # approvable once SQL is re-enabled, before it expires.
+    assert proposals._proposals[proposal.id].status is SQLProposalStatus.PROPOSED  # noqa: SLF001
+    assert proposals.mark_failed_calls == []
+
+
+def test_approve_and_execute_rejects_when_emergency_disabled_after_proposal() -> None:
+    store = _config_store(sql_enabled=True, emergency_disabled=False)
+    service, _, proposals, executor = _service(config_store=store)
+    proposal = _create_proposal(service)
+    store.replace(replace(store.current, emergency_disabled=True))
+
+    with pytest.raises(SQLProposalStateError, match="sql_disabled"):
+        service.approve_and_execute(principal=_principal(), proposal_id=proposal.id)
+
+    assert executor.executed is False
+    assert proposals._proposals[proposal.id].status is SQLProposalStatus.PROPOSED  # noqa: SLF001
+
+
 def test_approve_and_execute_rejects_when_catalog_version_changed() -> None:
     service, _, proposals, _ = _service(catalog_version=1)
     proposal = _create_proposal(service)
@@ -317,6 +386,22 @@ def test_approve_and_execute_rejects_on_fingerprint_mismatch() -> None:
         service.approve_and_execute(principal=_principal(), proposal_id=proposal.id)
 
     assert proposals.mark_failed_calls == ["fingerprint_mismatch"]
+
+
+def test_approve_and_execute_marks_failed_when_answerer_raises_after_execution() -> None:
+    """Regression: an error from the result-policy/answerer stage (after
+    the query already ran) must not leave the proposal stuck in EXECUTING
+    forever - only PROPOSED proposals can ever be locked for execution
+    again."""
+    service, _, proposals, executor = _service(answerer_error=RuntimeError("llm boom"))
+    proposal = _create_proposal(service)
+
+    with pytest.raises(SQLProposalStateError, match="post_execution_failure"):
+        service.approve_and_execute(principal=_principal(), proposal_id=proposal.id)
+
+    assert executor.executed is True  # the query itself did run
+    assert proposals.mark_failed_calls == ["post_execution_failure"]
+    assert proposals._proposals[proposal.id].status is SQLProposalStatus.FAILED  # noqa: SLF001
 
 
 def test_approve_and_execute_maps_query_canceled_to_statement_timeout() -> None:

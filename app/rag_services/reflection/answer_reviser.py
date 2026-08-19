@@ -12,6 +12,16 @@ from app.rag_services.crag import EvidenceChunk
 from app.rag_services.reflection.reflection import ReflectionCritique
 
 _CITATION_PATTERN = re.compile(r"\[([^\[\]]+)\]")
+_PAGE_PATTERN = re.compile(r"p(?:age)?\.?\s*(\d+)", re.IGNORECASE)
+# Meridian Trust's own policy-numbering convention (BNK-POL-045_CYBERLIAB.pdf,
+# BNK-POL-021_HOMELOAN.docx, ...) - matching on this normalized id rather than
+# raw substring containment is what lets one bracket legitimately cite
+# *several* sources for a synthesized, multi-policy claim (e.g. "[BNK-POL-021,
+# BNK-POL-027]" comparing two lending policies) without every id needing to
+# appear as a literal substring of a single source's full filename, or vice
+# versa - two correct citations concatenated in one bracket satisfy neither
+# containment direction against any single source string.
+_POLICY_ID_PATTERN = re.compile(r"BNK-POL-\d+")
 
 
 def find_fabricated_citations(answer: str, evidence: tuple[EvidenceChunk, ...]) -> tuple[str, ...]:
@@ -25,11 +35,18 @@ def find_fabricated_citations(answer: str, evidence: tuple[EvidenceChunk, ...]) 
     The expected citation format (see both the answer-generation and
     revision system prompts) is ``[Policy ID, version, page, section]`` -
     one bracket can legitimately carry several comma-separated metadata
-    fields alongside the source identifier. A whole bracket is only flagged
-    if *none* of its content matches a real source/URL - checking each
-    comma-separated fragment independently would flag the version/page/
-    section fragments of an otherwise perfectly grounded citation as
-    "fabricated", which is not the property being checked here.
+    fields alongside the source identifier, *and* several distinct policy
+    ids for a claim that synthesizes multiple sources. When the bracket
+    contains at least one recognizable ``BNK-POL-###`` id, every id found
+    must resolve to a supplied source - not just *some* content in the
+    bracket - so a real id alongside a fabricated one still gets caught.
+    Only brackets with no recognizable id at all (a web citation by
+    ``canonical_url``, for instance) fall back to whole-string containment.
+
+    A bracket that does match a real source is still flagged if it also
+    names a page number that source doesn't actually have - matching the
+    source string alone doesn't catch a fabricated page attached to a real
+    policy (e.g. citing p.999 of a 40-page document).
     """
     if not evidence:
         return ()
@@ -38,12 +55,42 @@ def find_fabricated_citations(answer: str, evidence: tuple[EvidenceChunk, ...]) 
     if not available:
         return ()
 
+    ids_to_items: dict[str, list[EvidenceChunk]] = {}
+    for item in evidence:
+        for policy_id in _POLICY_ID_PATTERN.findall(item.source):
+            ids_to_items.setdefault(policy_id, []).append(item)
+
     fabricated: list[str] = []
     for bracket_content in _CITATION_PATTERN.findall(answer):
         stripped = bracket_content.strip()
         if not stripped:
             continue
-        if not any(avail in stripped or stripped in avail for avail in available):
+
+        cited_ids = _POLICY_ID_PATTERN.findall(stripped)
+        if cited_ids:
+            matched_items: list[EvidenceChunk] = []
+            if any(cited_id not in ids_to_items for cited_id in cited_ids):
+                fabricated.append(stripped)
+                continue
+            for cited_id in cited_ids:
+                matched_items.extend(ids_to_items[cited_id])
+        else:
+            matched_items = [
+                item
+                for item in evidence
+                for avail in (item.source, item.canonical_url)
+                if avail and (avail in stripped or stripped in avail)
+            ]
+            if not matched_items:
+                fabricated.append(stripped)
+                continue
+
+        page_match = _PAGE_PATTERN.search(stripped)
+        if page_match is None:
+            continue
+        cited_page = int(page_match.group(1))
+        known_pages = {item.page_number for item in matched_items if item.page_number is not None}
+        if known_pages and cited_page not in known_pages:
             fabricated.append(stripped)
     return tuple(dict.fromkeys(fabricated))  # de-duped, order preserved
 

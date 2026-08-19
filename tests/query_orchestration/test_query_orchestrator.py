@@ -90,12 +90,17 @@ class _FakeSQLService:
         return self._proposal
 
 
-def _config(*, sql_enabled: bool) -> RagRuntimeConfig:
+def _config(
+    *,
+    sql_enabled: bool,
+    sql_rollout_percentage: int = 100,
+    emergency_disabled: bool = False,
+) -> RagRuntimeConfig:
     return RagRuntimeConfig(
         reranking_enabled=False,
         reranker_backend="local",
         reranker_rollout_percentage=100,
-        emergency_disabled=False,
+        emergency_disabled=emergency_disabled,
         semantic_cache_enabled=False,
         semantic_cache_threshold=0.95,
         corpus_version=1,
@@ -105,6 +110,7 @@ def _config(*, sql_enabled: bool) -> RagRuntimeConfig:
         crag_rollout_percentage=0,
         crag_web_enabled=False,
         sql_enabled=sql_enabled,
+        sql_rollout_percentage=sql_rollout_percentage,
     )
 
 
@@ -128,7 +134,12 @@ def _proposal() -> SQLProposal:
 
 
 def _orchestrator(
-    *, sql_enabled: bool, decision: RouteDecision, sql_service: _FakeSQLService | None = None
+    *,
+    sql_enabled: bool,
+    decision: RouteDecision,
+    sql_service: _FakeSQLService | None = None,
+    sql_rollout_percentage: int = 100,
+    emergency_disabled: bool = False,
 ) -> tuple[QueryOrchestrator, _FakeRAGService, _FakeRouter]:
     rag_service = _FakeRAGService()
     router = _FakeRouter(decision)
@@ -136,7 +147,13 @@ def _orchestrator(
         rag_service=cast(RAGService, rag_service),
         router=cast(IntentRouter, router),
         sql_service=cast(SQLService, sql_service or _FakeSQLService()),
-        config_store=RagRuntimeConfigStore(_config(sql_enabled=sql_enabled)),
+        config_store=RagRuntimeConfigStore(
+            _config(
+                sql_enabled=sql_enabled,
+                sql_rollout_percentage=sql_rollout_percentage,
+                emergency_disabled=emergency_disabled,
+            )
+        ),
     )
     return orchestrator, rag_service, router
 
@@ -166,6 +183,75 @@ def test_sql_disabled_short_circuits_to_rag_without_calling_router() -> None:
     assert response.answer == "rag answer"
     assert rag_service.calls == 1
     assert router.calls == 0  # the whole point: no LLM router call when the feature is off
+
+
+def test_zero_rollout_falls_back_to_rag_without_calling_router() -> None:
+    """Regression: sql_enabled=true, rollout=0, emergency=false must behave
+    like sql_enabled=false, not reach approval_required."""
+    orchestrator, rag_service, router = _orchestrator(
+        sql_enabled=True,
+        sql_rollout_percentage=0,
+        emergency_disabled=False,
+        decision=RouteDecision(route=QueryRoute.SQL, confidence=0.99, reason_code="x"),
+    )
+
+    response = orchestrator.answer(
+        principal=_admin(),
+        conversation_id=1,
+        question="how many accounts?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.answer == "rag answer"
+    assert response.status == "completed"
+    assert rag_service.calls == 1
+    assert router.calls == 0
+
+
+def test_zero_rollout_with_emergency_disabled_falls_back_to_rag() -> None:
+    """Regression: sql_enabled=true, rollout=0, emergency=true must also
+    behave like sql_enabled=false."""
+    orchestrator, rag_service, router = _orchestrator(
+        sql_enabled=True,
+        sql_rollout_percentage=0,
+        emergency_disabled=True,
+        decision=RouteDecision(route=QueryRoute.SQL, confidence=0.99, reason_code="x"),
+    )
+
+    response = orchestrator.answer(
+        principal=_admin(),
+        conversation_id=1,
+        question="how many accounts?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.answer == "rag answer"
+    assert response.status == "completed"
+    assert rag_service.calls == 1
+    assert router.calls == 0
+
+
+def test_emergency_disabled_short_circuits_even_with_full_rollout() -> None:
+    orchestrator, rag_service, router = _orchestrator(
+        sql_enabled=True,
+        sql_rollout_percentage=100,
+        emergency_disabled=True,
+        decision=RouteDecision(route=QueryRoute.SQL, confidence=0.99, reason_code="x"),
+    )
+
+    response = orchestrator.answer(
+        principal=_admin(),
+        conversation_id=1,
+        question="how many accounts?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.answer == "rag answer"
+    assert rag_service.calls == 1
+    assert router.calls == 0
 
 
 def test_sql_enabled_rag_route_delegates_to_rag_service() -> None:
@@ -248,6 +334,83 @@ def test_sql_generation_failure_returns_a_rejected_response_not_a_500() -> None:
 
     assert response.status == "rejected"
     assert response.metadata.sql.reason_code == "sql_generation_failed"
+
+
+def test_hybrid_route_merges_rag_answer_with_pending_sql_proposal() -> None:
+    proposal = _proposal()
+    sql_service = _FakeSQLService(proposal=proposal)
+    orchestrator, rag_service, _ = _orchestrator(
+        sql_enabled=True,
+        decision=RouteDecision(
+            route=QueryRoute.HYBRID_RAG_SQL, confidence=0.9, reason_code="hybrid"
+        ),
+        sql_service=sql_service,
+    )
+
+    response = orchestrator.answer(
+        principal=_admin(),
+        conversation_id=1,
+        question="how many confirmed fraud cases, and what's the policy?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.status == "approval_required"
+    assert "rag answer" in response.answer
+    assert rag_service.calls == 1
+    assert sql_service.propose_calls == 1
+    assert response.metadata.route == "hybrid_rag_sql"
+    assert response.metadata.sql.enabled is True
+    assert response.metadata.sql.proposal_id == str(proposal.id)
+
+
+def test_hybrid_route_degrades_to_rag_only_when_sql_generation_fails() -> None:
+    sql_service = _FakeSQLService(error=SQLGenerationFailedError("parse_error"))
+    orchestrator, rag_service, _ = _orchestrator(
+        sql_enabled=True,
+        decision=RouteDecision(
+            route=QueryRoute.HYBRID_RAG_SQL, confidence=0.9, reason_code="hybrid"
+        ),
+        sql_service=sql_service,
+    )
+
+    response = orchestrator.answer(
+        principal=_admin(),
+        conversation_id=1,
+        question="how many confirmed fraud cases, and what's the policy?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.status == "completed"
+    assert response.answer == "rag answer"
+    assert rag_service.calls == 1
+    assert response.metadata.route == "hybrid_rag_sql"
+    assert response.metadata.sql.reason_code == "sql_generation_failed"
+
+
+def test_hybrid_route_non_admin_is_rejected_without_calling_either_service() -> None:
+    sql_service = _FakeSQLService(proposal=_proposal())
+    orchestrator, rag_service, _ = _orchestrator(
+        sql_enabled=True,
+        decision=RouteDecision(
+            route=QueryRoute.HYBRID_RAG_SQL, confidence=0.9, reason_code="hybrid"
+        ),
+        sql_service=sql_service,
+    )
+
+    response = orchestrator.answer(
+        principal=_regular_user(),
+        conversation_id=1,
+        question="how many confirmed fraud cases, and what's the policy?",
+        top_k=5,
+        retrieval_mode=None,
+    )
+
+    assert response.status == "rejected"
+    assert response.metadata.sql.reason_code == "sql_admin_only_initial_rollout"
+    assert rag_service.calls == 0
+    assert sql_service.propose_calls == 0
 
 
 def test_reject_route_returns_a_rejected_response() -> None:

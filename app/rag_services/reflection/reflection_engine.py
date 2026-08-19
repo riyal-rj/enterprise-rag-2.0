@@ -239,6 +239,15 @@ class StructuredSelfReflectionEngine:
                 return self._abstain_policy(
                     state, started, critique, reason="budget_exhausted_deadline"
                 )
+            # Mirrors the pre-critique token check at the top of the loop -
+            # without it, a revise call could be issued even though the
+            # token budget was already exhausted by this round's critique,
+            # spending further tokens/latency on a call whose result the
+            # next loop iteration would just discard anyway.
+            if state.total_tokens >= self._max_total_tokens:
+                return self._abstain_policy(
+                    state, started, critique, reason="budget_exhausted_tokens"
+                )
             revised, revision_tokens = self._reviser.revise(
                 question, state.evidence, state.answer, critique, timeout_seconds=remaining
             )

@@ -72,6 +72,39 @@ def _is_transient(exc: Exception) -> bool:
     return isinstance(exc, _TRANSIENT_ERROR_TYPES) and not isinstance(exc, _PERMANENT_ERROR_TYPES)
 
 
+def _strict_json_schema(response_model: type[BaseModel]) -> dict[str, object]:
+    """A Pydantic model's own ``model_json_schema()`` is not, by itself, a
+    valid OpenAI Structured Outputs ``strict`` schema: OpenAI requires every
+    object's ``properties`` key to also appear in that object's
+    ``required`` array - including fields that are optional/nullable on the
+    Python side (they must still always be present in the response, just
+    with a ``null`` value) - and disallows the ``default`` keyword
+    entirely. Pydantic has no reason to know either convention; it emits a
+    field with a default as omittable from ``required``, which OpenAI's API
+    then rejects outright with a 400 (confirmed live: "'required' is
+    required to be supplied and to be an array including every key in
+    properties"). Every ``generate_structured`` caller goes through this
+    one patch rather than each response model working around it field by
+    field.
+    """
+    schema = response_model.model_json_schema()
+
+    def _patch(node: object) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "properties" in node:
+                node["required"] = list(node["properties"].keys())
+                node["additionalProperties"] = False
+            node.pop("default", None)
+            for value in node.values():
+                _patch(value)
+        elif isinstance(node, list):
+            for item in node:
+                _patch(item)
+
+    _patch(schema)
+    return schema
+
+
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 
 
@@ -254,7 +287,7 @@ class OpenAILLMClient:
                 "json_schema": {
                     "name": schema_name,
                     "strict": True,
-                    "schema": response_model.model_json_schema(),
+                    "schema": _strict_json_schema(response_model),
                 },
             },
         }
@@ -263,6 +296,7 @@ class OpenAILLMClient:
             resolved_model,
             kwargs,
             max_attempts=max_attempts,
+            total_timeout_seconds=timeout_seconds,
         )
 
         message = response.choices[0].message
@@ -284,13 +318,41 @@ class OpenAILLMClient:
         )
 
     def _create_with_retries(
-        self, model: str, kwargs: dict[str, object], max_attempts: int = _MAX_ATTEMPTS
+        self,
+        model: str,
+        kwargs: dict[str, object],
+        max_attempts: int = _MAX_ATTEMPTS,
+        total_timeout_seconds: float | None = None,
     ) -> ChatCompletion:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
 
+        # total_timeout_seconds (when given - only generate_structured's
+        # callers pass one) is a ceiling on *all* attempts plus backoff
+        # combined, not a per-attempt allowance: without this, a caller
+        # budgeting `timeout_seconds=remaining` for the whole call (see
+        # StructuredSelfReflectionEngine.reflect) could see one call spend
+        # up to `max_attempts * remaining + backoff` wall-clock time, since
+        # every retry previously reused the same per-attempt timeout kwarg
+        # and the backoff sleep was unconditioned on any deadline.
+        call_deadline = (
+            time.perf_counter() + total_timeout_seconds
+            if total_timeout_seconds is not None
+            else None
+        )
+
         last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
+            if call_deadline is not None:
+                remaining = call_deadline - time.perf_counter()
+                if remaining <= 0:
+                    if last_error is not None:
+                        raise last_error
+                    raise TimeoutError(
+                        f"LLM call deadline exceeded before attempt {attempt} could start"
+                    )
+                if "timeout" in kwargs:
+                    kwargs = {**kwargs, "timeout": min(kwargs["timeout"], remaining)}  # type: ignore[type-var]
             try:
                 # kwargs is built dynamically (with/without response_format);
                 # OpenAI's heavily-overloaded signature can't be statically
@@ -318,7 +380,13 @@ class OpenAILLMClient:
                     },
                 )
                 if attempt < max_attempts:
-                    time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+                    backoff = _RETRY_BACKOFF_SECONDS * attempt
+                    if call_deadline is not None:
+                        remaining = call_deadline - time.perf_counter()
+                        if remaining <= 0:
+                            raise
+                        backoff = min(backoff, remaining)
+                    time.sleep(backoff)
 
         assert last_error is not None  # loop always sets it before exhausting attempts
         raise last_error

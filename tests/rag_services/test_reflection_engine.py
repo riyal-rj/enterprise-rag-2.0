@@ -255,6 +255,23 @@ def test_token_budget_exhaustion_abstains_without_calling_policy() -> None:
     assert critic.calls == 1
 
 
+def test_revise_is_skipped_when_token_budget_already_exhausted_by_critique() -> None:
+    """Regression: the token budget was previously only checked before
+    critique and right after it returns - never immediately before the
+    reviser call - so a revise could still be issued (and spend further
+    tokens/latency) even though the budget was already exhausted."""
+    critic = _FakeCritic([_critique(usage_tokens=100)])
+    policy = _FakePolicy([ReflectionAction.REVISE])
+    reviser = _FakeReviser(["should never be used"])
+    engine = _engine(critic=critic, policy=policy, reviser=reviser, max_total_tokens=100)
+
+    outcome = engine.reflect("q", (_evidence(),), "initial answer", _FakeAugmenter(()))
+
+    assert outcome.abstain is True
+    assert outcome.bypass_reason == "budget_exhausted_tokens"
+    assert reviser.calls == 0
+
+
 def test_deadline_exhaustion_abstains_without_calling_the_critic() -> None:
     critic = _FakeCritic([_critique()])
     policy = _FakePolicy([ReflectionAction.ACCEPT])

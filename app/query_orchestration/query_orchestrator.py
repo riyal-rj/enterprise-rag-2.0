@@ -19,6 +19,7 @@ from app.models.auth_user import AuthenticatedUser
 from app.query_orchestration.intent_router import IntentRouter
 from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
+from app.rag_services.rollout import sampled_in
 from app.schemas.chat import ChatResponse as ChatResponseSchema
 from app.schemas.chat import (
     CRAGMetadata,
@@ -63,10 +64,22 @@ class QueryOrchestrator:
         retrieval_mode: str | None,
     ) -> ChatResponseSchema:
         config = self._config_store.current
-        if not config.sql_enabled:
+        # emergency_disabled is the same global kill switch every other
+        # feature (HyDE/CRAG/reranking) already gates on - SQL routing must
+        # not be an exception to it. See RagRuntimeConfig's docstring.
+        if not config.sql_enabled or config.emergency_disabled:
             return self._rag_service.answer(question, top_k=top_k, retrieval_mode=retrieval_mode)
 
         guarded_question = self._guard_input(question)
+        # sql_rollout_percentage gates SQL routing itself, not an
+        # enhancement layered on top of it - a question sampled out falls
+        # straight back to RAG, the same as sql_enabled=False, rather than
+        # reaching the router at all.
+        if not sampled_in(guarded_question, config.sql_rollout_percentage, salt="sql"):
+            return self._rag_service.answer(
+                guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+            )
+
         decision = self._router.route(guarded_question)
 
         if decision.route is QueryRoute.RAG:
@@ -87,6 +100,17 @@ class QueryOrchestrator:
                         enabled=True, reason_code="sql_admin_only_initial_rollout"
                     ),
                 )
+
+            if decision.route is QueryRoute.HYBRID_RAG_SQL:
+                return self._generate_hybrid_answer(
+                    decision,
+                    principal=principal,
+                    conversation_id=conversation_id,
+                    question=guarded_question,
+                    top_k=top_k,
+                    retrieval_mode=retrieval_mode,
+                )
+
             try:
                 proposal = self._sql_service.propose(
                     principal=to_sql_principal(principal),
@@ -114,6 +138,81 @@ class QueryOrchestrator:
             status="rejected",
             answer="This question could not be safely routed to either document search or data lookup.",
             sql_metadata=SQLMetadata(enabled=True, reason_code=decision.reason_code),
+        )
+
+    def _generate_hybrid_answer(
+        self,
+        decision: RouteDecision,
+        *,
+        principal: AuthenticatedUser,
+        conversation_id: int,
+        question: str,
+        top_k: int,
+        retrieval_mode: str | None,
+    ) -> ChatResponseSchema:
+        """Real fan-out for HYBRID_RAG_SQL: a grounded RAG answer (real
+        citations, synchronous) plus a real generated-and-policy-validated
+        SQL proposal for the structured-data half - not the SQL-only path
+        this route used to alias to. The SQL half can never be executed
+        synchronously here - ``RagRuntimeConfig.__post_init__`` forbids
+        ``sql_proposal_only=False``, there is no automatic-execution path
+        this release - so the merged answer surfaces the RAG-grounded text
+        immediately and attaches the pending proposal for the caller to
+        approve via the existing SQL approval endpoint, rather than
+        inventing a number that hasn't actually been computed yet.
+        """
+        rag_response = self._rag_service.answer(
+            question, top_k=top_k, retrieval_mode=retrieval_mode
+        )
+        try:
+            proposal = self._sql_service.propose(
+                principal=to_sql_principal(principal),
+                conversation_id=conversation_id,
+                question=question,
+            )
+        except SQLGenerationFailedError as exc:
+            # The structured-data half failed to generate - still return the
+            # genuinely useful RAG half rather than failing the whole
+            # response, but make the gap visible in metadata rather than
+            # silently dropping it.
+            logger.info(
+                "query_orchestrator.hybrid_sql_generation_failed",
+                extra={"username": principal.username, "error": str(exc)},
+            )
+            degraded_metadata = rag_response.metadata.model_copy(
+                update={
+                    "route": decision.route.value,
+                    "sql": SQLMetadata(enabled=True, reason_code="sql_generation_failed"),
+                }
+            )
+            return rag_response.model_copy(update={"metadata": degraded_metadata})
+
+        sql_metadata = SQLMetadata(
+            enabled=True,
+            proposal_id=str(proposal.id),
+            proposal_status=proposal.status.value,
+            normalized_sql=proposal.sql,
+            referenced_tables=list(proposal.referenced_tables),
+            expires_at=proposal.expires_at,
+            catalog_version=proposal.catalog_version,
+            policy_version=proposal.policy_version,
+        )
+        merged_answer = (
+            f"{rag_response.answer}\n\n"
+            "A related data lookup has also been generated for the "
+            "structured-data part of this question and is waiting for "
+            "admin approval before it runs - review and approve it to get "
+            "the exact figure."
+        )
+        merged_metadata = rag_response.metadata.model_copy(
+            update={"route": decision.route.value, "sql": sql_metadata}
+        )
+        return rag_response.model_copy(
+            update={
+                "status": "approval_required",
+                "answer": merged_answer,
+                "metadata": merged_metadata,
+            }
         )
 
     def _guard_input(self, question: str) -> str:

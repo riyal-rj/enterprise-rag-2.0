@@ -762,6 +762,7 @@ def get_sql_service() -> SQLService:
         answerer=get_sql_answerer(),
         proposals=get_sql_proposal_repository(),
         examples=get_sql_example_repository(),
+        config_store=get_rag_runtime_config_store(),
         proposal_ttl_seconds=settings.sql_proposal_ttl_seconds,
         max_generation_attempts=settings.sql_max_generation_attempts,
         max_examples=settings.sql_max_examples,

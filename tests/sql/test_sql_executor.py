@@ -86,6 +86,7 @@ def _query() -> ValidatedSQL:
         fingerprint="f" * 64,
         referenced_tables=("approved_analytics.accounts",),
         referenced_columns=("approved_analytics.accounts.id",),
+        projection_sensitive=(False,),
         row_limit=200,
         policy_version="sql-policy-v1",
     )

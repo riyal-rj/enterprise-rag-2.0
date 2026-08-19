@@ -86,6 +86,31 @@ def test_valid_select_is_accepted_and_gets_a_limit_and_fingerprint(
     assert len(result.fingerprint) == 64
 
 
+def test_projection_sensitivity_follows_source_column_not_output_alias(
+    policy: SQLPolicy, catalog: CatalogSnapshot, principal: SQLPrincipal
+) -> None:
+    """Regression for the masking-bypass finding: aliasing a sensitive
+    column to an innocuous-looking output name must not hide its
+    sensitivity from the result-masking stage - see
+    ValidatedSQL.projection_sensitive and
+    app.sql.sql_result_policy.DefaultSQLResultPolicy."""
+    sql = "SELECT a.id, a.ssn AS harmless FROM approved_analytics.accounts a"
+
+    result = policy.validate_and_rewrite(sql, catalog=catalog, principal=principal)
+
+    assert result.projection_sensitive == (False, True)
+
+
+def test_projection_sensitivity_is_conservative_for_expressions_over_sensitive_columns(
+    policy: SQLPolicy, catalog: CatalogSnapshot, principal: SQLPrincipal
+) -> None:
+    sql = "SELECT COUNT(a.ssn) FROM approved_analytics.accounts a"
+
+    result = policy.validate_and_rewrite(sql, catalog=catalog, principal=principal)
+
+    assert result.projection_sensitive == (True,)
+
+
 def test_fingerprint_changes_when_catalog_version_changes(
     policy: SQLPolicy, catalog: CatalogSnapshot, principal: SQLPrincipal
 ) -> None:

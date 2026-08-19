@@ -101,6 +101,14 @@ class ValidatedSQL:
     fingerprint: str
     referenced_tables: tuple[str, ...]
     referenced_columns: tuple[str, ...]
+    # Positional, same length/order as the SELECT projection list (and
+    # therefore ``SQLExecutionResult.columns``/each result row) -
+    # ``projection_sensitive[i]`` is True iff output column i resolves, via
+    # AST column lineage, to a catalog column marked ``sensitive`` (or is a
+    # derived expression touching one). See
+    # ``app.sql.sql_result_policy.SQLResultPolicy`` - masking keys off this,
+    # never off the output column's returned label/alias.
+    projection_sensitive: tuple[bool, ...]
     row_limit: int
     policy_version: str
 

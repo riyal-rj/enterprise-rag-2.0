@@ -211,6 +211,47 @@ class SQLPolicy:
                     raise SQLPolicyViolation("column_not_allowed")
                 referenced_columns.add(f"{schema_name}.{table_name}.{column_name}")
 
+        # Positional output-column lineage for result masking (see
+        # ValidatedSQL.projection_sensitive's docstring). Deliberately
+        # separate from the referenced_columns loop above: that loop tracks
+        # every column touched anywhere (WHERE/JOIN/SELECT) for the table/
+        # column allowlist, while this tracks, in SELECT-list order,
+        # whether each *output* column's value can carry a sensitive
+        # source value - a bare column reference resolves directly; any
+        # other expression (function, arithmetic, concatenation, ...) is
+        # sensitive if any leaf column it reads from is sensitive. This
+        # errs conservative (e.g. COUNT(ssn) is masked even though a count
+        # isn't itself PII) rather than trying to reason about which
+        # functions "launder" their sensitive input.
+        sensitive_lookup = {
+            (
+                column.schema_name.casefold(),
+                column.table_name.casefold(),
+                column.column_name.casefold(),
+            ): column.sensitive
+            for column in catalog.columns
+        }
+        root_sources_by_alias = {
+            alias.casefold(): source for alias, source in root_scope.sources.items()
+        }
+
+        def _column_is_sensitive(column: exp.Column) -> bool:
+            alias = column.table.casefold()
+            if not alias:
+                raise SQLPolicyViolation("unqualified_column")
+            source = root_sources_by_alias.get(alias)
+            if not isinstance(source, exp.Table):
+                raise SQLPolicyViolation("column_source_not_concrete")
+            schema_name = (source.db or "").casefold()
+            table_name = source.name.casefold()
+            column_name = column.name.casefold()
+            return sensitive_lookup.get((schema_name, table_name, column_name), False)
+
+        projection_sensitive = tuple(
+            any(_column_is_sensitive(column) for column in projection.find_all(exp.Column))
+            for projection in tree.selects
+        )
+
         for function in tree.find_all(exp.Func):
             if isinstance(function, exp.Connector):
                 # exp.And/exp.Or are Func subclasses in sqlglot's hierarchy
@@ -235,6 +276,7 @@ class SQLPolicy:
             fingerprint=fingerprint,
             referenced_tables=tuple(sorted(referenced_tables)),
             referenced_columns=tuple(sorted(referenced_columns)),
+            projection_sensitive=projection_sensitive,
             row_limit=row_limit,
             policy_version=self.version,
         )

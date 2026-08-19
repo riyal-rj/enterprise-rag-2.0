@@ -205,6 +205,52 @@ def test_reject_only_succeeds_from_proposed_state(repository) -> None:  # noqa: 
         repo.reject(proposal.id, username)
 
 
+def test_reclaim_stale_executing_transitions_abandoned_rows_to_failed(repository) -> None:  # noqa: ANN001
+    """Simulates a worker crashing between lock_for_execution's EXECUTING
+    commit and the terminal mark_executed/mark_failed call - only a
+    time-based reclaim can ever recover a row stuck like this, since
+    lock_for_execution only accepts PROPOSED proposals."""
+    repo, pool, username = repository
+    conversation_id = _make_conversation(pool, username)
+    proposal = _proposal(conversation_id, username=username)
+    repo.create(proposal)
+    repo.lock_for_execution(proposal.id, username, datetime.now(UTC))
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sql_query_proposals SET approved_at = now() - interval '10 minutes' "
+            "WHERE id = %s",
+            (str(proposal.id),),
+        )
+        conn.commit()
+
+    reclaimed = repo.reclaim_stale_executing(timedelta(minutes=5))
+
+    assert reclaimed == 1
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, error_code FROM sql_query_proposals WHERE id = %s", (str(proposal.id),)
+        )
+        status, error_code = cur.fetchone()
+    assert status == SQLProposalStatus.FAILED.value
+    assert error_code == "stale_execution_reclaimed"
+
+
+def test_reclaim_stale_executing_leaves_recent_executing_rows_alone(repository) -> None:  # noqa: ANN001
+    repo, pool, username = repository
+    conversation_id = _make_conversation(pool, username)
+    proposal = _proposal(conversation_id, username=username)
+    repo.create(proposal)
+    repo.lock_for_execution(proposal.id, username, datetime.now(UTC))
+
+    reclaimed = repo.reclaim_stale_executing(timedelta(minutes=5))
+
+    assert reclaimed == 0
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM sql_query_proposals WHERE id = %s", (str(proposal.id),))
+        (status,) = cur.fetchone()
+    assert status == SQLProposalStatus.EXECUTING.value
+
+
 def test_db_constraint_rejects_an_unknown_status_bypassing_the_application_layer(
     repository,  # noqa: ANN001
 ) -> None:

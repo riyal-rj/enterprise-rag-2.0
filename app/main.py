@@ -15,6 +15,7 @@ from app.api.routes.auth_routes import router as auth_router
 from app.api.routes.chat_routes import router as chat_router
 from app.api.routes.rag_ops_routes import router as rag_ops_router
 from app.api.routes.sql_routes import router as sql_router
+from app.api.sql_proposal_recovery import StaleSQLProposalReclaimer
 from app.core.config import get_settings
 from app.core.exception_handlers import register_exception_handlers
 
@@ -26,10 +27,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # via another worker - see app.api.rag_ops_sync.
     poller = RagOpsConfigPoller()
     poller.start()
+    # Recovers SQL proposals a crashed worker left stuck in EXECUTING - see
+    # app.api.sql_proposal_recovery.
+    sql_reclaimer = StaleSQLProposalReclaimer()
+    sql_reclaimer.start()
     try:
         yield
     finally:
         await poller.stop()
+        await sql_reclaimer.stop()
         if get_db_pool.cache_info().currsize:
             get_db_pool().close()
         if get_sql_pool.cache_info().currsize:

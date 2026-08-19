@@ -11,7 +11,7 @@ proposal can't both win (see ``app.core.exceptions.SQLProposalStateError``).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -42,6 +42,8 @@ class SQLProposalRepository(Protocol):
     def mark_failed(self, proposal_id: UUID, *, error_code: str) -> None: ...
 
     def reject(self, proposal_id: UUID, username: str) -> None: ...
+
+    def reclaim_stale_executing(self, older_than: timedelta) -> int: ...
 
 
 class PostgresSQLProposalRepository:
@@ -168,6 +170,32 @@ class PostgresSQLProposalRepository:
             conn.commit()
         if updated == 0:
             raise SQLProposalStateError("proposal_not_pending")
+
+    def reclaim_stale_executing(self, older_than: timedelta) -> int:
+        """Crash recovery: a proposal can be left in ``EXECUTING`` forever
+        if the process dies between ``lock_for_execution``'s commit and the
+        terminal ``mark_executed``/``mark_failed`` call - no in-process
+        exception handler can catch that. ``approved_at`` (set by
+        ``lock_for_execution``) is the lease start; anything still
+        ``EXECUTING`` past ``older_than`` is presumed abandoned and moved to
+        ``FAILED`` so it stops blocking - only ``PROPOSED`` proposals can
+        ever be locked for execution again. See
+        ``app.api.sql_proposal_recovery.StaleSQLProposalReclaimer``."""
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE sql_query_proposals SET status = %s, error_code = %s "
+                    "WHERE status = %s AND approved_at < now() - %s::interval",
+                    (
+                        SQLProposalStatus.FAILED.value,
+                        "stale_execution_reclaimed",
+                        SQLProposalStatus.EXECUTING.value,
+                        older_than,
+                    ),
+                )
+                reclaimed = cur.rowcount
+            conn.commit()
+        return reclaimed
 
 
 def _row_to_proposal(row: tuple[Any, ...]) -> SQLProposal:

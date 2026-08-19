@@ -68,6 +68,7 @@ from app.rag_services.hyde.query_transformer import (
     QueryTransformOutcome,
 )
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
+from app.rag_services.reflection.answer_reviser import find_fabricated_citations
 from app.rag_services.reflection.reflection import (
     EvidenceAugmenter,
     PlannedNoOpSelfReflectionEngine,
@@ -309,6 +310,11 @@ _SELF_REFLECTION_FALLBACK_ABSTENTION = (
     "An internal error prevented full verification of this answer against "
     "approved evidence, and part of the draft could not be confirmed. "
     "Please retry your question."
+)
+
+_INITIAL_ANSWER_FABRICATED_CITATION_ABSTENTION = (
+    "The supplied approved evidence is insufficient to produce a fully "
+    "cited answer to this question."
 )
 
 
@@ -802,6 +808,22 @@ class RAGService:
             )
             answer_text = self._llm_client.generate(_SYSTEM_PROMPT, user_message).text
 
+        # A fabricated citation (a bracket citing a source/page never
+        # actually supplied) is a hard-safety issue on its own, independent
+        # of whether self-reflection later gets a chance to run/catch it -
+        # if it's disabled, bypassed (rollout), or CRAG already abstained,
+        # nothing downstream would otherwise ever check the initial draft.
+        # Treated the same way as a CRAG abstention: overrides answer_text
+        # directly and is threaded through the same gates below so it can
+        # never reach self-reflection to "fix" (and potentially compound)
+        # and is never cached.
+        initial_answer_fabricated = bool(
+            not crag_outcome.abstain
+            and find_fabricated_citations(answer_text, crag_outcome.evidence)
+        )
+        if initial_answer_fabricated:
+            answer_text = _INITIAL_ANSWER_FABRICATED_CITATION_ABSTENTION
+
         # Self-reflection critiques/revises the initial answer against
         # CRAG-approved evidence, and may perform one bounded additional
         # retrieval (never a web search, never a re-entrant call into this
@@ -814,6 +836,7 @@ class RAGService:
             effective_self_reflective_enabled
             and self_reflection_plan.cohort == "shadow"
             and not crag_outcome.abstain
+            and not initial_answer_fabricated
         ):
             # Observe-only: the real engine actually runs (for measurement -
             # see DynamicSelfReflectionEngine.execute treating "shadow" like
@@ -879,6 +902,7 @@ class RAGService:
             effective_self_reflective_enabled
             and self_reflection_plan.cohort == "treatment"
             and not crag_outcome.abstain
+            and not initial_answer_fabricated
         ):
             augmenter: EvidenceAugmenter = _CallableEvidenceAugmenter(
                 lambda query: self._retrieve_reflection_evidence(
@@ -928,6 +952,8 @@ class RAGService:
             bypass_reason = self_reflection_plan.bypass_reason
             if crag_outcome.abstain and effective_self_reflective_enabled:
                 bypass_reason = "crag_abstained"
+            elif initial_answer_fabricated and effective_self_reflective_enabled:
+                bypass_reason = "initial_answer_fabricated_citation"
             self_reflection_outcome = SelfReflectionOutcome(
                 answer=answer_text,
                 evidence=crag_outcome.evidence,
@@ -955,28 +981,24 @@ class RAGService:
         # who turned self-reflection on for a banking-policy system opted
         # into an extra layer of assurance against unsupported claims;
         # silently reverting to "no safety net" on a technical hiccup
-        # defeats that. Gate the fallback draft on the same deterministic,
-        # zero-LLM-cost check the response already computes for every answer
-        # (see flagged_claims below) - if it flags anything, force a
-        # deterministic abstention instead of serving unverified content.
+        # defeats that. Unconditional, not gated on the lexical
+        # find_unsupported_claims checker below - that checker only flags
+        # sentences using absolute-claim language ("must", "cannot", ...),
+        # so a fabricated-but-plainly-worded claim (e.g. "the policy permits
+        # withdrawals up to INR 10,000") would otherwise sail through
+        # unflagged and get served with no verification at all. A reflection
+        # failure means the draft was never actually checked against
+        # evidence, so it can never be trusted enough to serve as-is.
         # fallback=True already keeps this out of the cache either way (see
         # pipeline_fallback below); this only changes what's served to the
         # caller for *this* request.
         if self_reflection_outcome.fallback:
-            fallback_claims = find_unsupported_claims(
-                self_reflection_outcome.answer,
-                self._evidence_as_retrieved_chunks(self_reflection_outcome.evidence),
+            logger.warning("rag.self_reflection_fallback_unsafe_draft")
+            self_reflection_outcome = replace(
+                self_reflection_outcome,
+                answer=_SELF_REFLECTION_FALLBACK_ABSTENTION,
+                abstain=True,
             )
-            if fallback_claims:
-                logger.warning(
-                    "rag.self_reflection_fallback_unsafe_draft",
-                    extra={"flagged_claim_count": len(fallback_claims)},
-                )
-                self_reflection_outcome = replace(
-                    self_reflection_outcome,
-                    answer=_SELF_REFLECTION_FALLBACK_ABSTENTION,
-                    abstain=True,
-                )
 
         # Everything downstream (confidence, claim-checking, sources,
         # final-evidence preview) must see exactly what was actually
@@ -1109,6 +1131,7 @@ class RAGService:
             or crag_outcome.fallback
             or crag_outcome.web_used
             or crag_outcome.abstain
+            or initial_answer_fabricated
             or self_reflection_outcome.fallback
             or self_reflection_outcome.abstain
             # Explicit, not merely implied by fallback/abstain above: today

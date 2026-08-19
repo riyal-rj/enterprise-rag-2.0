@@ -503,23 +503,28 @@ def test_fallback_with_flagged_claims_forces_deterministic_abstention() -> None:
     assert response.cache_hit is False
 
 
-def test_fallback_without_flagged_claims_still_serves_the_draft() -> None:
-    """The fallback gate is precise, not a blanket "reflection failed -> always
-    abstain": a fallback draft that passes the deterministic check (the same
-    one every answer is already scored against) is still served, matching
-    pre-self-reflection baseline behavior."""
+def test_fallback_abstains_even_without_flagged_claims() -> None:
+    """Regression: a reflection failure must abstain unconditionally, not
+    only when the lexical absolute-claim checker happens to flag something.
+    That checker only catches sentences using absolute-claim language
+    ("must", "cannot", ...) - a fabricated-but-plainly-worded claim (e.g.
+    "the policy permits withdrawals up to INR 10,000") would otherwise pass
+    it unflagged and get served with no verification at all, since
+    self-reflection never actually ran to check it against evidence."""
     chunks = _chunks("a")
     delegate = _FakeReflectionDelegate(raise_error=True)
     llm_client = _FakeLLMClient(
-        answer="This section describes general account opening considerations."
+        answer="The policy permits withdrawals up to INR 10,000 without further verification."
     )
     service, _ = _reflection_service(chunks, delegate, llm_client=llm_client)
 
     response = service.answer("q", top_k=1)
 
     assert response.metadata.self_reflection.fallback is True
-    assert response.metadata.self_reflection.abstain is False
-    assert response.answer == "This section describes general account opening considerations."
+    assert response.metadata.self_reflection.abstain is True
+    assert "INR 10,000" not in response.answer
+    assert "internal error" in response.answer.lower()
+    assert response.cache_hit is False
 
 
 def _shadow_config_store(*, retrieval_enabled: bool = False) -> RagRuntimeConfigStore:

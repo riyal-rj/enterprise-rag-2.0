@@ -235,10 +235,68 @@ class TestFindFabricatedCitations:
         equality, is required or every real citation would false-positive."""
         from app.rag_services.reflection.answer_reviser import find_fabricated_citations
 
-        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
-        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 4, section 3.1]"
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)  # page_number=1
+        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 1, section 3.1]"
 
         assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_with_an_invented_page_on_a_real_source_is_flagged(self) -> None:
+        """Regression: matching the source string alone isn't enough - a
+        citation can attach a fabricated page number to a real policy
+        (reproduced with an invented page 999) and must still be caught."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)  # page_number=1
+        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 999, section 3.1]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-001_KYC.pdf, v2, page 999, section 3.1",)
+
+    def test_citation_page_check_only_applies_when_evidence_has_a_page_number(self) -> None:
+        """Web-origin evidence has no page_number - a cited page can't be
+        validated against it, so it must not false-positive."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            EvidenceChunk(
+                text="text",
+                source="RBI Circular on KYC",
+                page_number=None,
+                retrieval_score=0.9,
+                origin=EvidenceOrigin.REGULATORY_WEB,
+                canonical_url="https://rbi.org.in/circular/123",
+            ),
+        )
+        answer = "Per regulation. [https://rbi.org.in/circular/123, page 4]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_naming_two_real_sources_in_one_bracket_is_not_flagged(self) -> None:
+        """Regression: a synthesized claim spanning multiple policies is
+        legitimately cited as one bracket with several policy ids (e.g.
+        comparing two lending products) - neither containment direction
+        against a single source holds for a concatenated multi-id bracket,
+        so this must be resolved id-by-id, not as one opaque string."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            _evidence(source="BNK-POL-021_HOMELOAN.docx"),
+            _evidence(source="BNK-POL-027_LAP.docx"),
+        )
+        answer = "Home loan LTV is higher than LAP's. [BNK-POL-021, BNK-POL-027]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_naming_one_real_and_one_fabricated_id_together_is_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-021_HOMELOAN.docx"),)
+        answer = "See both policies. [BNK-POL-021, BNK-POL-999]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-021, BNK-POL-999",)
 
     def test_citation_to_a_source_not_in_the_supplied_evidence_is_flagged(self) -> None:
         from app.rag_services.reflection.answer_reviser import find_fabricated_citations

@@ -7,8 +7,8 @@
     { "schema_name": "approved_analytics", "table_name": "branches", "column_name": "region", "data_type": "text", "description": "Region (North/South/East/West)", "sensitive": false },
 
     { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "id", "data_type": "integer", "description": "Customer identifier", "sensitive": false },
-    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "full_name", "data_type": "text", "description": "Customer full name", "sensitive": false },
-    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "email", "data_type": "text", "description": "Customer email address", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "full_name", "data_type": "text", "description": "Customer full name", "sensitive": true },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "email", "data_type": "text", "description": "Customer email address", "sensitive": true },
     { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "ssn", "data_type": "text", "description": "Social security number", "sensitive": true },
     { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "segment", "data_type": "text", "description": "Customer segment: retail, premium, or business", "sensitive": false },
     { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "created_at", "data_type": "timestamptz", "description": "When the customer record was created", "sensitive": false },

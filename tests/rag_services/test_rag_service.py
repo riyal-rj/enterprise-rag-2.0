@@ -275,6 +275,33 @@ def test_answer_returns_llm_text_and_sorted_unique_sources() -> None:
     assert response.cache_hit is False
 
 
+def test_initial_answer_with_fabricated_citation_is_replaced_with_abstention() -> None:
+    """Regression: a fabricated citation in the initial (pre-reflection)
+    answer must be caught even when self-reflection never runs (the
+    default: disabled) - otherwise it ships to the caller completely
+    unchecked, and the previous behavior only ever validated citations
+    inside the self-reflection reviser."""
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
+    service, *_ = _service(results=chunks, answer="Refunds apply per policy. [z.pdf, page 3]")
+
+    first = service.answer("refund policy?")
+    second = service.answer("refund policy?")
+
+    assert "z.pdf" not in first.answer
+    assert "insufficient" in first.answer.lower()
+    assert first.cache_hit is False
+    assert second.cache_hit is False  # never cached - not written the first time either
+
+
+def test_initial_answer_citing_real_retrieved_sources_is_untouched() -> None:
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
+    service, *_ = _service(results=chunks, answer="Refunds apply per policy. [a.pdf]")
+
+    response = service.answer("refund policy?")
+
+    assert response.answer == "Refunds apply per policy. [a.pdf]"
+
+
 def test_answer_confidence_is_computed_not_a_fixed_constant() -> None:
     strong_chunks = [
         RetrievedChunk(text="refunds within 30 days of purchase", source="a.pdf", score=0.9),

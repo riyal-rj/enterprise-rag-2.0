@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import psycopg2
 
 from app.core.exceptions import SQLGenerationFailedError, SQLProposalStateError
+from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
 from app.repositories.sql_example_repository import SQLExampleRepository
 from app.repositories.sql_proposal_repository import SQLProposalRepository
 from app.sql.catalog import StaticSQLCatalog
@@ -62,6 +63,7 @@ class SQLService:
         answerer: SQLAnswerer,
         proposals: SQLProposalRepository,
         examples: SQLExampleRepository,
+        config_store: RagRuntimeConfigStore,
         proposal_ttl_seconds: int,
         max_generation_attempts: int,
         max_examples: int,
@@ -74,6 +76,7 @@ class SQLService:
         self._answerer = answerer
         self._proposals = proposals
         self._examples = examples
+        self._config_store = config_store
         self._proposal_ttl_seconds = proposal_ttl_seconds
         self._max_generation_attempts = max_generation_attempts
         self._max_examples = max_examples
@@ -137,6 +140,20 @@ class SQLService:
     def approve_and_execute(
         self, *, principal: SQLPrincipal, proposal_id: UUID
     ) -> SQLCompletedAnswer:
+        # Re-check the kill switch at approval time, not just at proposal
+        # time - a proposal can sit pending for up to proposal_ttl_seconds,
+        # and ops disabling SQL (or the emergency kill switch) must make
+        # every not-yet-approved proposal unexecutable immediately, not just
+        # block new ones. Checked before lock_for_execution so a disabled
+        # proposal never takes the row lock or moves out of PROPOSED - it
+        # stays approvable later if re-enabled before it expires. Rollout
+        # percentage is deliberately not re-checked here: that's a
+        # per-question sampling decision at proposal time, not a resource
+        # gate at execution time.
+        config = self._config_store.current
+        if not config.sql_enabled or config.emergency_disabled:
+            raise SQLProposalStateError("sql_disabled")
+
         proposal = self._proposals.lock_for_execution(
             proposal_id, principal.username, datetime.now(UTC)
         )
@@ -176,10 +193,22 @@ class SQLService:
             self._proposals.mark_failed(proposal.id, error_code=code)
             raise SQLProposalStateError(code) from exc
 
-        safe = self._result_policy.apply(raw, principal, catalog)
-        answer_text = self._answerer.answer(
-            question=proposal.question, query=validated, result=safe
-        )
+        try:
+            safe = self._result_policy.apply(raw, principal, catalog, validated)
+            answer_text = self._answerer.answer(
+                question=proposal.question, query=validated, result=safe
+            )
+        except Exception as exc:  # noqa: BLE001 - closes the same stuck-EXECUTING gap the
+            # execution try/except above does: without this, an error here
+            # (masking mismatch, LLM/schema error from the answerer) would
+            # leave the proposal in EXECUTING forever - only PROPOSED
+            # proposals can ever be locked for execution again.
+            logger.warning(
+                "sql.post_execution_failed",
+                extra={"username": principal.username, "error_type": type(exc).__name__},
+            )
+            self._proposals.mark_failed(proposal.id, error_code="post_execution_failure")
+            raise SQLProposalStateError("post_execution_failure") from exc
 
         self._proposals.mark_executed(
             proposal.id, row_count=safe.row_count, execution_ms=raw.duration_ms
