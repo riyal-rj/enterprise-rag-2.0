@@ -28,15 +28,14 @@ through a real call.
 via ``PipelineProfile.search_mode`` as its ``retrieval_mode`` override,
 ``PipelineProfile.enable_rerank`` as a per-call ``reranking_enabled``
 override, ``PipelineProfile.enable_hyde`` as a per-call ``hyde_enabled``
-override, and ``PipelineProfile.enable_crag`` as a per-call
-``crag_enabled`` override (see ``RAGService.answer``) - dense/sparse/hybrid,
-reranking, HyDE, and CRAG all run for real, through
-``app.api.deps.get_eval_hyde_transformer``/``get_eval_crag`` (never the
-production admin-rollout-controlled transformer/corrective retriever - see
-``_rag_service`` below). Self-reflective profiles still skip cleanly: it
-doesn't exist in the pipeline yet (see ``app.rag_services.rag_service``'s
-module docstring), so silently ignoring that flag would produce misleading
-pass/fail results.
+override, ``PipelineProfile.enable_crag`` as a per-call ``crag_enabled``
+override, and ``PipelineProfile.enable_self_reflective`` as a per-call
+``self_reflective_enabled`` override (see ``RAGService.answer``) -
+dense/sparse/hybrid, reranking, HyDE, CRAG, and self-reflection all run for
+real, through ``app.api.deps.get_eval_hyde_transformer``/``get_eval_crag``/
+``get_eval_self_reflection`` (never the production admin-rollout-controlled
+transformer/corrective retriever/reflection engine - see ``_rag_service``
+below).
 """
 
 from __future__ import annotations
@@ -127,6 +126,7 @@ class ServiceInvoker:
             get_embedding_client,
             get_eval_crag,
             get_eval_hyde_transformer,
+            get_eval_self_reflection,
             get_llm_client,
             get_reranker,
             get_retrieval_strategies,
@@ -176,6 +176,20 @@ class ServiceInvoker:
             # Tavily call.
             corrective_retriever=get_eval_crag(),
             crag_enabled=False,
+            # Same reasoning as the reranker/HyDE/CRAG overrides above, for
+            # self-reflection: the eval-only engine (never the admin-
+            # rollout-controlled production one), already wrapped in
+            # StaticPlannedSelfReflectionEngine by get_eval_self_reflection()
+            # so it always attempts reflection for real when
+            # flags.enable_self_reflective (a per-call override, see
+            # _call_pipeline) is on - never inheriting an admin's live
+            # rollout percentage or emergency-disable state. The bounded
+            # additional-retrieval step stays within this same eval
+            # RAGService instance (dense/sparse/hybrid over the real corpus,
+            # no web) - see RAGService._retrieve_reflection_evidence.
+            self_reflection_engine=get_eval_self_reflection(),
+            self_reflective_enabled=False,
+            reflection_retrieval_top_k=rag_settings.reflection_retrieval_top_k,
         )
 
     def invoke(
@@ -193,12 +207,6 @@ class ServiceInvoker:
     def _call_pipeline(
         self, question: str, flags: PipelineProfile
     ) -> tuple[InvokeResponse, list[RetrievedChunk]]:
-        if flags.enable_self_reflective:
-            raise SkippedIntent(
-                f"{flags.name}: self-reflective isn't implemented "
-                "in the pipeline yet, only search_mode, reranking, HyDE, and CRAG are wired"
-            )
-
         response = self._rag_service.answer(
             question,
             top_k=flags.top_k,
@@ -206,6 +214,7 @@ class ServiceInvoker:
             reranking_enabled=flags.enable_rerank,
             hyde_enabled=flags.enable_hyde,
             crag_enabled=flags.enable_crag,
+            self_reflective_enabled=flags.enable_self_reflective,
         )
 
         if flags.enable_hyde:
@@ -234,6 +243,25 @@ class ServiceInvoker:
                     f"{flags.name}: CRAG was requested but not cleanly applied "
                     f"(applied={crag.applied}, fallback={crag.fallback}, "
                     f"bypass_reason={crag.bypass_reason!r})"
+                )
+
+        if flags.enable_self_reflective and not response.metadata.crag.abstain:
+            # response.metadata.crag.abstain is excluded deliberately:
+            # self-reflection never runs when CRAG already abstained (see
+            # RAGService.answer) - there's no LLM-generated answer to
+            # critique, the abstention string is already the safe terminal
+            # response, and that's correct behavior for a golden case that
+            # intentionally tests CRAG abstention, not a reflection failure.
+            reflection = response.metadata.self_reflection
+            if not reflection.applied or reflection.fallback:
+                # Same reasoning as the HyDE/CRAG checks above: a case that
+                # asked for self-reflection and silently got the unreflected
+                # baseline answer would score as if reflection were under
+                # test when it never actually ran cleanly.
+                raise EvaluationPipelineError(
+                    f"{flags.name}: self-reflection was requested but not cleanly applied "
+                    f"(applied={reflection.applied}, fallback={reflection.fallback}, "
+                    f"bypass_reason={reflection.bypass_reason!r})"
                 )
 
         if flags.enable_crag and not response.metadata.final_evidence:

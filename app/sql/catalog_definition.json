@@ -1,0 +1,40 @@
+{
+  "_comment": "DEV/TESTING catalog matching scripts/sql/dev_seed_analytics_sample.sql - a synthetic sample schema in the local docker-compose Postgres. Replace this with the real approved allowlist once a production analytics database is provisioned (see scripts/sql/provision_sql_reader_role.sql). Bump sql_catalog_state.version whenever this file changes so cached generator training picks it up (see app.sql.sql_generator.VannaSQLGenerator.sync_catalog).",
+  "columns": [
+    { "schema_name": "approved_analytics", "table_name": "branches", "column_name": "id", "data_type": "integer", "description": "Branch identifier", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "branches", "column_name": "name", "data_type": "text", "description": "Branch name", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "branches", "column_name": "city", "data_type": "text", "description": "City the branch is located in", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "branches", "column_name": "region", "data_type": "text", "description": "Region (North/South/East/West)", "sensitive": false },
+
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "id", "data_type": "integer", "description": "Customer identifier", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "full_name", "data_type": "text", "description": "Customer full name", "sensitive": true },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "email", "data_type": "text", "description": "Customer email address", "sensitive": true },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "ssn", "data_type": "text", "description": "Social security number", "sensitive": true },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "segment", "data_type": "text", "description": "Customer segment: retail, premium, or business", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "customers", "column_name": "created_at", "data_type": "timestamptz", "description": "When the customer record was created", "sensitive": false },
+
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "id", "data_type": "integer", "description": "Account identifier", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "customer_id", "data_type": "integer", "description": "Owning customer id (references customers.id)", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "branch_id", "data_type": "integer", "description": "Branch id the account was opened at (references branches.id)", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "account_type", "data_type": "text", "description": "checking, savings, or fixed_deposit", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "balance", "data_type": "numeric(14,2)", "description": "Current account balance", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "accounts", "column_name": "opened_at", "data_type": "timestamptz", "description": "When the account was opened", "sensitive": false },
+
+    { "schema_name": "approved_analytics", "table_name": "transactions", "column_name": "id", "data_type": "integer", "description": "Transaction identifier", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "transactions", "column_name": "account_id", "data_type": "integer", "description": "Account id the transaction belongs to (references accounts.id)", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "transactions", "column_name": "amount", "data_type": "numeric(14,2)", "description": "Transaction amount (negative for withdrawals/fees)", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "transactions", "column_name": "transaction_type", "data_type": "text", "description": "deposit, withdrawal, transfer, or fee", "sensitive": false },
+    { "schema_name": "approved_analytics", "table_name": "transactions", "column_name": "occurred_at", "data_type": "timestamptz", "description": "When the transaction occurred", "sensitive": false }
+  ],
+  "relationships": [
+    "accounts.customer_id references customers.id",
+    "accounts.branch_id references branches.id",
+    "transactions.account_id references accounts.id"
+  ],
+  "business_rules": [
+    "Balances are stored in INR.",
+    "A negative transactions.amount represents money leaving the account (withdrawal, fee, outgoing transfer); a positive amount represents money entering it (deposit, incoming transfer).",
+    "account_type is one of: checking, savings, fixed_deposit.",
+    "customers.segment is one of: retail, premium, business."
+  ]
+}

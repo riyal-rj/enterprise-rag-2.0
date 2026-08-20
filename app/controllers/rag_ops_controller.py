@@ -27,7 +27,12 @@ interval instead of only the worker an admin happened to hit.
 from __future__ import annotations
 
 from app.core.exceptions import InvalidRagOpsConfigError
-from app.models.rag_ops import RagOpsConfig, validate_crag_state
+from app.models.rag_ops import (
+    RagOpsConfig,
+    validate_crag_state,
+    validate_guardrail_mode,
+    validate_self_reflective_state,
+)
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.reranker.dynamic_reranker import DynamicReranker
 from app.repositories.rag_ops_repository import RagOpsRepository
@@ -42,6 +47,10 @@ from app.schemas.rag_ops import (
     RagOpsConfigUpdateRequest,
     RagOpsStatusResponse,
     RerankMetrics,
+    SafetyLockdownDisableRequest,
+    SafetyLockdownEnableRequest,
+    SelfReflectionMetrics,
+    SelfReflectionShadowMetrics,
     SemanticCacheMetrics,
 )
 from app.services.rag_metrics_service import RagMetricsService
@@ -78,6 +87,16 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
             crag_shadow_enabled=config.crag_shadow_enabled,
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            self_reflective_shadow_enabled=config.self_reflective_shadow_enabled,
+            self_reflective_retrieval_enabled=config.self_reflective_retrieval_enabled,
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
         )
     )
 
@@ -119,6 +138,11 @@ class RagOpsController:
                 "Cannot switch to the Voyage reranker backend: no VOYAGE_API_KEY is "
                 "configured for this deployment."
             )
+        if payload.guardrail_mode is not None:
+            try:
+                validate_guardrail_mode(payload.guardrail_mode)
+            except ValueError as exc:
+                raise InvalidRagOpsConfigError(str(exc)) from exc
         # Validate the *effective* post-update state, not just the fields
         # this payload happens to touch - a partial update (e.g. only
         # crag_enabled=False in a request) must be rejected if it would
@@ -155,6 +179,33 @@ class RagOpsController:
                 "and an approved regulatory-domain allowlist."
             )
 
+        effective_self_reflective_enabled = (
+            current.self_reflective_enabled
+            if payload.self_reflective_enabled is None
+            else payload.self_reflective_enabled
+        )
+        effective_self_reflective_shadow_enabled = (
+            current.self_reflective_shadow_enabled
+            if payload.self_reflective_shadow_enabled is None
+            else payload.self_reflective_shadow_enabled
+        )
+        effective_self_reflective_retrieval_enabled = (
+            current.self_reflective_retrieval_enabled
+            if payload.self_reflective_retrieval_enabled is None
+            else payload.self_reflective_retrieval_enabled
+        )
+        try:
+            validate_self_reflective_state(
+                self_reflective_enabled=effective_self_reflective_enabled,
+                self_reflective_shadow_enabled=effective_self_reflective_shadow_enabled,
+                self_reflective_retrieval_enabled=effective_self_reflective_retrieval_enabled,
+            )
+        except ValueError as exc:
+            raise InvalidRagOpsConfigError(
+                "Self-reflection shadow mode and retrieval cannot remain enabled while "
+                "self-reflection is disabled."
+            ) from exc
+
         config = self._repository.update_config(
             actor=actor,
             reason=payload.reason,
@@ -169,6 +220,14 @@ class RagOpsController:
             crag_rollout_percentage=payload.crag_rollout_percentage,
             crag_web_enabled=payload.crag_web_enabled,
             crag_shadow_enabled=payload.crag_shadow_enabled,
+            self_reflective_enabled=payload.self_reflective_enabled,
+            self_reflective_rollout_percentage=payload.self_reflective_rollout_percentage,
+            self_reflective_shadow_enabled=payload.self_reflective_shadow_enabled,
+            self_reflective_retrieval_enabled=payload.self_reflective_retrieval_enabled,
+            sql_enabled=payload.sql_enabled,
+            sql_rollout_percentage=payload.sql_rollout_percentage,
+            guardrail_mode=payload.guardrail_mode,
+            guardrail_policy_version=payload.guardrail_policy_version,
         )
         self._apply(config)
         return self._to_status(config)
@@ -185,6 +244,29 @@ class RagOpsController:
     def emergency_enable(self, actor: str, payload: EmergencyEnableRequest) -> RagOpsStatusResponse:
         config = self._repository.set_emergency_disabled(
             actor=actor, disabled=False, reason=payload.reason
+        )
+        self._apply(config)
+        return self._to_status(config)
+
+    def safety_lockdown_enable(
+        self, actor: str, payload: SafetyLockdownEnableRequest
+    ) -> RagOpsStatusResponse:
+        """Security-incident kill switch, distinct from
+        ``emergency_disable`` - forces the SQL route fully closed (see
+        ``app.guardrails.tool_guardrail.ToolGuardrail.authorize_sql``)
+        regardless of ``sql_enabled``, without touching reranking/HyDE/
+        CRAG/self-reflection at all."""
+        config = self._repository.set_safety_lockdown(
+            actor=actor, enabled=True, reason=payload.reason
+        )
+        self._apply(config)
+        return self._to_status(config)
+
+    def safety_lockdown_disable(
+        self, actor: str, payload: SafetyLockdownDisableRequest
+    ) -> RagOpsStatusResponse:
+        config = self._repository.set_safety_lockdown(
+            actor=actor, enabled=False, reason=payload.reason
         )
         self._apply(config)
         return self._to_status(config)
@@ -217,6 +299,8 @@ class RagOpsController:
         hyde_snapshot = self._metrics.hyde_stats()
         crag_snapshot = self._metrics.crag_stats()
         crag_shadow_snapshot = self._metrics.crag_shadow_stats()
+        reflection_snapshot = self._metrics.self_reflection_stats()
+        reflection_shadow_snapshot = self._metrics.self_reflection_shadow_stats()
         return RagOpsStatusResponse(
             reranking_enabled=config.reranking_enabled,
             reranker_backend=config.reranker_backend,  # type: ignore[arg-type]
@@ -277,6 +361,45 @@ class RagOpsController:
                 web_use_rate=crag_shadow_snapshot.web_use_rate,
                 usage_tokens_total=crag_shadow_snapshot.usage_tokens_total,
             ),
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            self_reflective_shadow_enabled=config.self_reflective_shadow_enabled,
+            self_reflective_retrieval_enabled=config.self_reflective_retrieval_enabled,
+            self_reflection_metrics=SelfReflectionMetrics(
+                sample_count=reflection_snapshot.sample_count,
+                p50_latency_ms=reflection_snapshot.p50_latency_ms,
+                p95_latency_ms=reflection_snapshot.p95_latency_ms,
+                first_pass_acceptance_rate=reflection_snapshot.first_pass_acceptance_rate,
+                revision_rate=reflection_snapshot.revision_rate,
+                additional_retrieval_rate=reflection_snapshot.additional_retrieval_rate,
+                abstention_rate=reflection_snapshot.abstention_rate,
+                fallback_rate=reflection_snapshot.fallback_rate,
+                average_iterations=reflection_snapshot.average_iterations,
+                usage_tokens_total=reflection_snapshot.usage_tokens_total,
+                rollout_bypasses=reflection_snapshot.rollout_bypasses,
+                emergency_bypasses=reflection_snapshot.emergency_bypasses,
+            ),
+            self_reflection_shadow_metrics=SelfReflectionShadowMetrics(
+                sample_count=reflection_shadow_snapshot.sample_count,
+                p50_latency_ms=reflection_shadow_snapshot.p50_latency_ms,
+                p95_latency_ms=reflection_shadow_snapshot.p95_latency_ms,
+                first_pass_acceptance_rate=reflection_shadow_snapshot.first_pass_acceptance_rate,
+                revision_rate=reflection_shadow_snapshot.revision_rate,
+                additional_retrieval_rate=reflection_shadow_snapshot.additional_retrieval_rate,
+                abstention_rate=reflection_shadow_snapshot.abstention_rate,
+                fallback_rate=reflection_shadow_snapshot.fallback_rate,
+                average_iterations=reflection_shadow_snapshot.average_iterations,
+                usage_tokens_total=reflection_shadow_snapshot.usage_tokens_total,
+            ),
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
+            safety_lockdown_reason=config.safety_lockdown_reason,
+            safety_lockdown_at=config.safety_lockdown_at,
+            safety_lockdown_by=config.safety_lockdown_by,
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,
             emergency_disabled_at=config.emergency_disabled_at,

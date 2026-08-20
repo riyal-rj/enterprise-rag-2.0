@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 RerankerBackend = Literal["local", "voyage"]
+GuardrailMode = Literal["enforce", "monitor"]
 
 
 class RerankMetrics(BaseModel):
@@ -85,6 +86,47 @@ class CRAGShadowMetrics(BaseModel):
     usage_tokens_total: int
 
 
+class SelfReflectionMetrics(BaseModel):
+    """Self-reflection performance over the last N *attempted* reflections (a
+    rolling in-memory window - see ``app.services.rag_metrics_service``).
+    ``None`` latencies mean no reflection attempt has happened yet since the
+    process started. ``rollout_bypasses``/``emergency_bypasses`` count
+    requests that never reached the engine at all (sampled out /
+    emergency-disabled), same distinction as ``HyDEMetrics``/``CRAGMetrics``.
+    """
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+    rollout_bypasses: int
+    emergency_bypasses: int
+
+
+class SelfReflectionShadowMetrics(BaseModel):
+    """Shadow-cohort self-reflection performance - never served to a real
+    user, tracked separately from ``SelfReflectionMetrics`` so a shadow
+    regression is visible without being confused with what traffic is
+    actually experiencing."""
+
+    sample_count: int
+    p50_latency_ms: float | None
+    p95_latency_ms: float | None
+    first_pass_acceptance_rate: float
+    revision_rate: float
+    additional_retrieval_rate: float
+    abstention_rate: float
+    fallback_rate: float
+    average_iterations: float
+    usage_tokens_total: int
+
+
 class RagOpsStatusResponse(BaseModel):
     """Everything the RAG Operations panel displays: live config, rolled-up
     metrics, and emergency-disable state."""
@@ -109,6 +151,30 @@ class RagOpsStatusResponse(BaseModel):
     crag_shadow_enabled: bool
     crag_metrics: CRAGMetrics
     crag_shadow_metrics: CRAGShadowMetrics
+
+    self_reflective_enabled: bool
+    self_reflective_rollout_percentage: int
+    self_reflective_shadow_enabled: bool
+    self_reflective_retrieval_enabled: bool
+    self_reflection_metrics: SelfReflectionMetrics
+    self_reflection_shadow_metrics: SelfReflectionShadowMetrics
+
+    # Text-to-SQL routing - no metrics sub-object yet (unlike the stages
+    # above): this is an admin-only, proposal-only rollout with no live
+    # traffic path to sample from until an admin turns it on for real. See
+    # app.query_orchestration.query_orchestrator.
+    sql_enabled: bool
+    sql_rollout_percentage: int
+    sql_proposal_only: bool
+
+    # Guardrails layer (app.guardrails) - see
+    # app/seed/migrations/013_add_guardrails_config.sql.
+    guardrail_mode: GuardrailMode
+    guardrail_policy_version: str
+    safety_lockdown_enabled: bool
+    safety_lockdown_reason: str | None
+    safety_lockdown_at: datetime | None
+    safety_lockdown_by: str | None
 
     emergency_disabled: bool
     emergency_disabled_reason: str | None
@@ -137,6 +203,18 @@ class RagOpsConfigUpdateRequest(BaseModel):
     crag_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
     crag_web_enabled: bool | None = None
     crag_shadow_enabled: bool | None = None
+    self_reflective_enabled: bool | None = None
+    self_reflective_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
+    self_reflective_shadow_enabled: bool | None = None
+    self_reflective_retrieval_enabled: bool | None = None
+    # sql_proposal_only is deliberately not settable here - it is
+    # DB-CHECK-constrained to always be TRUE (migration 011) and re-verified
+    # in RagRuntimeConfig.__post_init__; this release has no path that would
+    # ever need to change it.
+    sql_enabled: bool | None = None
+    sql_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
+    guardrail_mode: GuardrailMode | None = None
+    guardrail_policy_version: str | None = Field(default=None, min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=500)
 
 
@@ -153,6 +231,21 @@ class EmergencyDisableRequest(BaseModel):
 
 
 class EmergencyEnableRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class SafetyLockdownEnableRequest(BaseModel):
+    """Body for ``POST /admin/rag-ops/safety-lockdown-enable``.
+
+    ``confirm`` is a server-side backstop, same reasoning as
+    ``EmergencyDisableRequest.confirm``.
+    """
+
+    reason: str = Field(min_length=1, max_length=500)
+    confirm: Literal[True]
+
+
+class SafetyLockdownDisableRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 

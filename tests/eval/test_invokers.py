@@ -22,6 +22,7 @@ from app.schemas.chat import (
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
+    SelfReflectionMetadata,
 )
 
 
@@ -57,6 +58,7 @@ class _FakeRAGService:
         reranking_enabled: bool | None = None,
         hyde_enabled: bool | None = None,
         crag_enabled: bool | None = None,
+        self_reflective_enabled: bool | None = None,
     ) -> ChatResponse:
         self.calls.append(
             {
@@ -66,6 +68,7 @@ class _FakeRAGService:
                 "reranking_enabled": reranking_enabled,
                 "hyde_enabled": hyde_enabled,
                 "crag_enabled": crag_enabled,
+                "self_reflective_enabled": self_reflective_enabled,
             }
         )
         return self._response
@@ -76,6 +79,7 @@ def _response(
     *,
     hyde: HyDEMetadata | None = None,
     crag: CRAGMetadata | None = None,
+    self_reflection: SelfReflectionMetadata | None = None,
     final_evidence: list[EvidencePreview] | None = None,
 ) -> ChatResponse:
     # RAGService always populates final_evidence from CRAG's outcome - even
@@ -96,6 +100,7 @@ def _response(
             hyde=hyde or HyDEMetadata(enabled=False, backend="none"),
             reranking=RerankingMetadata(enabled=False, backend="none"),
             crag=crag or CRAGMetadata(enabled=False),
+            self_reflection=self_reflection or SelfReflectionMetadata(enabled=False),
             retrieved_chunks=[
                 RetrievedChunkPreview(text="hi", source="a.pdf", score=0.9, page_number=None)
             ],
@@ -126,6 +131,20 @@ def _crag_applied_response(answer: str = "the answer") -> ChatResponse:
     return _response(
         answer,
         crag=CRAGMetadata(enabled=True, applied=True, decision="correct", evidence_count=2),
+    )
+
+
+def _reflection_applied_response(answer: str = "the answer") -> ChatResponse:
+    """A response shaped like a real, cleanly-applied self-reflection run -
+    used by tests that pass ``enable_self_reflective=True`` and must clear
+    ServiceInvoker._call_pipeline's EvaluationPipelineError check (see
+    app.eval.invokers)."""
+    return _response(
+        answer,
+        crag=CRAGMetadata(enabled=True, applied=True, decision="correct", evidence_count=2),
+        self_reflection=SelfReflectionMetadata(
+            enabled=True, applied=True, accepted=True, final_action="accept"
+        ),
     )
 
 
@@ -169,6 +188,7 @@ def test_service_invoker_calls_the_real_rag_service_for_a_supported_profile() ->
             "reranking_enabled": False,
             "hyde_enabled": False,
             "crag_enabled": False,
+            "self_reflective_enabled": False,
         }
     ]
 
@@ -311,21 +331,66 @@ def test_non_crag_profile_ignores_crag_metadata_entirely() -> None:
     assert result.answer == response.answer
 
 
-def test_service_invoker_skips_profiles_requesting_unimplemented_features() -> None:
-    """Self-reflective doesn't exist in the pipeline yet - silently
-    ignoring the flag would produce misleading pass/fail results, so it
-    skips cleanly instead, even with a working rag_service wired up. HyDE,
-    reranking, and CRAG alone are no longer in this list - see
-    test_service_invoker_passes_enable_hyde_as_a_per_call_override,
-    test_service_invoker_passes_enable_rerank_as_a_per_call_override, and
-    test_service_invoker_passes_enable_crag_as_a_per_call_override."""
-    fake_rag_service = _FakeRAGService(_response())
+def test_service_invoker_passes_enable_self_reflective_as_a_per_call_override() -> None:
+    """The "all" profile must actually exercise self-reflection through the
+    real RAGService.answer() override, not silently no-op - this is what
+    makes a baseline-vs-self-reflection RAGAS comparison possible."""
+    fake_rag_service = _FakeRAGService(_reflection_applied_response())
     invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
 
-    with pytest.raises(SkippedIntent, match="isn't implemented"):
-        invoker.invoke("question", PROFILES["all"], Intent.RAG)
+    invoker.invoke("q", PROFILES["hybrid+rerank+crag+self_reflective"], Intent.RAG)
 
-    assert fake_rag_service.calls == []
+    assert fake_rag_service.calls[0]["self_reflective_enabled"] is True
+    assert fake_rag_service.calls[0]["crag_enabled"] is True
+
+
+def test_reflection_fallback_raises_evaluation_pipeline_error_instead_of_scoring_baseline() -> None:
+    """A self-reflection case that fell back (critic/reviser error) must
+    fail loudly, not be scored as if reflection cleanly ran - see
+    app.core.exceptions.EvaluationPipelineError."""
+    response = _response(
+        crag=CRAGMetadata(enabled=True, applied=True, decision="correct"),
+        self_reflection=SelfReflectionMetadata(enabled=True, applied=False, fallback=True),
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    with pytest.raises(EvaluationPipelineError, match="self-reflection"):
+        invoker.invoke("q", PROFILES["hybrid+rerank+crag+self_reflective"], Intent.RAG)
+
+
+def test_reflection_is_not_checked_when_crag_already_abstained() -> None:
+    """Self-reflection never runs when CRAG already abstained upstream -
+    that's correct behavior (nothing to critique), not a reflection
+    failure, so it must not trip the integrity check."""
+    response = _response(
+        crag=CRAGMetadata(enabled=True, applied=True, decision="incorrect", abstain=True),
+        self_reflection=SelfReflectionMetadata(
+            enabled=True, applied=False, bypass_reason="crag_abstained"
+        ),
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["hybrid+rerank+crag+self_reflective"], Intent.RAG)
+
+    assert result.answer == response.answer
+
+
+def test_non_reflection_profile_ignores_reflection_metadata_entirely() -> None:
+    """A profile with enable_self_reflective=False must never trigger the
+    reflection integrity check, regardless of what the response's
+    self_reflection metadata says - that field is meaningless when
+    reflection wasn't even requested."""
+    response = _response(
+        self_reflection=SelfReflectionMetadata(enabled=False, applied=False, fallback=True)
+    )
+    fake_rag_service = _FakeRAGService(response)
+    invoker = ServiceInvoker(rag_service=cast(RAGService, fake_rag_service))
+
+    result, _ = invoker.invoke("q", PROFILES["naive"], Intent.RAG)
+
+    assert result.answer == response.answer
 
 
 def test_service_invoker_builds_a_real_rag_service_lazily_when_none_is_injected() -> None:

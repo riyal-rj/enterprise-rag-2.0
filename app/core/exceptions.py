@@ -112,6 +112,50 @@ class EvaluationPipelineError(AppError):
         super().__init__(message)
 
 
+class SQLProposalNotFoundError(AppError):
+    """Raised when a SQL proposal doesn't exist or isn't owned by the caller.
+
+    Deliberately doesn't distinguish the two cases in the message, same
+    reasoning as ``ConversationNotFoundError``.
+    """
+
+    def __init__(self, proposal_id: object) -> None:
+        super().__init__(f"SQL proposal {proposal_id} not found")
+        self.proposal_id = proposal_id
+
+
+class SQLProposalStateError(AppError):
+    """Raised when a SQL proposal can't transition the way a caller asked -
+    already consumed by a concurrent approval, expired, or its catalog/
+    policy/fingerprint no longer matches what was approved. See
+    ``app.repositories.sql_proposal_repository.PostgresSQLProposalRepository
+    .lock_for_execution`` - the race-safe backstop this maps to a 409, not a
+    generic 400, since the request itself was well-formed."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"SQL proposal cannot be executed: {code}")
+        self.code = code
+
+
+class SQLGenerationFailedError(AppError):
+    """Raised when SQL generation exhausts its bounded correction-retry
+    budget without producing a policy-valid, EXPLAIN-approved query."""
+
+    def __init__(self, last_error_code: str) -> None:
+        super().__init__(f"SQL generation failed: {last_error_code}")
+        self.last_error_code = last_error_code
+
+
+class SQLFeatureDisabledError(AppError):
+    """Raised when a SQL route/approval endpoint is hit while the feature is
+    disabled, not yet rolled out to this principal, or attempted by a
+    non-admin during this admin-only rollout phase."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Text-to-SQL is not available: {reason}")
+        self.reason = reason
+
+
 class HybridRetrievalDisabledError(AppError):
     """Raised when a request asks for a retrieval mode the rollout flag
     (``RAGFeatureSettings.hybrid_search_enabled``) currently disallows.

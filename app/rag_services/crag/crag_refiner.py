@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 
@@ -16,6 +17,8 @@ from app.rag_services.crag.crag import (
     RetrievalGrade,
     WebEvidence,
 )
+
+logger = logging.getLogger(__name__)
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(])")
 
@@ -101,7 +104,15 @@ class ExtractiveKnowledgeRefiner:
         evidence: list[EvidenceChunk] = []
         for selection in selections:
             if selection.document_index >= len(relevant):
-                raise ValueError("refiner returned an unknown document index")
+                # The model was given exactly len(relevant) documents but
+                # occasionally returns an index outside that range anyway -
+                # drop just this one selection rather than discarding every
+                # other (possibly valid) selection alongside it.
+                logger.warning(
+                    "crag.refiner_unknown_document_index",
+                    extra={"document_index": selection.document_index, "document_count": len(relevant)},
+                )
+                continue
             _chunk_grade, chunk = relevant[selection.document_index]
             sentences = documents[selection.document_index]
             text = self._materialize(sentences, selection.sentence_indices)
@@ -126,7 +137,16 @@ class ExtractiveKnowledgeRefiner:
         evidence: list[EvidenceChunk] = []
         for selection in selections:
             if selection.document_index >= len(selected_results):
-                raise ValueError("refiner returned an unknown web document index")
+                # Same tolerance as refine_local - one bad index shouldn't
+                # discard every other selection.
+                logger.warning(
+                    "crag.refiner_unknown_web_document_index",
+                    extra={
+                        "document_index": selection.document_index,
+                        "document_count": len(selected_results),
+                    },
+                )
+                continue
             source = selected_results[selection.document_index]
             text = self._materialize(
                 documents[selection.document_index], selection.sentence_indices
@@ -177,6 +197,17 @@ class ExtractiveKnowledgeRefiner:
 
     @staticmethod
     def _materialize(sentences: tuple[str, ...], indices: list[int]) -> str:
-        if any(index < 0 or index >= len(sentences) for index in indices):
-            raise ValueError("refiner returned an unknown sentence index")
-        return " ".join(sentences[index] for index in sorted(indices))
+        # The model is given the exact valid sentence_index range per
+        # document (see _select's payload) but occasionally returns one
+        # outside it anyway - drop just the invalid indices rather than
+        # discarding this selection's other, in-range sentences. Observed
+        # in practice on single-sentence documents (bullet-style policy
+        # clauses with no internal periods), where the model sometimes
+        # returns an index as if the document had several sentences.
+        valid = [index for index in indices if 0 <= index < len(sentences)]
+        if len(valid) != len(indices):
+            logger.warning(
+                "crag.refiner_unknown_sentence_index",
+                extra={"invalid_indices": sorted(set(indices) - set(valid)), "sentence_count": len(sentences)},
+            )
+        return " ".join(sentences[index] for index in sorted(valid))

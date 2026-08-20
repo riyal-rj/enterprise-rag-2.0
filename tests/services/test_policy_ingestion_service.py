@@ -50,6 +50,7 @@ class _FakeVectorRepository:
         self._records = existing_records or []
         self.upsert_calls: list[tuple[list[DocumentChunk], list[list[float]], list[SparseVector]]] = []
         self.delete_calls: list[str] = []
+        self.set_status_calls: list[tuple[str, str]] = []
         self.call_order: list[str] = []
 
     def upsert_chunks(
@@ -57,7 +58,9 @@ class _FakeVectorRepository:
         chunks: list[DocumentChunk],
         dense_embeddings: list[list[float]],
         sparse_embeddings: list[SparseVector],
+        ingestion_status: str = "active",
     ) -> None:
+        del ingestion_status
         self.upsert_calls.append((chunks, dense_embeddings, sparse_embeddings))
         self.call_order.append("upsert")
 
@@ -70,8 +73,14 @@ class _FakeVectorRepository:
     def search_hybrid(self, *args: object, **kwargs: object):
         raise NotImplementedError
 
-    def scroll_all_chunks(self, limit: int = 10_000) -> list[dict[str, str | int | None]]:
+    def scroll_all_chunks(
+        self, limit: int = 10_000, ingestion_status: str | None = "active"
+    ) -> list[dict[str, str | int | None]]:
+        del limit, ingestion_status  # fake ignores status filtering - see records passed in
         return self._records
+
+    def set_ingestion_status(self, source: str, ingestion_status: str) -> None:
+        self.set_status_calls.append((source, ingestion_status))
 
     def delete_by_source(self, source: str) -> None:
         self.delete_calls.append(source)

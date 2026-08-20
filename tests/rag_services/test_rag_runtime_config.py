@@ -109,3 +109,33 @@ def test_crag_shadow_enabled_is_accepted_alongside_crag_enabled() -> None:
     )
 
     assert config.crag_shadow_enabled is True
+
+
+def test_sql_fields_default_to_disabled_and_proposal_only_for_existing_call_sites() -> None:
+    config = RagRuntimeConfig(**_valid_kwargs())  # type: ignore[arg-type]
+
+    assert config.sql_enabled is False
+    assert config.sql_rollout_percentage == 0
+    assert config.sql_proposal_only is True
+
+
+@pytest.mark.parametrize("value", [-1, 101, 1000])
+def test_invalid_sql_rollout_percentage_is_rejected(value: int) -> None:
+    with pytest.raises(ValueError, match="sql_rollout_percentage"):
+        RagRuntimeConfig(**_valid_kwargs(sql_rollout_percentage=value))  # type: ignore[arg-type]
+
+
+def test_sql_proposal_only_cannot_be_disabled() -> None:
+    """Non-negotiable for this release (see the Text-to-SQL architecture
+    blueprint's controls #7/#9): there is no automatic-execution code path,
+    so nothing can ever construct a config that would try to use one."""
+    with pytest.raises(ValueError, match="sql_proposal_only"):
+        RagRuntimeConfig(**_valid_kwargs(sql_proposal_only=False))  # type: ignore[arg-type]
+
+
+def test_store_default_construction_disables_sql_and_keeps_proposal_only() -> None:
+    store = RagRuntimeConfigStore()
+
+    config = store.current
+    assert config.sql_enabled is False
+    assert config.sql_proposal_only is True

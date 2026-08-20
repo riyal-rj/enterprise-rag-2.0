@@ -20,6 +20,7 @@ from app.rag_services.crag.crag import (
     SourceScopePolicy,
     StaticPlannedCorrectiveRetriever,
     WebEvidence,
+    WebQueryFormulator,
     WebRetriever,
     local_evidence,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "SourceScopePolicy",
     "StaticPlannedCorrectiveRetriever",
     "WebEvidence",
+    "WebQueryFormulator",
     "WebRetriever",
     "local_evidence",
 ]

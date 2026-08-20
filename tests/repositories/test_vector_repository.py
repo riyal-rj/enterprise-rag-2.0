@@ -58,7 +58,9 @@ class _FakeQdrantClient:
         self.created_payload_indexes: list[dict[str, object]] = []
         self.upsert_calls: list[dict[str, object]] = []
         self.delete_calls: list[dict[str, object]] = []
+        self.set_payload_calls: list[dict[str, object]] = []
         self.query_points_calls: list[dict[str, object]] = []
+        self.scroll_calls: list[dict[str, object]] = []
         self.query_response: _FakeQueryResponse = _FakeQueryResponse(points=[])
         self.scroll_response: tuple[list[_FakeRecord], None] = ([], None)
 
@@ -85,10 +87,14 @@ class _FakeQdrantClient:
         return self.query_response
 
     def scroll(self, **kwargs: object) -> tuple[list[_FakeRecord], None]:
+        self.scroll_calls.append(kwargs)
         return self.scroll_response
 
     def delete(self, **kwargs: object) -> None:
         self.delete_calls.append(kwargs)
+
+    def set_payload(self, **kwargs: object) -> None:
+        self.set_payload_calls.append(kwargs)
 
 
 def _repo(fake: _FakeQdrantClient, collection_name: str = "docs") -> QdrantVectorRepository:
@@ -107,23 +113,41 @@ def test_init_creates_collection_with_named_dense_and_sparse_vectors_when_missin
     assert created["sparse_vectors_config"] == {"bm25": SparseVectorParams(modifier=Modifier.IDF)}
 
 
-def test_init_creates_a_payload_index_on_source_when_collection_is_missing() -> None:
+def test_init_creates_payload_indexes_on_source_and_ingestion_status_when_collection_is_missing() -> (
+    None
+):
     fake = _FakeQdrantClient(existing_collections=[])
 
     _repo(fake)
 
-    assert len(fake.created_payload_indexes) == 1
-    assert fake.created_payload_indexes[0]["collection_name"] == "docs"
-    assert fake.created_payload_indexes[0]["field_name"] == "source"
+    field_names = {idx["field_name"] for idx in fake.created_payload_indexes}
+    assert field_names == {"source", "ingestion_status"}
+    assert all(idx["collection_name"] == "docs" for idx in fake.created_payload_indexes)
 
 
-def test_init_does_not_recreate_existing_collection() -> None:
+def test_init_does_not_recreate_an_existing_collection() -> None:
     fake = _FakeQdrantClient(existing_collections=["docs"])
 
     _repo(fake)
 
     assert fake.created_collections == []
-    assert fake.created_payload_indexes == []
+
+
+def test_init_backfills_ingestion_status_on_an_existing_collection() -> None:
+    """Upgrade safety: a collection that predates ingestion_status must
+    have its points backfilled to "active" so the new active-only search
+    filter doesn't make the entire pre-existing corpus invisible - see
+    QdrantVectorRepository._ensure_ingestion_status_backfilled."""
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+
+    _repo(fake)
+
+    assert len(fake.set_payload_calls) == 1
+    assert fake.set_payload_calls[0]["payload"] == {"ingestion_status": "active"}
+    # Also (re)creates the index a pre-migration collection won't have.
+    assert any(
+        idx["field_name"] == "ingestion_status" for idx in fake.created_payload_indexes
+    )
 
 
 def test_init_treats_an_alias_as_an_existing_collection() -> None:
@@ -157,10 +181,63 @@ def test_upsert_chunks_sends_named_dense_and_sparse_vectors_with_payload() -> No
     assert len(fake.upsert_calls) == 1
     points = cast(list, fake.upsert_calls[0]["points"])
     assert len(points) == 2
-    assert points[0].payload == {"text": "hello", "source": "a.pdf", "page_number": 3}
-    assert points[1].payload == {"text": "world", "source": "b.pdf", "page_number": None}
+    assert points[0].payload == {
+        "text": "hello",
+        "source": "a.pdf",
+        "page_number": 3,
+        "ingestion_status": "active",
+    }
+    assert points[1].payload == {
+        "text": "world",
+        "source": "b.pdf",
+        "page_number": None,
+        "ingestion_status": "active",
+    }
     assert points[0].vector == {"dense": [0.1, 0.2], "bm25": sparse_embeddings[0]}
     assert points[0].id != points[1].id  # each point gets a unique id
+
+
+def test_upsert_chunks_honors_an_explicit_ingestion_status() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+
+    repo.upsert_chunks(
+        [DocumentChunk(text="pending", source="a.pdf")],
+        [[0.1, 0.2]],
+        [SparseVector(indices=[1], values=[1.0])],
+        ingestion_status="quarantined",
+    )
+
+    points = cast(list, fake.upsert_calls[0]["points"])
+    assert points[0].payload["ingestion_status"] == "quarantined"
+
+
+def test_search_dense_filters_to_active_ingestion_status() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+
+    repo.search_dense([0.1], top_k=5)
+
+    query_filter = cast(Filter, fake.query_points_calls[0]["query_filter"])
+    condition = cast(FieldCondition, query_filter.must[0])  # type: ignore[index]
+    assert condition.key == "ingestion_status"
+    assert cast(MatchValue, condition.match).value == "active"
+
+
+def test_set_ingestion_status_filters_on_source_and_sets_the_new_status() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+    fake.set_payload_calls.clear()  # drop the constructor's own backfill call
+
+    repo.set_ingestion_status("a.pdf", "active")
+
+    assert len(fake.set_payload_calls) == 1
+    call = fake.set_payload_calls[0]
+    assert call["payload"] == {"ingestion_status": "active"}
+    points_filter = cast(Filter, call["points"])
+    condition = cast(FieldCondition, points_filter.must[0])  # type: ignore[index]
+    assert condition.key == "source"
+    assert cast(MatchValue, condition.match).value == "a.pdf"
 
 
 def test_upsert_chunks_raises_on_length_mismatch() -> None:
@@ -257,6 +334,27 @@ def test_scroll_all_chunks_returns_id_text_source_page_number_dicts() -> None:
     result = repo.scroll_all_chunks()
 
     assert result == [{"id": "abc", "text": "hi", "source": "a.pdf", "page_number": 2}]
+
+
+def test_scroll_all_chunks_defaults_to_an_active_only_filter() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+
+    repo.scroll_all_chunks()
+
+    scroll_filter = cast(Filter, fake.scroll_calls[0]["scroll_filter"])
+    condition = cast(FieldCondition, scroll_filter.must[0])  # type: ignore[index]
+    assert condition.key == "ingestion_status"
+    assert cast(MatchValue, condition.match).value == "active"
+
+
+def test_scroll_all_chunks_with_status_none_applies_no_filter() -> None:
+    fake = _FakeQdrantClient(existing_collections=["docs"])
+    repo = _repo(fake)
+
+    repo.scroll_all_chunks(ingestion_status=None)
+
+    assert fake.scroll_calls[0]["scroll_filter"] is None
 
 
 def test_delete_by_source_deletes_from_the_configured_collection() -> None:

@@ -125,6 +125,21 @@ class WebRetriever(Protocol):
     def search(self, query: str) -> list[WebEvidence]: ...
 
 
+class WebQueryFormulator(Protocol):
+    """Rewrites a conversational question into a short, keyword-oriented
+    query before it reaches ``WebRetriever.search`` - a domain-restricted
+    web search matches keywords far better than a full natural-language
+    question (see ``app.rag_services.crag.web_query_formulator``'s module
+    docstring for the concrete evidence)."""
+
+    @property
+    def cache_namespace(self) -> str: ...
+
+    def formulate(self, question: str) -> tuple[str, int]:
+        """Returns ``(search_query, usage_tokens)``."""
+        ...
+
+
 class CorrectiveRetriever(Protocol):
     @property
     def cache_namespace(self) -> str: ...

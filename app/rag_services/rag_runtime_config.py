@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 RerankerBackendName = Literal["local", "voyage"]
+GuardrailModeName = Literal["enforce", "monitor"]
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,45 @@ class RagRuntimeConfig:
     # "shadow" cohort handling. Defaulted so every pre-existing construction
     # site (deps.py, RagOpsController, tests) keeps working unchanged.
     crag_shadow_enabled: bool = False
+    # Self-reflective answer critique/revision stage - see
+    # app.rag_services.reflection.dynamic_self_reflection and
+    # RAGService.answer's post-answer reflection block. Two-field shape
+    # (enabled/rollout%), same as HyDE - no web/shadow-style dependent
+    # sub-flag exists for this stage. Defaulted so every pre-existing
+    # construction site keeps working unchanged.
+    self_reflective_enabled: bool = False
+    self_reflective_rollout_percentage: int = 0
+    # Observe-only rollout stage, ahead of a real treatment rollout - see
+    # DynamicSelfReflectionEngine.plan and RAGService.answer's self-reflection
+    # "shadow" cohort handling. Same role as crag_shadow_enabled.
+    self_reflective_shadow_enabled: bool = False
+    # Revision-only canary gate: RETRIEVE_MORE is unavailable (degrades to
+    # REVISE) until this is turned on separately - see
+    # StructuredSelfReflectionEngine.reflect's allow_retrieval parameter.
+    self_reflective_retrieval_enabled: bool = False
+    # Text-to-SQL routing (app.query_orchestration.query_orchestrator) -
+    # admin-only, proposal-only. Defaulted so every pre-existing
+    # construction site keeps working unchanged, same reasoning as
+    # crag_shadow_enabled/self_reflective_enabled above.
+    sql_enabled: bool = False
+    sql_rollout_percentage: int = 0
+    sql_proposal_only: bool = True
+    # Guardrails layer (app.guardrails) - see
+    # app/seed/migrations/013_add_guardrails_config.sql. guardrail_mode
+    # gates whether a BLOCK/REDACT-worthy decision is actually applied
+    # ("enforce") or only recorded ("monitor" - see GuardrailPolicy.decide);
+    # production startup refuses "monitor" while SQL/CRAG-web is enabled
+    # (see app.core.config.settings). safety_lockdown_enabled is a
+    # security-incident kill switch distinct from emergency_disabled: the
+    # latter degrades rollout-gated quality features (reranking/HyDE/CRAG/
+    # self-reflection), while safety_lockdown_enabled additionally forces
+    # the SQL route fully closed regardless of sql_enabled (see
+    # app.guardrails.tool_guardrail.ToolGuardrail.authorize_sql).
+    # Defaulted so every pre-existing construction site keeps working
+    # unchanged, same reasoning as crag_shadow_enabled/sql_enabled above.
+    guardrail_mode: GuardrailModeName = "enforce"
+    guardrail_policy_version: str = "guardrails-policy-v1"
+    safety_lockdown_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.reranker_rollout_percentage <= 100:
@@ -76,6 +116,29 @@ class RagRuntimeConfig:
             raise ValueError("crag_web_enabled requires crag_enabled")
         if self.crag_shadow_enabled and not self.crag_enabled:
             raise ValueError("crag_shadow_enabled requires crag_enabled")
+        if not 0 <= self.self_reflective_rollout_percentage <= 100:
+            raise ValueError("self_reflective_rollout_percentage must be between 0 and 100")
+        if self.self_reflective_shadow_enabled and not self.self_reflective_enabled:
+            raise ValueError("self_reflective_shadow_enabled requires self_reflective_enabled")
+        if self.self_reflective_retrieval_enabled and not self.self_reflective_enabled:
+            raise ValueError("self_reflective_retrieval_enabled requires self_reflective_enabled")
+        if not 0 <= self.sql_rollout_percentage <= 100:
+            raise ValueError("sql_rollout_percentage must be between 0 and 100")
+        if not self.sql_proposal_only:
+            # Non-negotiable for this release (see the architecture
+            # blueprint's "Non-negotiable controls" #7 and rollout gate #9):
+            # there is no automatic-execution code path at all, so nothing
+            # upstream (an admin request, a bad default, a bug) can ever
+            # construct a config that would try to use one.
+            raise ValueError(
+                "sql_proposal_only cannot be disabled - this release has no "
+                "automatic SQL execution path"
+            )
+        if self.guardrail_mode not in ("enforce", "monitor"):
+            # Defensive - the DB CHECK constraint (migration 013) is the
+            # real backstop; this just fails loudly on a construction site
+            # that somehow bypasses it (e.g. a future test/eval fixture).
+            raise ValueError("guardrail_mode must be 'enforce' or 'monitor'")
 
 
 _DEFAULT_CONFIG = RagRuntimeConfig(

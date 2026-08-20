@@ -66,6 +66,13 @@ class RAGFeatureSettings(EnvBaseSettings):
     semantic_cache_collection: str = Field(default="rag_query_cache")
 
     crag_enabled_by_default: bool = Field(default=False)
+    # No corresponding DB "by default" seed field exists for crag_web_enabled
+    # itself (it defaults FALSE directly in migration 008's column DEFAULT,
+    # with no settings-level seed the way most other flags have) - this
+    # field exists purely so app.core.config.settings's production-hardening
+    # check has a frozen deploy-time value to read alongside
+    # sql.sql_enabled_by_default, not to seed a new column.
+    crag_web_enabled_by_default: bool = Field(default=False)
     crag_grader_model: str = Field(default="gpt-4o-mini", min_length=1)
     # v2: grader system prompt tightened to stop conflating "wrong_policy"
     # with "on-topic chunk that doesn't restate the question's exact
@@ -84,7 +91,37 @@ class RAGFeatureSettings(EnvBaseSettings):
     crag_max_attempts: int = Field(default=2, ge=1, le=2)
     crag_min_evidence_chunks: int = Field(default=1, ge=1, le=5)
     crag_policy_version: str = Field(default="crag-policy-v1", min_length=1)
+    # Rewrites a conversational question into a short, keyword-oriented
+    # query before it hits the domain-restricted regulatory web search - see
+    # app.rag_services.crag.web_query_formulator's module docstring for why
+    # this exists at all. Short max-tokens: the output is a few keywords,
+    # not prose.
+    crag_web_query_model: str = Field(default="gpt-4o-mini", min_length=1)
+    crag_web_query_prompt_version: str = Field(default="web-query-v1", min_length=1)
+    crag_web_query_timeout_seconds: float = Field(default=5.0, gt=0.0, le=15.0)
+    crag_web_query_max_completion_tokens: int = Field(default=100, ge=16, le=300)
 
-    reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
-    max_reflection_retries: int = Field(default=2, ge=0)
     self_reflective_enabled_by_default: bool = Field(default=False)
+    reflection_critic_model: str = Field(default="gpt-4o-mini", min_length=1)
+    reflection_reviser_model: str = Field(default="gpt-4o-mini", min_length=1)
+    reflection_prompt_version: str = Field(default="bank-policy-v1", min_length=1)
+    # Answer-relevance acceptance floor - historically named reflection_min_score;
+    # kept as-is rather than renamed, since RagOpsConfig/eval goldens don't
+    # reference it directly and a rename buys nothing here.
+    reflection_min_score: float = Field(default=0.85, ge=0.0, le=1.0)
+    reflection_min_evidence_relevance: float = Field(default=0.70, ge=0.0, le=1.0)
+    reflection_min_citation_completeness: float = Field(default=0.90, ge=0.0, le=1.0)
+    reflection_min_utility: int = Field(default=4, ge=1, le=5)
+    # Iteration budget - each iteration is one critique + (revise or
+    # retrieve_more) round; the initial answer's first critique doesn't
+    # count against this.
+    max_reflection_retries: int = Field(default=2, ge=0, le=3)
+    reflection_max_additional_retrievals: int = Field(default=1, ge=0, le=1)
+    reflection_retrieval_top_k: int = Field(default=5, ge=1, le=10)
+    reflection_max_evidence_chunks: int = Field(default=10, ge=1, le=20)
+    reflection_max_evidence_chars: int = Field(default=30_000, ge=1_000, le=80_000)
+    reflection_max_total_tokens: int = Field(default=6_000, ge=500, le=20_000)
+    reflection_max_completion_tokens: int = Field(default=1_500, ge=128, le=4_000)
+    reflection_stage_timeout_seconds: float = Field(default=12.0, gt=0.0, le=60.0)
+    reflection_total_timeout_seconds: float = Field(default=25.0, gt=0.0, le=90.0)
+    reflection_max_attempts: int = Field(default=2, ge=1, le=2)

@@ -224,3 +224,69 @@ async def test_emergency_disable_forces_reranking_and_semantic_cache_off_via_pol
     # app.controllers.rag_ops_controller.apply_rag_ops_config.
     assert current.hyde_enabled is True
     assert current.hyde_rollout_percentage == 10
+
+
+async def test_rollback_drill_emergency_disable_propagates_to_a_second_worker_and_forces_self_reflection_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rehearses the actual cross-worker emergency-disable rollback
+    procedure end to end, not just the poller's own field-mapping: two
+    independent ``RagRuntimeConfigStore`` instances stand in for two
+    Uvicorn/Gunicorn workers that share nothing but the Postgres row and
+    their own poller. Only ONE of them (worker B) polls after an admin
+    emergency-disables the row (simulating "worker A already saw the admin
+    request directly, worker B only converges via its next poll tick") -
+    then a real ``DynamicSelfReflectionEngine`` reading worker B's store
+    must resolve every self-reflection request to the disabled cohort,
+    proving the full chain (DB row -> poller -> config store -> engine.plan())
+    agrees, not just that the poller copies a boolean field correctly."""
+    from app.rag_services.reflection.dynamic_self_reflection import DynamicSelfReflectionEngine
+
+    worker_b_store = RagRuntimeConfigStore()  # hasn't seen anything yet - stale defaults
+
+    # An admin's emergency-disable request lands on worker A directly (not
+    # simulated here - RagOpsController._apply already has direct coverage,
+    # and needs no separate store of its own for this drill); what matters
+    # here is that the *persisted* row now reflects it, and that worker B -
+    # which never saw that request - converges purely through its poller.
+    disabled_config = RagOpsConfig(
+        reranking_enabled=False,
+        reranker_backend="local",
+        reranker_rollout_percentage=100,
+        semantic_cache_enabled=False,
+        semantic_cache_threshold=0.95,
+        hyde_enabled=False,
+        hyde_rollout_percentage=0,
+        crag_enabled=False,
+        crag_rollout_percentage=0,
+        crag_web_enabled=False,
+        emergency_disabled=True,
+        emergency_disabled_reason="self-reflection cost spike",
+        emergency_disabled_at=datetime.now(UTC),
+        emergency_disabled_by="oncall",
+        corpus_version=1,
+        last_cache_invalidated_at=None,
+        updated_at=datetime.now(UTC),
+        updated_by="oncall",
+        self_reflective_enabled=True,
+        self_reflective_rollout_percentage=100,
+    )
+    repository = _FakeRepository(disabled_config)
+    monkeypatch.setattr(rag_ops_sync, "get_rag_runtime_config_store", lambda: worker_b_store)
+    monkeypatch.setattr(rag_ops_sync, "get_rag_ops_repository", lambda: repository)
+
+    # Before worker B's next poll tick, it would still (wrongly) route
+    # traffic as if self-reflection were fully off (its stale default) -
+    # this drill is specifically about the *poll* closing that gap, so
+    # confirm the pre-poll state is genuinely stale/different first.
+    assert worker_b_store.current.self_reflective_enabled is False
+
+    poller = rag_ops_sync.RagOpsConfigPoller()
+    await poller._poll_once()
+
+    engine = DynamicSelfReflectionEngine(delegate=object())  # type: ignore[arg-type]
+    plan = engine.plan("any question", worker_b_store.current, enabled=True)
+
+    assert worker_b_store.current.emergency_disabled is True
+    assert plan.cohort == "disabled"
+    assert plan.bypass_reason == "emergency_disabled"

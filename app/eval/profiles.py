@@ -49,6 +49,13 @@ PROFILES: dict[str, PipelineProfile] = {
         enable_rerank=True,
         enable_crag=True,
     ),
+    "hybrid+rerank+crag+self_reflective": PipelineProfile(
+        name="hybrid+rerank+crag+self_reflective",
+        search_mode="hybrid",
+        enable_rerank=True,
+        enable_crag=True,
+        enable_self_reflective=True,
+    ),
     "all": PipelineProfile(
         name="all",
         search_mode="hybrid",

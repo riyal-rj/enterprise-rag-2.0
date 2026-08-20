@@ -25,6 +25,7 @@ from app.schemas.chat import (
     RerankingMetadata,
     ResponseMetadata,
     RetrievedChunkPreview,
+    SelfReflectionMetadata,
 )
 
 
@@ -55,6 +56,7 @@ class _FakeRAGService:
         reranking_enabled: bool | None = None,
         hyde_enabled: bool | None = None,
         crag_enabled: bool | None = None,
+        self_reflective_enabled: bool | None = None,
     ) -> ChatResponse:
         return self._response
 
@@ -77,6 +79,7 @@ def _response(
             crag=CRAGMetadata(
                 enabled=True, applied=crag_applied, fallback=crag_fallback, decision="correct"
             ),
+            self_reflection=SelfReflectionMetadata(enabled=False),
             retrieved_chunks=[
                 RetrievedChunkPreview(
                     text="raw chunk", source="doc.pdf", score=0.9, page_number=None

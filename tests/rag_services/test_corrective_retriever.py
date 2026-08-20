@@ -88,6 +88,20 @@ class _FakeWebRetriever:
         return list(self._results)
 
 
+class _FakeQueryFormulator:
+    def __init__(self, *, query: str) -> None:
+        self._query = query
+        self.calls: list[str] = []
+
+    @property
+    def cache_namespace(self) -> str:
+        return "query-formulator:fake:v1"
+
+    def formulate(self, question: str) -> tuple[str, int]:
+        self.calls.append(question)
+        return self._query, 2
+
+
 def _local_evidence(n: int = 1) -> tuple[EvidenceChunk, ...]:
     return tuple(
         EvidenceChunk(
@@ -241,6 +255,61 @@ def test_empty_web_result_abstains_without_a_second_grade_call() -> None:
     assert outcome.bypass_reason == "web_correction_empty"
     assert outcome.evidence == refiner._local_evidence
     assert len(grader.calls) == 1  # no re-grade - nothing new to verify
+
+
+def test_web_search_uses_the_formulated_query_but_refine_web_gets_the_original_question() -> None:
+    """The keyword-formulated query is only for WebRetriever.search - the
+    refiner still selects evidence against what the user actually asked,
+    see corrective_retriever.py's comment at the call site."""
+    grader = _FakeGrader(
+        [
+            _grade(CRAGDecision.AMBIGUOUS, coverage=0.6),
+            _grade(CRAGDecision.CORRECT, coverage=0.9),
+        ]
+    )
+    refiner = _FakeRefiner(local_evidence=(), web_evidence=_web_evidence(1))
+    web = _FakeWebRetriever(
+        results=[
+            WebEvidence(
+                title="t",
+                text="text",
+                canonical_url="https://rbi.org.in/x",
+                domain="rbi.org.in",
+                retrieved_at_iso="2026-01-01T00:00:00+00:00",
+                score=0.5,
+            )
+        ]
+    )
+    formulator = _FakeQueryFormulator(query="RBI repo rate")
+    retriever = ProductionCorrectiveRetriever(
+        grader=grader,
+        refiner=refiner,
+        scope_policy=_FakeScopePolicy(permits=True),
+        web_retriever=web,
+        web_query_formulator=formulator,
+    )
+
+    question = "What is the Reserve Bank of India's current repo rate this month?"
+    retriever.correct(question, [RetrievedChunk(text="x", source="a.pdf", score=0.9)], allow_web=True)
+
+    assert formulator.calls == [question]
+    assert web.calls == ["RBI repo rate"]
+
+
+def test_web_search_uses_the_raw_question_when_no_formulator_is_configured() -> None:
+    grader = _FakeGrader([_grade(CRAGDecision.AMBIGUOUS, coverage=0.6)])
+    refiner = _FakeRefiner(local_evidence=(), web_evidence=())
+    web = _FakeWebRetriever(results=[])
+    retriever = ProductionCorrectiveRetriever(
+        grader=grader,
+        refiner=refiner,
+        scope_policy=_FakeScopePolicy(permits=True),
+        web_retriever=web,
+    )
+
+    retriever.correct("q", [RetrievedChunk(text="x", source="a.pdf", score=0.9)], allow_web=True)
+
+    assert web.calls == ["q"]
 
 
 def test_non_correct_regrade_of_combined_evidence_abstains() -> None:

@@ -1,0 +1,363 @@
+"""Tests for StructuredGroundedAnswerReviser."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from app.core.llm.chat_client import StructuredLLMResponse, TokenUsage
+from app.rag_services.crag import EvidenceChunk, EvidenceOrigin
+from app.rag_services.reflection.answer_reviser import StructuredGroundedAnswerReviser
+from app.rag_services.reflection.reflection import ReflectionCritique, SupportLevel
+
+
+class _FakeLLMClient:
+    def __init__(self, *, payload: dict[str, object] | None = None, usage_tokens: int = 11) -> None:
+        self._payload = payload
+        self._usage_tokens = usage_tokens
+        self.calls: list[dict[str, object]] = []
+
+    def generate(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    def generate_json(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        response_model: type,
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_completion_tokens: int = 1_000,
+        timeout_seconds: float = 30.0,
+        max_attempts: int = 2,
+    ) -> StructuredLLMResponse:
+        self.calls.append({"system_prompt": system_prompt, "user_message": user_message})
+        assert self._payload is not None
+        value = response_model(**self._payload)
+        return StructuredLLMResponse(value=value, usage=TokenUsage(total_tokens=self._usage_tokens))
+
+
+def _reviser(llm_client: object, **overrides: object) -> StructuredGroundedAnswerReviser:
+    defaults: dict[str, object] = dict(
+        llm_client=llm_client,
+        model="gpt-4o",
+        prompt_version="bank-policy-v1",
+        timeout_seconds=10.0,
+        max_completion_tokens=1_500,
+        max_attempts=2,
+        max_evidence_chars=30_000,
+    )
+    defaults.update(overrides)
+    return StructuredGroundedAnswerReviser(**defaults)  # type: ignore[arg-type]
+
+
+def _evidence(text: str = "text", source: str = "a.pdf") -> EvidenceChunk:
+    return EvidenceChunk(
+        text=text, source=source, page_number=1, retrieval_score=0.9, origin=EvidenceOrigin.POLICY
+    )
+
+
+def _critique(**overrides: object) -> ReflectionCritique:
+    defaults: dict[str, object] = dict(
+        retrieval_needed=False,
+        retrieval_query=None,
+        evidence_relevance=0.9,
+        support_level=SupportLevel.PARTIAL,
+        answer_relevance=0.6,
+        citation_completeness=0.5,
+        utility=3,
+        missing_aspects=("deadline",),
+        unsupported_claims=("a claim",),
+    )
+    defaults.update(overrides)
+    return ReflectionCritique(**defaults)  # type: ignore[arg-type]
+
+
+def test_revise_returns_revised_answer_and_token_count() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "Revised, fully cited answer."})
+    reviser = _reviser(llm_client)
+
+    answer, tokens = reviser.revise("q", (_evidence(),), "old answer", _critique())
+
+    assert answer == "Revised, fully cited answer."
+    assert tokens == 11
+
+
+def test_answer_is_stripped_of_surrounding_whitespace() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "  padded answer  "})
+    reviser = _reviser(llm_client)
+
+    answer, _ = reviser.revise("q", (_evidence(),), "old answer", _critique())
+
+    assert answer == "padded answer"
+
+
+def test_empty_answer_is_rejected() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": ""})
+    reviser = _reviser(llm_client)
+
+    with pytest.raises(ValidationError):
+        reviser.revise("q", (_evidence(),), "old answer", _critique())
+
+
+def test_extra_response_fields_are_rejected() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "ok", "unexpected": "field"})
+    reviser = _reviser(llm_client)
+
+    with pytest.raises(ValidationError):
+        reviser.revise("q", (_evidence(),), "old answer", _critique())
+
+
+def test_payload_carries_evidence_previous_answer_and_feedback() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "revised"})
+    reviser = _reviser(llm_client)
+
+    reviser.revise(
+        "What is the KYC threshold?",
+        (_evidence(text="policy text", source="policy.pdf"),),
+        "The previous answer.",
+        _critique(missing_aspects=("filing deadline",), unsupported_claims=("bad claim",)),
+    )
+
+    sent_payload = json.loads(str(llm_client.calls[0]["user_message"]))
+    assert sent_payload["question"] == "What is the KYC threshold?"
+    assert sent_payload["previous_answer"] == "The previous answer."
+    assert sent_payload["evidence"][0]["text"] == "policy text"
+    assert sent_payload["evidence"][0]["source"] == "policy.pdf"
+    assert sent_payload["feedback"]["missing_aspects"] == ["filing deadline"]
+    assert sent_payload["feedback"]["unsupported_claims"] == ["bad claim"]
+    assert sent_payload["feedback"]["support_level"] == "partial"
+
+
+def test_cache_namespace_encodes_model_and_prompt_version() -> None:
+    reviser = _reviser(_FakeLLMClient(payload={"answer": "ok"}))
+
+    assert reviser.cache_namespace == (
+        "reviser=gpt-4o:schema=v1:prompt=bank-policy-v1:evidence_chars=30000:"
+        "max_tokens=1500:timeout=10.0:attempts=2"
+    )
+
+
+def test_cache_namespace_changes_with_every_output_affecting_setting() -> None:
+    baseline = _reviser(_FakeLLMClient(payload={"answer": "ok"})).cache_namespace
+
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), model="gpt-4o-mini").cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), prompt_version="bank-policy-v2"
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), max_evidence_chars=10_000
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(
+            _FakeLLMClient(payload={"answer": "ok"}), max_completion_tokens=500
+        ).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), timeout_seconds=5.0).cache_namespace
+        != baseline
+    )
+    assert (
+        _reviser(_FakeLLMClient(payload={"answer": "ok"}), max_attempts=1).cache_namespace
+        != baseline
+    )
+
+
+def test_evidence_is_truncated_to_max_evidence_chars() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "ok"})
+    reviser = _reviser(llm_client, max_evidence_chars=10)
+
+    reviser.revise("q", (_evidence(text="a" * 50),), "old answer", _critique())
+
+    sent_payload = json.loads(str(llm_client.calls[0]["user_message"]))
+    assert len(sent_payload["evidence"][0]["text"]) == 10
+
+
+def test_timeout_override_is_clamped_to_the_configured_ceiling() -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturingLLMClient:
+        def generate(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_json(self, *a: object, **k: object) -> None:
+            raise NotImplementedError
+
+        def generate_structured(self, *args: object, **kwargs: object) -> StructuredLLMResponse:
+            captured["timeout_seconds"] = kwargs["timeout_seconds"]
+            from app.rag_services.reflection.answer_reviser import _RevisedAnswerPayload
+
+            return StructuredLLMResponse(
+                value=_RevisedAnswerPayload(answer="ok"), usage=TokenUsage(total_tokens=1)
+            )
+
+    reviser = _reviser(_CapturingLLMClient(), timeout_seconds=10.0)
+
+    reviser.revise("q", (_evidence(),), "old", _critique(), timeout_seconds=3.0)
+    assert captured["timeout_seconds"] == 3.0
+
+    reviser.revise("q", (_evidence(),), "old", _critique(), timeout_seconds=100.0)
+    assert captured["timeout_seconds"] == 10.0
+
+
+class TestFindFabricatedCitations:
+    """Unit tests for the standalone deterministic check, independent of
+    any LLM call."""
+
+    def test_citation_matching_a_real_source_is_not_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+        answer = "Customers must complete CDD. [BNK-POL-001_KYC.pdf]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_with_extra_metadata_around_a_real_source_is_not_flagged(self) -> None:
+        """The model may cite with page/section metadata alongside the
+        source, e.g. the system prompt's own suggested format
+        [Policy ID, version, page, section] - a substring match, not exact
+        equality, is required or every real citation would false-positive."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)  # page_number=1
+        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 1, section 3.1]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_with_an_invented_page_on_a_real_source_is_flagged(self) -> None:
+        """Regression: matching the source string alone isn't enough - a
+        citation can attach a fabricated page number to a real policy
+        (reproduced with an invented page 999) and must still be caught."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)  # page_number=1
+        answer = "CDD is required. [BNK-POL-001_KYC.pdf, v2, page 999, section 3.1]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-001_KYC.pdf, v2, page 999, section 3.1",)
+
+    def test_citation_page_check_only_applies_when_evidence_has_a_page_number(self) -> None:
+        """Web-origin evidence has no page_number - a cited page can't be
+        validated against it, so it must not false-positive."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            EvidenceChunk(
+                text="text",
+                source="RBI Circular on KYC",
+                page_number=None,
+                retrieval_score=0.9,
+                origin=EvidenceOrigin.REGULATORY_WEB,
+                canonical_url="https://rbi.org.in/circular/123",
+            ),
+        )
+        answer = "Per regulation. [https://rbi.org.in/circular/123, page 4]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_naming_two_real_sources_in_one_bracket_is_not_flagged(self) -> None:
+        """Regression: a synthesized claim spanning multiple policies is
+        legitimately cited as one bracket with several policy ids (e.g.
+        comparing two lending products) - neither containment direction
+        against a single source holds for a concatenated multi-id bracket,
+        so this must be resolved id-by-id, not as one opaque string."""
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            _evidence(source="BNK-POL-021_HOMELOAN.docx"),
+            _evidence(source="BNK-POL-027_LAP.docx"),
+        )
+        answer = "Home loan LTV is higher than LAP's. [BNK-POL-021, BNK-POL-027]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_citation_naming_one_real_and_one_fabricated_id_together_is_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-021_HOMELOAN.docx"),)
+        answer = "See both policies. [BNK-POL-021, BNK-POL-999]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-021, BNK-POL-999",)
+
+    def test_citation_to_a_source_not_in_the_supplied_evidence_is_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+        answer = "Customers must complete CDD. [BNK-POL-999_MADEUP.pdf]"
+
+        fabricated = find_fabricated_citations(answer, evidence)
+
+        assert fabricated == ("BNK-POL-999_MADEUP.pdf",)
+
+    def test_web_citation_matches_on_canonical_url(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (
+            EvidenceChunk(
+                text="text",
+                source="RBI Circular on KYC",
+                page_number=None,
+                retrieval_score=0.9,
+                origin=EvidenceOrigin.REGULATORY_WEB,
+                canonical_url="https://rbi.org.in/circular/123",
+            ),
+        )
+        answer = "Per regulation. [https://rbi.org.in/circular/123]"
+
+        assert find_fabricated_citations(answer, evidence) == ()
+
+    def test_answer_with_no_citations_at_all_is_not_flagged(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        evidence = (_evidence(source="BNK-POL-001_KYC.pdf"),)
+
+        assert find_fabricated_citations("No brackets here at all.", evidence) == ()
+
+    def test_no_evidence_supplied_means_nothing_can_be_validated_against(self) -> None:
+        from app.rag_services.reflection.answer_reviser import find_fabricated_citations
+
+        assert find_fabricated_citations("[SOME.pdf]", ()) == ()
+
+
+def test_revise_raises_when_the_llm_fabricates_a_citation() -> None:
+    """End-to-end through revise() itself, not just the standalone checker -
+    proves the reviser actually enforces this, fails closed (the outer
+    FailSafeSelfReflectionEngine catches the raise and falls back), rather
+    than merely having a checker function nothing calls."""
+    llm_client = _FakeLLMClient(
+        payload={"answer": "This is required. [BNK-POL-999_NEVER_SUPPLIED.pdf]"}
+    )
+    reviser = _reviser(llm_client)
+
+    with pytest.raises(ValueError, match="BNK-POL-999_NEVER_SUPPLIED.pdf"):
+        reviser.revise("q", (_evidence(source="BNK-POL-001_KYC.pdf"),), "old answer", _critique())
+
+
+def test_revise_succeeds_when_citations_are_grounded() -> None:
+    llm_client = _FakeLLMClient(payload={"answer": "This is required. [BNK-POL-001_KYC.pdf]"})
+    reviser = _reviser(llm_client)
+
+    answer, _ = reviser.revise(
+        "q", (_evidence(source="BNK-POL-001_KYC.pdf"),), "old answer", _critique()
+    )
+
+    assert answer == "This is required. [BNK-POL-001_KYC.pdf]"

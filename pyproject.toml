@@ -21,8 +21,18 @@ dependencies = [
     "qdrant-client>=1.17,<2",
     # Doc parsing
     "docling>=2.9.0",
-    # Text2SQL
-    "vanna[openai,postgres]>=0.7.0",
+    # Text2SQL: Vanna generates candidate SQL (app.sql.sql_generator); pinned
+    # exact minor (not the open-ended >=0.7.0 this repo declared before) per
+    # the architecture blueprint's rule against an unconstrained major
+    # crossing dependency in a security-sensitive path. qdrant extra reuses
+    # this app's existing Qdrant instance as Vanna's example vector store
+    # instead of pulling in a second one (chromadb).
+    "vanna[openai,postgres,qdrant]>=0.7.0,<0.8",
+    # AST parsing/validation for the read-only SQL policy layer
+    # (app.sql.sql_policy) - a transpiler/parser, not a security sandbox by
+    # itself; PostgreSQL's own EXPLAIN in a read-only transaction is the
+    # authoritative validator (see app.sql.sql_executor).
+    "sqlglot>=27,<28",
     # Postgres
     "psycopg2-binary>=2.9.10",
     # Cache
@@ -40,7 +50,12 @@ dependencies = [
     "voyageai>=0.3.0",
     "tavily-python>=0.5.0",
     # === Phase 4 deps ===
-    "llm-guard>=0.3.15",
+    # [onnxruntime] extra (-> optimum[onnxruntime]): MaliciousURLs' default
+    # (non-ONNX) model repo, DunnBC22/codebert-base-Malicious_URLs, 401s on
+    # the Hub (upstream repo gone) - only an ONNX mirror is available, so
+    # the output scanner needs this extra to load it. See
+    # app.guardrails.llm_guard_adapter.build_llm_guard_output_scanner.
+    "llm-guard[onnxruntime]>=0.3.15",
     "boto3>=1.35.0",
     "pypdf>=5.1.0",
     # === Data pipeline deps ===
@@ -77,6 +92,14 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# "slow" tests load real LLM Guard transformer models (see
+# tests/guardrails/test_llm_guard_adapter.py) - minutes on a cold cache and
+# a hard failure in a network-restricted environment, so they're opt-in:
+#   uv run pytest -m slow tests/guardrails/test_llm_guard_adapter.py
+markers = [
+    "slow: requires downloading/loading real ML models; excluded by default",
+]
+addopts = "-m 'not slow'"
 
 [build-system]
 requires = ["hatchling"]

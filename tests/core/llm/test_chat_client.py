@@ -22,6 +22,11 @@ class _Answer(BaseModel):
     value: str
 
 
+class _AnswerWithOptionalField(BaseModel):
+    value: str
+    note: str | None = None
+
+
 _REQUEST = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
 
 
@@ -227,6 +232,134 @@ def test_authentication_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) ->
         llm.generate("system", "user")
 
     assert len(fake.completions.calls) == 1
+
+
+class _FakeClock:
+    """Controllable monotonic clock for deadline tests - avoids actually
+    sleeping/waiting real wall-clock time in the test suite."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _TimeAdvancingCompletions:
+    """Like _FakeCompletions, but each queued item also advances the fake
+    clock by a caller-chosen amount before returning/raising - simulates a
+    call that itself took real wall-clock time."""
+
+    def __init__(
+        self, clock: _FakeClock, queue: list[tuple[float, _FakeChatCompletion | Exception]]
+    ) -> None:
+        self._clock = clock
+        self._queue = list(queue)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> _FakeChatCompletion:
+        self.calls.append(kwargs)
+        elapsed, item = self._queue.pop(0)
+        self._clock.now += elapsed
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _FakeOpenAIWithClock:
+    def __init__(self, completions: _TimeAdvancingCompletions) -> None:
+        self.chat = _FakeChat(cast(_FakeCompletions, completions))
+
+
+def _client_with_clock(
+    clock: _FakeClock, queue: list[tuple[float, _FakeChatCompletion | Exception]]
+) -> tuple[OpenAILLMClient, _TimeAdvancingCompletions]:
+    completions = _TimeAdvancingCompletions(clock, queue)
+    fake = _FakeOpenAIWithClock(completions)
+    return (
+        OpenAILLMClient(
+            client=cast(OpenAI, fake),
+            default_answer_model="gpt-4o",
+            default_grader_model="gpt-4o-mini",
+        ),
+        completions,
+    )
+
+
+def test_generate_structured_retry_timeout_is_bounded_by_total_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a retry must not get a fresh full per-attempt timeout -
+    the total wall-clock time across every attempt plus backoff must stay
+    within the requested timeout_seconds budget."""
+    clock = _FakeClock()
+    monkeypatch.setattr(chat_client.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(chat_client.time, "sleep", clock.sleep)
+    monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 2.0)
+    llm, fake = _client_with_clock(
+        clock,
+        [
+            (6.0, _rate_limit_error("slow failure")),  # eats 6s of a 10s budget
+            (0.0, _fake_completion('{"value": "recovered"}')),
+        ],
+    )
+
+    result = llm.generate_structured("system", "user", response_model=_Answer, timeout_seconds=10.0)
+
+    assert result.value.value == "recovered"
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["timeout"] == 10.0
+    # Second attempt's timeout is clamped to what's actually left (10 - 6
+    # elapsed - 2 backoff = 2), not the original 10s budget again.
+    assert fake.calls[1]["timeout"] == pytest.approx(2.0)
+    assert clock.sleeps == [pytest.approx(2.0)]
+
+
+def test_generate_structured_gives_up_without_retrying_past_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: if a failed attempt already consumed the whole budget,
+    the client must raise immediately - not sleep for backoff and burn
+    another HTTP call it has no time left for."""
+    clock = _FakeClock()
+    monkeypatch.setattr(chat_client.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(chat_client.time, "sleep", clock.sleep)
+    monkeypatch.setattr(chat_client, "_RETRY_BACKOFF_SECONDS", 2.0)
+    llm, fake = _client_with_clock(
+        clock,
+        [
+            (5.0, _rate_limit_error("used the whole budget")),
+            (0.0, _fake_completion("never reached")),
+        ],
+    )
+
+    with pytest.raises(RateLimitError, match="used the whole budget"):
+        llm.generate_structured("system", "user", response_model=_Answer, timeout_seconds=5.0)
+
+    assert len(fake.calls) == 1
+    assert clock.sleeps == []
+
+
+def test_generate_structured_schema_makes_optional_fields_required_and_nullable() -> None:
+    """Regression: OpenAI's strict Structured Outputs mode rejects a schema
+    where an optional/defaulted field is missing from 'required' (confirmed
+    live: "'required' is required to be supplied and to be an array
+    including every key in properties") - every generate_structured call
+    must patch this, not just models a developer remembered to hand-craft
+    around it."""
+    llm, fake = _client(_fake_completion('{"value": "x", "note": null}'))
+
+    llm.generate_structured("system", "user", response_model=_AnswerWithOptionalField)
+
+    schema = fake.completions.calls[0]["response_format"]["json_schema"]["schema"]
+    assert schema["required"] == ["value", "note"]
+    assert schema["additionalProperties"] is False
+    assert "default" not in schema["properties"]["note"]
 
 
 def test_invalid_max_attempts_is_rejected_before_any_call() -> None:

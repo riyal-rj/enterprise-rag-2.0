@@ -50,9 +50,27 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - LOG_JSON=false
       - LOG_LEVEL=INFO
-      # Self-RAG / reflection tuning (overridable via host .env)
+      # Self-RAG / reflection tuning (overridable via host .env) -
+      # enabled/rollout% live in the rag_ops_config DB row, not here (see
+      # app/seed/migrations/010_add_self_reflection_rag_ops_config.sql);
+      # only static models/thresholds/budgets are deployment settings.
       - REFLECTION_MIN_SCORE=${REFLECTION_MIN_SCORE:-0.85}
       - MAX_REFLECTION_RETRIES=${MAX_REFLECTION_RETRIES:-2}
+      - REFLECTION_CRITIC_MODEL=${REFLECTION_CRITIC_MODEL:-gpt-4o-mini}
+      - REFLECTION_REVISER_MODEL=${REFLECTION_REVISER_MODEL:-gpt-4o-mini}
+      - REFLECTION_PROMPT_VERSION=${REFLECTION_PROMPT_VERSION:-bank-policy-v1}
+      - REFLECTION_MIN_EVIDENCE_RELEVANCE=${REFLECTION_MIN_EVIDENCE_RELEVANCE:-0.70}
+      - REFLECTION_MIN_CITATION_COMPLETENESS=${REFLECTION_MIN_CITATION_COMPLETENESS:-0.90}
+      - REFLECTION_MIN_UTILITY=${REFLECTION_MIN_UTILITY:-4}
+      - REFLECTION_MAX_ADDITIONAL_RETRIEVALS=${REFLECTION_MAX_ADDITIONAL_RETRIEVALS:-1}
+      - REFLECTION_RETRIEVAL_TOP_K=${REFLECTION_RETRIEVAL_TOP_K:-5}
+      - REFLECTION_MAX_EVIDENCE_CHUNKS=${REFLECTION_MAX_EVIDENCE_CHUNKS:-10}
+      - REFLECTION_MAX_EVIDENCE_CHARS=${REFLECTION_MAX_EVIDENCE_CHARS:-30000}
+      - REFLECTION_MAX_TOTAL_TOKENS=${REFLECTION_MAX_TOTAL_TOKENS:-6000}
+      - REFLECTION_MAX_COMPLETION_TOKENS=${REFLECTION_MAX_COMPLETION_TOKENS:-1500}
+      - REFLECTION_STAGE_TIMEOUT_SECONDS=${REFLECTION_STAGE_TIMEOUT_SECONDS:-12}
+      - REFLECTION_TOTAL_TIMEOUT_SECONDS=${REFLECTION_TOTAL_TIMEOUT_SECONDS:-25}
+      - REFLECTION_MAX_ATTEMPTS=${REFLECTION_MAX_ATTEMPTS:-2}
       # HYDE tuning (overridable via host .env)
       - HYDE_MODEL=${HYDE_MODEL:-gpt-4o-mini}
       - HYDE_PROMPT_VERSION=${HYDE_PROMPT_VERSION:-bank-policy-v1}
@@ -85,6 +103,24 @@ services:
       # approves a real allowlist for this deployment.
       - CRAG_ALLOWED_REGULATORY_DOMAINS=${CRAG_ALLOWED_REGULATORY_DOMAINS:-}
       - CRAG_WEB_MAX_RESULTS=${CRAG_WEB_MAX_RESULTS:-5}
+      # Text-to-SQL (overridable via host .env) - disabled/unconfigured by
+      # default. SQL_DATABASE_URL is a separate, read-only-role analytics
+      # database (see scripts/sql/provision_sql_reader_role.sql), never this
+      # app's own DATABASE_URL above. sql_enabled/sql_rollout_percentage
+      # still live in the rag_ops_config DB row (see
+      # app/seed/migrations/011_create_text_to_sql.sql), same as CRAG's
+      # rollout flags - only static budgets/models are deployment settings.
+      - SQL_DATABASE_URL=${SQL_DATABASE_URL:-}
+      - SQL_ENABLED_BY_DEFAULT=${SQL_ENABLED_BY_DEFAULT:-false}
+      - SQL_GENERATOR_MODEL=${SQL_GENERATOR_MODEL:-gpt-4o}
+      - SQL_ROUTER_MODEL=${SQL_ROUTER_MODEL:-gpt-4o-mini}
+      - SQL_MIN_ROUTE_CONFIDENCE=${SQL_MIN_ROUTE_CONFIDENCE:-0.90}
+      - SQL_STATEMENT_TIMEOUT_MS=${SQL_STATEMENT_TIMEOUT_MS:-5000}
+      - SQL_LOCK_TIMEOUT_MS=${SQL_LOCK_TIMEOUT_MS:-500}
+      - SQL_MAX_PLAN_COST=${SQL_MAX_PLAN_COST:-100000}
+      - SQL_MAX_RESULT_ROWS=${SQL_MAX_RESULT_ROWS:-200}
+      - SQL_PROPOSAL_TTL_SECONDS=${SQL_PROPOSAL_TTL_SECONDS:-300}
+      - SQL_ALLOWED_SCHEMAS_RAW=${SQL_ALLOWED_SCHEMAS_RAW:-approved_analytics}
 
     depends_on:
       postgres:

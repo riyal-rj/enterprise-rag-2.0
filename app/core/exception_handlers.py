@@ -22,9 +22,14 @@ from app.core.exceptions import (
     InvalidTokenError,
     PermissionDeniedError,
     RateLimitExceededError,
+    SQLFeatureDisabledError,
+    SQLGenerationFailedError,
+    SQLProposalNotFoundError,
+    SQLProposalStateError,
     UnsupportedFileTypeError,
     UserAlreadyExistsError,
 )
+from app.guardrails.contracts import GuardrailBlockedError
 
 _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     UserAlreadyExistsError: status.HTTP_409_CONFLICT,
@@ -37,6 +42,15 @@ _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     ConversationNotFoundError: status.HTTP_404_NOT_FOUND,
     HybridRetrievalDisabledError: status.HTTP_400_BAD_REQUEST,
     InvalidRagOpsConfigError: status.HTTP_400_BAD_REQUEST,
+    SQLProposalNotFoundError: status.HTTP_404_NOT_FOUND,
+    SQLProposalStateError: status.HTTP_409_CONFLICT,
+    SQLGenerationFailedError: status.HTTP_422_UNPROCESSABLE_ENTITY,
+    SQLFeatureDisabledError: status.HTTP_400_BAD_REQUEST,
+    # Safe by construction: GuardrailBlockedError never carries a raw-
+    # findings message (see its docstring), so the generic
+    # {"detail": str(exc)} handler below can never leak which
+    # scanner/category fired or what the offending text was.
+    GuardrailBlockedError: status.HTTP_400_BAD_REQUEST,
 }
 
 
@@ -46,7 +60,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         app.add_exception_handler(exc_type, _make_handler(status_code))
 
 
-def _make_handler(status_code: int,) -> Callable[[Request, Exception], Awaitable[JSONResponse]]:
+def _make_handler(
+    status_code: int,
+) -> Callable[[Request, Exception], Awaitable[JSONResponse]]:
     async def _handler(request: Request, exc: Exception) -> JSONResponse:
         # exc may be a subclass of Exception (AppError); coerce to str for the response
         return JSONResponse(status_code=status_code, content={"detail": str(exc)})

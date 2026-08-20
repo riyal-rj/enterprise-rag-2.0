@@ -27,7 +27,11 @@ _CONFIG_COLUMNS = (
     "crag_web_enabled, emergency_disabled, "
     "emergency_disabled_reason, emergency_disabled_at, emergency_disabled_by, "
     "corpus_version, last_cache_invalidated_at, updated_at, updated_by, "
-    "crag_shadow_enabled"
+    "crag_shadow_enabled, self_reflective_enabled, self_reflective_rollout_percentage, "
+    "sql_enabled, sql_rollout_percentage, sql_proposal_only, "
+    "self_reflective_shadow_enabled, self_reflective_retrieval_enabled, "
+    "guardrail_mode, guardrail_policy_version, safety_lockdown_enabled, "
+    "safety_lockdown_reason, safety_lockdown_at, safety_lockdown_by"
 )
 
 _DIFF_FIELDS = (
@@ -42,6 +46,14 @@ _DIFF_FIELDS = (
     "crag_rollout_percentage",
     "crag_web_enabled",
     "crag_shadow_enabled",
+    "self_reflective_enabled",
+    "self_reflective_rollout_percentage",
+    "self_reflective_shadow_enabled",
+    "self_reflective_retrieval_enabled",
+    "sql_enabled",
+    "sql_rollout_percentage",
+    "guardrail_mode",
+    "guardrail_policy_version",
 )
 
 
@@ -66,6 +78,14 @@ class RagOpsRepository(Protocol):
         crag_rollout_percentage: int | None = None,
         crag_web_enabled: bool | None = None,
         crag_shadow_enabled: bool | None = None,
+        self_reflective_enabled: bool | None = None,
+        self_reflective_rollout_percentage: int | None = None,
+        self_reflective_shadow_enabled: bool | None = None,
+        self_reflective_retrieval_enabled: bool | None = None,
+        sql_enabled: bool | None = None,
+        sql_rollout_percentage: int | None = None,
+        guardrail_mode: str | None = None,
+        guardrail_policy_version: str | None = None,
     ) -> RagOpsConfig:
         """Partial update: ``None`` fields are left unchanged. Writes an
         audit row iff at least one field actually changed value."""
@@ -74,6 +94,15 @@ class RagOpsRepository(Protocol):
     def set_emergency_disabled(
         self, *, actor: str, disabled: bool, reason: str | None
     ) -> RagOpsConfig: ...
+
+    def set_safety_lockdown(
+        self, *, actor: str, enabled: bool, reason: str | None
+    ) -> RagOpsConfig:
+        """Distinct from ``update_config``/``_diff`` (like
+        ``set_emergency_disabled``) so a lockdown toggle gets its own
+        non-diff-based audit action (``safety_lockdown_enabled``/
+        ``_disabled``), distinguishable from a routine ``config_update``."""
+        ...
 
     def bump_corpus_version(self, *, actor: str, source: str) -> RagOpsConfig: ...
 
@@ -118,6 +147,14 @@ class PostgresRagOpsRepository:
         crag_rollout_percentage: int | None = None,
         crag_web_enabled: bool | None = None,
         crag_shadow_enabled: bool | None = None,
+        self_reflective_enabled: bool | None = None,
+        self_reflective_rollout_percentage: int | None = None,
+        self_reflective_shadow_enabled: bool | None = None,
+        self_reflective_retrieval_enabled: bool | None = None,
+        sql_enabled: bool | None = None,
+        sql_rollout_percentage: int | None = None,
+        guardrail_mode: str | None = None,
+        guardrail_policy_version: str | None = None,
     ) -> RagOpsConfig:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -152,6 +189,32 @@ class PostgresRagOpsRepository:
                 if next_crag_shadow_enabled and not next_crag_enabled:
                     raise InvalidRagOpsConfigError("crag_shadow_enabled requires crag_enabled")
 
+                # Same lock-protected re-validation as above, for
+                # self-reflection's dependent sub-flags.
+                next_self_reflective_enabled = (
+                    old.self_reflective_enabled
+                    if self_reflective_enabled is None
+                    else self_reflective_enabled
+                )
+                next_self_reflective_shadow_enabled = (
+                    old.self_reflective_shadow_enabled
+                    if self_reflective_shadow_enabled is None
+                    else self_reflective_shadow_enabled
+                )
+                next_self_reflective_retrieval_enabled = (
+                    old.self_reflective_retrieval_enabled
+                    if self_reflective_retrieval_enabled is None
+                    else self_reflective_retrieval_enabled
+                )
+                if next_self_reflective_shadow_enabled and not next_self_reflective_enabled:
+                    raise InvalidRagOpsConfigError(
+                        "self_reflective_shadow_enabled requires self_reflective_enabled"
+                    )
+                if next_self_reflective_retrieval_enabled and not next_self_reflective_enabled:
+                    raise InvalidRagOpsConfigError(
+                        "self_reflective_retrieval_enabled requires self_reflective_enabled"
+                    )
+
                 cur.execute(
                     f"""
                     UPDATE rag_ops_config SET
@@ -166,6 +229,20 @@ class PostgresRagOpsRepository:
                         crag_rollout_percentage = COALESCE(%s, crag_rollout_percentage),
                         crag_web_enabled = COALESCE(%s, crag_web_enabled),
                         crag_shadow_enabled = COALESCE(%s, crag_shadow_enabled),
+                        self_reflective_enabled = COALESCE(%s, self_reflective_enabled),
+                        self_reflective_rollout_percentage = COALESCE(
+                            %s, self_reflective_rollout_percentage
+                        ),
+                        self_reflective_shadow_enabled = COALESCE(
+                            %s, self_reflective_shadow_enabled
+                        ),
+                        self_reflective_retrieval_enabled = COALESCE(
+                            %s, self_reflective_retrieval_enabled
+                        ),
+                        sql_enabled = COALESCE(%s, sql_enabled),
+                        sql_rollout_percentage = COALESCE(%s, sql_rollout_percentage),
+                        guardrail_mode = COALESCE(%s, guardrail_mode),
+                        guardrail_policy_version = COALESCE(%s, guardrail_policy_version),
                         updated_at = now(),
                         updated_by = %s
                     WHERE id = 1
@@ -183,6 +260,14 @@ class PostgresRagOpsRepository:
                         crag_rollout_percentage,
                         crag_web_enabled,
                         crag_shadow_enabled,
+                        self_reflective_enabled,
+                        self_reflective_rollout_percentage,
+                        self_reflective_shadow_enabled,
+                        self_reflective_retrieval_enabled,
+                        sql_enabled,
+                        sql_rollout_percentage,
+                        guardrail_mode,
+                        guardrail_policy_version,
                         actor,
                     ),
                 )
@@ -222,6 +307,39 @@ class PostgresRagOpsRepository:
                     actor,
                     "emergency_disable" if disabled else "emergency_enable",
                     {"emergency_disabled": {"new": disabled}},
+                    reason,
+                )
+            conn.commit()
+        return new
+
+    def set_safety_lockdown(
+        self, *, actor: str, enabled: bool, reason: str | None
+    ) -> RagOpsConfig:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE rag_ops_config SET
+                        safety_lockdown_enabled = %s,
+                        safety_lockdown_reason = %s,
+                        safety_lockdown_at = CASE WHEN %s THEN now() ELSE NULL END,
+                        safety_lockdown_by = CASE WHEN %s THEN %s ELSE NULL END,
+                        updated_at = now(),
+                        updated_by = %s
+                    WHERE id = 1
+                    RETURNING {_CONFIG_COLUMNS}
+                    """,
+                    (enabled, reason, enabled, enabled, actor, actor),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError("rag_ops_config has no row - run migrations")
+                new = _row_to_config(row)
+                self._insert_audit(
+                    cur,
+                    actor,
+                    "safety_lockdown_enabled" if enabled else "safety_lockdown_disabled",
+                    {"safety_lockdown_enabled": {"new": enabled}},
                     reason,
                 )
             conn.commit()
@@ -335,4 +453,17 @@ def _row_to_config(row: tuple[Any, ...]) -> RagOpsConfig:
         updated_at=row[17],
         updated_by=row[18],
         crag_shadow_enabled=row[19],
+        self_reflective_enabled=row[20],
+        self_reflective_rollout_percentage=row[21],
+        sql_enabled=row[22],
+        sql_rollout_percentage=row[23],
+        sql_proposal_only=row[24],
+        self_reflective_shadow_enabled=row[25],
+        self_reflective_retrieval_enabled=row[26],
+        guardrail_mode=row[27],
+        guardrail_policy_version=row[28],
+        safety_lockdown_enabled=row[29],
+        safety_lockdown_reason=row[30],
+        safety_lockdown_at=row[31],
+        safety_lockdown_by=row[32],
     )

@@ -143,32 +143,50 @@ def test_empty_selection_returns_empty_evidence() -> None:
     assert llm_client2.calls == []
 
 
-def test_unknown_document_index_is_rejected() -> None:
-    chunk = RetrievedChunk(text="text.", source="a.pdf", score=0.9)
+def test_unknown_document_index_is_dropped_not_raised() -> None:
+    """A model occasionally returns a document_index outside the range it
+    was actually given (see crag_refiner.py's docstring at the call site) -
+    that one selection is dropped, not treated as a reason to discard every
+    other selection alongside it (see the second, valid selection below)."""
+    chunk_a = RetrievedChunk(text="text a.", source="a.pdf", score=0.9)
+    chunk_b = RetrievedChunk(text="text b.", source="b.pdf", score=0.9)
+    grade = _grade(
+        ChunkGrade(index=0, relevance=0.9, supports_question=True, reason_code="directly_relevant"),
+        ChunkGrade(index=1, relevance=0.9, supports_question=True, reason_code="directly_relevant"),
+    )
+    llm_client = _FakeLLMClient(
+        payload={
+            "selections": [
+                {"document_index": 5, "sentence_indices": [0]},
+                {"document_index": 1, "sentence_indices": [0]},
+            ]
+        }
+    )
+    refiner = _refiner(llm_client)
+
+    evidence, _ = refiner.refine_local("q", [chunk_a, chunk_b], grade)
+
+    assert len(evidence) == 1
+    assert evidence[0].source == "b.pdf"
+
+
+def test_unknown_sentence_index_is_dropped_not_raised() -> None:
+    """Same tolerance as the document-index case, at the sentence level -
+    an out-of-range sentence_index is dropped; any other valid indices in
+    the same selection still materialize."""
+    chunk = RetrievedChunk(text="One sentence. Another sentence.", source="a.pdf", score=0.9)
     grade = _grade(
         ChunkGrade(index=0, relevance=0.9, supports_question=True, reason_code="directly_relevant")
     )
     llm_client = _FakeLLMClient(
-        payload={"selections": [{"document_index": 5, "sentence_indices": [0]}]}
+        payload={"selections": [{"document_index": 0, "sentence_indices": [0, 9]}]}
     )
     refiner = _refiner(llm_client)
 
-    with pytest.raises(ValueError, match="unknown document index"):
-        refiner.refine_local("q", [chunk], grade)
+    evidence, _ = refiner.refine_local("q", [chunk], grade)
 
-
-def test_unknown_sentence_index_is_rejected() -> None:
-    chunk = RetrievedChunk(text="Only one sentence here.", source="a.pdf", score=0.9)
-    grade = _grade(
-        ChunkGrade(index=0, relevance=0.9, supports_question=True, reason_code="directly_relevant")
-    )
-    llm_client = _FakeLLMClient(
-        payload={"selections": [{"document_index": 0, "sentence_indices": [9]}]}
-    )
-    refiner = _refiner(llm_client)
-
-    with pytest.raises(ValueError, match="unknown sentence index"):
-        refiner.refine_local("q", [chunk], grade)
+    assert len(evidence) == 1
+    assert evidence[0].text == "One sentence."
 
 
 def test_duplicate_sentence_indices_are_rejected() -> None:
@@ -211,7 +229,7 @@ def test_refine_web_preserves_source_url_and_timestamp() -> None:
     assert item.page_number is None
 
 
-def test_refine_web_unknown_document_index_is_rejected() -> None:
+def test_refine_web_unknown_document_index_is_dropped_not_raised() -> None:
     result = WebEvidence(
         title="t",
         text="text.",
@@ -225,8 +243,9 @@ def test_refine_web_unknown_document_index_is_rejected() -> None:
     )
     refiner = _refiner(llm_client)
 
-    with pytest.raises(ValueError, match="unknown web document index"):
-        refiner.refine_web("q", [result])
+    evidence, _ = refiner.refine_web("q", [result])
+
+    assert evidence == ()
 
 
 def test_relevance_floor_and_max_documents_cap_what_reaches_the_llm() -> None:

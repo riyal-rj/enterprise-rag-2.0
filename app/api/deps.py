@@ -21,6 +21,7 @@ from app.controllers.admin_controller import AdminController
 from app.controllers.auth_controller import AuthController
 from app.controllers.chat_controller import ChatController
 from app.controllers.rag_ops_controller import RagOpsController
+from app.controllers.sql_controller import SQLController
 from app.core.config import Settings, get_settings
 from app.core.db import PostgresConnectionPool
 from app.core.ingestion.document_processor import (
@@ -35,6 +36,29 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.guardrails.context_pipeline import ContextGuardPipeline
+from app.guardrails.contracts import OutputScanner, TextScanner
+from app.guardrails.factory import (
+    build_context_guard_pipeline,
+    build_guardrail_policy,
+    build_ingestion_security_scanner,
+    build_input_guard_pipeline,
+    build_output_guard_pipeline,
+    build_tool_guardrail,
+)
+from app.guardrails.ingestion_security import IngestionSecurityScanner
+from app.guardrails.input_pipeline import InputGuardPipeline
+from app.guardrails.llm_guard_adapter import (
+    LLMGuardInputScanner,
+    LLMGuardOutputScanner,
+    build_llm_guard_input_scanner,
+    build_llm_guard_output_scanner,
+)
+from app.guardrails.output_pipeline import OutputGuardPipeline
+from app.guardrails.policy import GuardrailPolicy
+from app.guardrails.tool_guardrail import ToolGuardrail
+from app.query_orchestration.intent_router import IntentRouter, StructuredIntentRouter
+from app.query_orchestration.query_orchestrator import QueryOrchestrator
 from app.rag_services.crag import (
     CorrectiveRetriever,
     FailSafeCorrectiveRetriever,
@@ -42,12 +66,17 @@ from app.rag_services.crag import (
     PlannedCorrectiveRetriever,
     RetrievalGrader,
     StaticPlannedCorrectiveRetriever,
+    WebQueryFormulator,
     WebRetriever,
 )
 from app.rag_services.crag.corrective_retriever import ProductionCorrectiveRetriever
 from app.rag_services.crag.crag_refiner import ExtractiveKnowledgeRefiner
 from app.rag_services.crag.crag_retrieval_grader import StructuredLLMRetrievalGrader
 from app.rag_services.crag.dynamic_corrective_retriever import DynamicCorrectiveRetriever
+from app.rag_services.crag.web_query_formulator import (
+    FailOpenWebQueryFormulator,
+    StructuredWebQueryFormulator,
+)
 from app.rag_services.crag.web_retriever import (
     KeywordRegulatoryScopePolicy,
     TavilyRegulatoryWebRetriever,
@@ -57,6 +86,19 @@ from app.rag_services.hyde.hyde_query_transformer import HydeQueryTransformer
 from app.rag_services.hyde.query_transformer import FailOpenQueryTransformer, QueryTransformer
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
+from app.rag_services.reflection import (
+    DynamicSelfReflectionEngine,
+    GroundedAnswerReviser,
+    PlannedSelfReflectionEngine,
+    ReflectionCritic,
+    ReflectionDecisionPolicy,
+    SelfReflectionEngine,
+    StaticPlannedSelfReflectionEngine,
+    StructuredGroundedAnswerReviser,
+    StructuredReflectionCritic,
+    StructuredSelfReflectionEngine,
+    ThresholdReflectionDecisionPolicy,
+)
 from app.rag_services.reranker.cross_encoder_reranker import LocalCrossEncoderReranker
 from app.rag_services.reranker.dynamic_reranker import DynamicReranker
 from app.rag_services.reranker.reranker import FailOpenReranker, NoOpReranker, ReRanker
@@ -75,8 +117,24 @@ from app.repositories.conversation_repository import (
     ConversationRepository,
     PostgresConversationRepository,
 )
+from app.repositories.document_security_repository import (
+    DocumentSecurityRepository,
+    PostgresDocumentSecurityRepository,
+)
 from app.repositories.rag_ops_repository import PostgresRagOpsRepository, RagOpsRepository
+from app.repositories.security_events_repository import (
+    PostgresSecurityEventsRepository,
+    SecurityEventsRepository,
+)
 from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache, SemanticQueryCache
+from app.repositories.sql_example_repository import (
+    PostgresSQLExampleRepository,
+    SQLExampleRepository,
+)
+from app.repositories.sql_proposal_repository import (
+    PostgresSQLProposalRepository,
+    SQLProposalRepository,
+)
 from app.repositories.user_repository import PostgresUserRepository, UserRepository
 from app.repositories.vector_repository import (
     QdrantVectorRepository,
@@ -93,12 +151,26 @@ from app.services.health_checks import (
     RedisHealthCheck,
     TavilyHealthCheck,
 )
+from app.services.policy_ingestion_security_service import PolicyIngestionSecurityService
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
 from app.services.rag_metrics_service import RagMetricsService
+from app.sql.catalog import StaticSQLCatalog
+from app.sql.sql_answerer import GroundedSQLAnswerer, SQLAnswerer
+from app.sql.sql_executor import (
+    PostgresReadOnlySQLExecutor,
+    SQLExecutionLimits,
+    SQLExecutor,
+    UnavailableSQLExecutor,
+)
+from app.sql.sql_generator import VannaSQLGenerator
+from app.sql.sql_policy import SQLPolicy, SQLPolicyConfig
+from app.sql.sql_result_policy import DefaultSQLResultPolicy, SQLResultPolicy
+from app.sql.sql_service import SQLService
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _POLICY_DIR = _REPO_ROOT / "policy"
+_SQL_CATALOG_DEFINITION_PATH = _REPO_ROOT / "app" / "sql" / "catalog_definition.json"
 
 
 @lru_cache(maxsize=1)
@@ -115,6 +187,15 @@ def get_rag_ops_repository() -> RagOpsRepository:
     ``get_semantic_query_cache`` seed their initial mutable state from at
     process start, instead of the frozen ``RAGFeatureSettings`` defaults."""
     return PostgresRagOpsRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_security_events_repository() -> SecurityEventsRepository:
+    """Process-wide handle to the sanitized guardrail-decision audit trail
+    (see ``app.repositories.security_events_repository``) - the app
+    database pool, same reasoning as ``get_rag_ops_repository`` (this is
+    app metadata, not analytics data)."""
+    return PostgresSecurityEventsRepository(get_db_pool())
 
 
 @lru_cache(maxsize=1)
@@ -262,6 +343,25 @@ def get_regulatory_web_retriever() -> WebRetriever | None:
 
 
 @lru_cache(maxsize=1)
+def get_web_query_formulator() -> WebQueryFormulator:
+    """Rewrites a question into a keyword-oriented web-search query ahead
+    of CRAG's regulatory-web correction - see
+    ``app.rag_services.crag.web_query_formulator``. Wrapped fail-open: a
+    formulation failure falls back to searching with the raw question
+    rather than blocking web correction outright."""
+    settings = get_settings().rag
+    return FailOpenWebQueryFormulator(
+        StructuredWebQueryFormulator(
+            llm_client=get_llm_client(),
+            model=settings.crag_web_query_model,
+            prompt_version=settings.crag_web_query_prompt_version,
+            timeout_seconds=settings.crag_web_query_timeout_seconds,
+            max_completion_tokens=settings.crag_web_query_max_completion_tokens,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
 def get_crag_delegate() -> CorrectiveRetriever:
     """Raw CRAG correct/ambiguous/incorrect orchestrator, no rollout/
     emergency state - see ``get_dynamic_crag`` (production) and
@@ -274,6 +374,7 @@ def get_crag_delegate() -> CorrectiveRetriever:
         refiner=get_crag_refiner(),
         scope_policy=KeywordRegulatoryScopePolicy(policy_version=settings.crag_policy_version),
         web_retriever=get_regulatory_web_retriever(),
+        web_query_formulator=get_web_query_formulator(),
         min_evidence_chunks=settings.crag_min_evidence_chunks,
     )
 
@@ -298,6 +399,89 @@ def get_dynamic_crag() -> PlannedCorrectiveRetriever:
     panel. Holds no config state of its own - ``RAGService.answer`` passes
     in the one ``RagRuntimeConfig`` snapshot it captures per request."""
     return DynamicCorrectiveRetriever(delegate=get_crag_delegate())
+
+
+@lru_cache(maxsize=1)
+def get_reflection_critic() -> ReflectionCritic:
+    """Structured Self-RAG-inspired critic shared by production and eval
+    reflection wiring - see ``app.rag_services.reflection.reflection_critic``."""
+    settings = get_settings().rag
+    return StructuredReflectionCritic(
+        llm_client=get_llm_client(),
+        model=settings.reflection_critic_model,
+        prompt_version=settings.reflection_prompt_version,
+        timeout_seconds=settings.reflection_stage_timeout_seconds,
+        max_completion_tokens=settings.reflection_max_completion_tokens,
+        max_attempts=settings.reflection_max_attempts,
+        max_evidence_chars=settings.reflection_max_evidence_chars,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_reflection_decision_policy() -> ReflectionDecisionPolicy:
+    """Deterministic accept/revise/retrieve-more/abstain policy - never an
+    LLM call, see ``ThresholdReflectionDecisionPolicy``."""
+    settings = get_settings().rag
+    return ThresholdReflectionDecisionPolicy(
+        min_evidence_relevance=settings.reflection_min_evidence_relevance,
+        min_answer_relevance=settings.reflection_min_score,
+        min_citation_completeness=settings.reflection_min_citation_completeness,
+        min_utility=settings.reflection_min_utility,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_answer_reviser() -> GroundedAnswerReviser:
+    """Grounded structured revision adapter - see
+    ``app.rag_services.reflection.answer_reviser``."""
+    settings = get_settings().rag
+    return StructuredGroundedAnswerReviser(
+        llm_client=get_llm_client(),
+        model=settings.reflection_reviser_model,
+        prompt_version=settings.reflection_prompt_version,
+        timeout_seconds=settings.reflection_stage_timeout_seconds,
+        max_completion_tokens=settings.reflection_max_completion_tokens,
+        max_attempts=settings.reflection_max_attempts,
+        max_evidence_chars=settings.reflection_max_evidence_chars,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_self_reflection_delegate() -> SelfReflectionEngine:
+    """Raw bounded reflection state machine, no rollout/emergency state -
+    see ``get_dynamic_self_reflection`` (production) and
+    ``get_eval_self_reflection`` (offline eval) below, which each wrap this
+    for the availability/isolation guarantees their callers need, matching
+    ``get_crag_delegate``'s shape."""
+    settings = get_settings().rag
+    return StructuredSelfReflectionEngine(
+        critic=get_reflection_critic(),
+        policy=get_reflection_decision_policy(),
+        reviser=get_answer_reviser(),
+        max_iterations=settings.max_reflection_retries,
+        max_additional_retrievals=settings.reflection_max_additional_retrievals,
+        max_total_tokens=settings.reflection_max_total_tokens,
+        total_timeout_seconds=settings.reflection_total_timeout_seconds,
+        max_evidence_chunks=settings.reflection_max_evidence_chunks,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_eval_self_reflection() -> PlannedSelfReflectionEngine:
+    """Self-reflection for the offline eval harness only - always attempts
+    reflection for real when a case's ``PipelineProfile.enable_self_reflective``
+    is on, ignoring admin rollout%/emergency state entirely, matching
+    ``get_eval_crag``'s guarantee."""
+    return StaticPlannedSelfReflectionEngine(delegate=get_self_reflection_delegate())
+
+
+@lru_cache(maxsize=1)
+def get_dynamic_self_reflection() -> PlannedSelfReflectionEngine:
+    """The self-reflection stage that actually serves real ``/chat``
+    traffic - admin-mutable (rollout%/emergency-disable) via the RAG
+    Operations panel. Holds no config state of its own - ``RAGService.answer``
+    passes in the one ``RagRuntimeConfig`` snapshot it captures per request."""
+    return DynamicSelfReflectionEngine(delegate=get_self_reflection_delegate())
 
 
 @lru_cache(maxsize=1)
@@ -417,8 +601,90 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             crag_rollout_percentage=config.crag_rollout_percentage,
             crag_web_enabled=config.crag_web_enabled,
             crag_shadow_enabled=config.crag_shadow_enabled,
+            self_reflective_enabled=config.self_reflective_enabled,
+            self_reflective_rollout_percentage=config.self_reflective_rollout_percentage,
+            self_reflective_shadow_enabled=config.self_reflective_shadow_enabled,
+            self_reflective_retrieval_enabled=config.self_reflective_retrieval_enabled,
+            sql_enabled=config.sql_enabled,
+            sql_rollout_percentage=config.sql_rollout_percentage,
+            sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
         )
     )
+
+
+@lru_cache(maxsize=1)
+def get_llm_guard_input_scanner() -> LLMGuardInputScanner | None:
+    """Triggers real transformer-model loads (PromptInjection, Anonymize,
+    ...) - ``None`` unless ``SafetySettings.scanner_models_ready`` is
+    explicitly set, the same static-capability-gate pattern
+    ``get_regulatory_web_retriever`` already uses for
+    ``crag_web_guardrails_ready``. Guarded/preloaded at startup - see
+    ``app.main``'s lifespan - so a deployment either confirms this is
+    constructible (and pays the model-load cost once, at boot) or, in
+    production, refuses to start rather than silently falling back to the
+    deterministic-only scanner layer."""
+    settings = get_settings().safety
+    if not settings.scanner_models_ready:
+        return None
+    return build_llm_guard_input_scanner(settings)
+
+
+@lru_cache(maxsize=1)
+def get_llm_guard_output_scanner() -> LLMGuardOutputScanner | None:
+    """Same gate/preload story as ``get_llm_guard_input_scanner`` above -
+    a separate ``Vault`` from the input scanner's ``Anonymize``, since this
+    deployment's default posture never deanonymizes (see
+    ``build_llm_guard_output_scanner``'s docstring)."""
+    settings = get_settings().safety
+    if not settings.scanner_models_ready:
+        return None
+    return build_llm_guard_output_scanner(settings)
+
+
+@lru_cache(maxsize=1)
+def get_guardrail_policy() -> GuardrailPolicy:
+    return build_guardrail_policy()
+
+
+@lru_cache(maxsize=1)
+def get_input_guard_pipeline() -> InputGuardPipeline:
+    ml_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_input_guard_pipeline(
+        ml_scanner=ml_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_context_guard_pipeline() -> ContextGuardPipeline:
+    # Reuses the input scanner's PromptInjection detector for context
+    # (evidence-chunk) scanning too - one model load, two call sites - see
+    # app.guardrails.context_pipeline's module docstring.
+    injection_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_context_guard_pipeline(
+        injection_scanner=injection_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_output_guard_pipeline() -> OutputGuardPipeline:
+    ml_scanner: OutputScanner | None = get_llm_guard_output_scanner()
+    return build_output_guard_pipeline(
+        ml_scanner=ml_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_tool_guardrail() -> ToolGuardrail:
+    return build_tool_guardrail(security_events=get_security_events_repository())
 
 
 @lru_cache(maxsize=1)
@@ -504,7 +770,180 @@ def get_rag_service() -> RAGService:
         query_transformer=get_dynamic_hyde_transformer(),
         corrective_retriever=get_dynamic_crag(),
         config_store=get_rag_runtime_config_store(),
+        self_reflection_engine=get_dynamic_self_reflection(),
+        reflection_retrieval_top_k=settings.reflection_retrieval_top_k,
+        context_guard=get_context_guard_pipeline(),
+        output_guard=get_output_guard_pipeline(),
     )
+
+
+@lru_cache(maxsize=1)
+def get_sql_pool() -> PostgresConnectionPool | None:
+    """A **separate** pooled connection to the analytics database SQL
+    queries actually execute against - never ``get_db_pool()`` (the app's
+    own users/history/RAG-Ops database). ``None`` when
+    ``SQLFeatureSettings.sql_database_url`` is unset, which is the default:
+    no analytics database has been provisioned for this deployment yet (see
+    ``scripts/sql/provision_sql_reader_role.sql``). Proposal/example
+    persistence still uses ``get_db_pool()`` - see
+    ``get_sql_proposal_repository``/``get_sql_example_repository`` - since
+    that's app metadata, not analytics data."""
+    settings = get_settings().sql
+    dsn = settings.sql_database_url.get_secret_value()
+    if not dsn:
+        return None
+    return PostgresConnectionPool(
+        dsn, minconn=settings.sql_pool_min_conn, maxconn=settings.sql_pool_max_conn
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_catalog() -> StaticSQLCatalog:
+    """Allowlisted table/column catalog - see ``app.sql.catalog``. Reads its
+    version from ``sql_catalog_state`` in the *app* database (``get_db_pool``),
+    same as the proposal/example repositories - only actual SQL execution
+    uses the separate analytics pool."""
+    return StaticSQLCatalog(pool=get_db_pool(), definition_path=_SQL_CATALOG_DEFINITION_PATH)
+
+
+@lru_cache(maxsize=1)
+def get_sql_generator() -> VannaSQLGenerator:
+    """Vanna-backed SQL generator, trained on the approved catalog/examples
+    only - see ``app.sql.sql_generator``. Reuses this app's existing Qdrant
+    and OpenAI clients rather than building Vanna its own."""
+    settings = get_settings().sql
+    return VannaSQLGenerator(
+        qdrant_client=get_qdrant_client(),
+        openai_client=get_openai_client(),
+        model=settings.sql_generator_model,
+        temperature=settings.sql_generator_temperature,
+        seed=settings.sql_generator_seed,
+        collection_prefix=settings.sql_vanna_collection_prefix,
+        fastembed_model=settings.sql_vanna_fastembed_model,
+        max_examples=settings.sql_max_examples,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_policy() -> SQLPolicy:
+    """AST validation/rewrite policy - see ``app.sql.sql_policy``. One of
+    several independent layers (alongside the database role/RLS and the
+    read-only ``EXPLAIN`` check below); never trusted alone."""
+    settings = get_settings().sql
+    return SQLPolicy(
+        SQLPolicyConfig(
+            policy_version=settings.sql_policy_version,
+            allowed_schemas=settings.sql_allowed_schemas,
+            allowed_functions=settings.sql_allowed_functions,
+            max_joins=settings.sql_max_joins,
+            max_rows=settings.sql_max_result_rows,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_executor() -> SQLExecutor:
+    """Read-only ``EXPLAIN``/execute against the separate analytics pool -
+    see ``app.sql.sql_executor``. Falls back to :class:`UnavailableSQLExecutor`
+    (fails closed on first real use, never silently succeeds) when
+    ``get_sql_pool`` returns ``None`` - matches every other dynamic RAG Ops
+    dependency being always constructible regardless of current feature
+    state."""
+    pool = get_sql_pool()
+    if pool is None:
+        return UnavailableSQLExecutor()
+    settings = get_settings().sql
+    return PostgresReadOnlySQLExecutor(
+        pool=pool,
+        limits=SQLExecutionLimits(
+            statement_timeout_ms=settings.sql_statement_timeout_ms,
+            lock_timeout_ms=settings.sql_lock_timeout_ms,
+            max_plan_cost=settings.sql_max_plan_cost,
+            max_plan_rows=settings.sql_max_plan_rows,
+            max_result_rows=settings.sql_max_result_rows,
+            max_result_bytes=settings.sql_max_result_bytes,
+            max_cell_chars=settings.sql_max_cell_chars,
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_result_policy() -> SQLResultPolicy:
+    return DefaultSQLResultPolicy()
+
+
+@lru_cache(maxsize=1)
+def get_sql_answerer() -> SQLAnswerer:
+    return GroundedSQLAnswerer(
+        llm_client=get_llm_client(), model=get_settings().llm.llm_model_answer
+    )
+
+
+@lru_cache(maxsize=1)
+def get_sql_proposal_repository() -> SQLProposalRepository:
+    """Proposal state lives in the app database (``get_db_pool``), not the
+    analytics one - it's approval metadata, not analytics data."""
+    return PostgresSQLProposalRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_sql_example_repository() -> SQLExampleRepository:
+    return PostgresSQLExampleRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_sql_service() -> SQLService:
+    settings = get_settings().sql
+    return SQLService(
+        catalog=get_sql_catalog(),
+        generator=get_sql_generator(),
+        policy=get_sql_policy(),
+        executor=get_sql_executor(),
+        result_policy=get_sql_result_policy(),
+        answerer=get_sql_answerer(),
+        proposals=get_sql_proposal_repository(),
+        examples=get_sql_example_repository(),
+        config_store=get_rag_runtime_config_store(),
+        proposal_ttl_seconds=settings.sql_proposal_ttl_seconds,
+        max_generation_attempts=settings.sql_max_generation_attempts,
+        max_examples=settings.sql_max_examples,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_intent_router() -> IntentRouter:
+    settings = get_settings().sql
+    return StructuredIntentRouter(
+        llm_client=get_llm_client(),
+        model=settings.sql_router_model,
+        min_sql_confidence=settings.sql_min_route_confidence,
+        prompt_version=settings.sql_router_prompt_version,
+        timeout_seconds=settings.sql_router_timeout_seconds,
+        max_completion_tokens=settings.sql_router_max_completion_tokens,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_query_orchestrator() -> QueryOrchestrator:
+    """The router ``ChatController`` actually calls - see
+    ``app.query_orchestration.query_orchestrator``. Short-circuits straight
+    to ``get_rag_service()`` whenever ``RagRuntimeConfig.sql_enabled`` is
+    False (the default), so this doesn't change ``/chat``'s behavior or cost
+    for any deployment that hasn't opted into SQL routing."""
+    return QueryOrchestrator(
+        rag_service=get_rag_service(),
+        router=get_intent_router(),
+        sql_service=get_sql_service(),
+        config_store=get_rag_runtime_config_store(),
+        input_guard=get_input_guard_pipeline(),
+        tool_guardrail=get_tool_guardrail(),
+    )
+
+
+def get_sql_controller(
+    sql_service: SQLService = Depends(get_sql_service),
+) -> SQLController:
+    return SQLController(sql_service)
 
 
 @lru_cache(maxsize=1)
@@ -525,6 +964,35 @@ def get_policy_ingestion_service() -> PolicyIngestionService:
         vector_repository=get_vector_repository(),
         policy_dir=_POLICY_DIR,
         max_upload_size_mb=get_settings().ingestion.max_upload_size_mb,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_document_security_repository() -> DocumentSecurityRepository:
+    return PostgresDocumentSecurityRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_ingestion_security_scanner() -> IngestionSecurityScanner:
+    # Reuses the same injection scanner the context guard uses - one model
+    # load, multiple call sites - see app.guardrails.context_pipeline's
+    # module docstring for the same reasoning.
+    injection_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_ingestion_security_scanner(
+        ml_scanner=injection_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_policy_ingestion_security_service() -> PolicyIngestionSecurityService:
+    return PolicyIngestionSecurityService(
+        ingestion=get_policy_ingestion_service(),
+        security_repository=get_document_security_repository(),
+        scanner=get_ingestion_security_scanner(),
+        vector_repository=get_vector_repository(),
+        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -596,11 +1064,11 @@ def get_conversation_repository(
 
 
 def get_chat_controller(
-    rag_service: RAGService = Depends(get_rag_service),
+    query_orchestrator: QueryOrchestrator = Depends(get_query_orchestrator),
     chat_history_repository: ChatHistoryRepository = Depends(get_chat_history_repository),
     conversation_repository: ConversationRepository = Depends(get_conversation_repository),
 ) -> ChatController:
-    return ChatController(rag_service, chat_history_repository, conversation_repository)
+    return ChatController(query_orchestrator, chat_history_repository, conversation_repository)
 
 
 def get_health_checks(
@@ -633,9 +1101,14 @@ def get_query_cache_service() -> QueryCacheService:
 def get_admin_controller(
     health_check_service: HealthCheckService = Depends(get_health_check_service),
     query_cache: QueryCacheService = Depends(get_query_cache_service),
-    policy_ingestion_service: PolicyIngestionService = Depends(get_policy_ingestion_service),
+    policy_ingestion_service: PolicyIngestionSecurityService = Depends(
+        get_policy_ingestion_security_service
+    ),
     semantic_query_cache: SemanticQueryCache = Depends(get_semantic_query_cache),
     rag_ops_repository: RagOpsRepository = Depends(get_rag_ops_repository),
+    security_events_repository: SecurityEventsRepository = Depends(
+        get_security_events_repository
+    ),
 ) -> AdminController:
     return AdminController(
         health_check_service,
@@ -643,6 +1116,7 @@ def get_admin_controller(
         policy_ingestion_service,
         semantic_query_cache,
         rag_ops_repository,
+        security_events_repository,
     )
 
 
