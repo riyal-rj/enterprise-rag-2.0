@@ -47,6 +47,9 @@ from typing import Protocol
 from app.core.exceptions import HybridRetrievalDisabledError
 from app.core.llm.chat_client import LLMClient
 from app.core.llm.embedding_client import EmbeddingClient
+from app.guardrails.context_pipeline import ContextGuardPipeline, NoOpContextGuardPipeline
+from app.guardrails.contracts import GuardrailBlockedError
+from app.guardrails.output_pipeline import NoOpOutputGuardPipeline, OutputGuardPipeline
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.claim_checker import find_unsupported_claims
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
@@ -87,6 +90,7 @@ from app.schemas.chat import (
     ChatResponse,
     CRAGMetadata,
     EvidencePreview,
+    GuardrailMetadata,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -317,6 +321,11 @@ _INITIAL_ANSWER_FABRICATED_CITATION_ABSTENTION = (
     "cited answer to this question."
 )
 
+_OUTPUT_GUARD_BLOCKED_ABSTENTION = (
+    "I could not produce a response that passed the required safety and "
+    "grounding checks for this question."
+)
+
 
 class _CallableEvidenceAugmenter:
     """Adapts a bound closure to the ``EvidenceAugmenter`` protocol -
@@ -360,6 +369,8 @@ class RAGService:
         self_reflective_enabled: bool = False,
         reflection_retrieval_top_k: int = 5,
         self_reflection_telemetry: SelfReflectionTelemetry | None = None,
+        context_guard: ContextGuardPipeline | None = None,
+        output_guard: OutputGuardPipeline | None = None,
     ) -> None:
         if default_retrieval_mode not in retrieval_strategies:
             raise ValueError(
@@ -400,6 +411,14 @@ class RAGService:
         # real Prometheus/OpenTelemetry backend, and is a no-op unless a
         # deployment actually wires one in.
         self._crag_telemetry = crag_telemetry or NoOpCRAGTelemetry()
+        # Defaulted to pass-through, matching every other optional
+        # collaborator in this constructor - deps.py always supplies real
+        # pipelines for actual /chat traffic (see app.guardrails); a
+        # service instance nothing else needs guarded (most tests, the
+        # eval harness) gets a safe no-op instead of every call site
+        # needing to know these params exist.
+        self._context_guard = context_guard or NoOpContextGuardPipeline()
+        self._output_guard = output_guard or NoOpOutputGuardPipeline()
         # A caller that cares about atomic cross-object config application
         # (app.api.deps.get_rag_service) passes the same config_store this
         # process's DynamicReranker/DynamicQueryTransformer read from (see
@@ -788,6 +807,22 @@ class RAGService:
                 # distinction above.
                 self._metrics.record_crag_bypass(reason=crag_plan.bypass_reason)
 
+        # Context guardrail: drop any evidence chunk carrying an injection
+        # payload smuggled inside document text ("ignore previous
+        # instructions" embedded in a policy PDF chunk) before it can reach
+        # the answer prompt - see app.guardrails.context_pipeline. A
+        # flagged chunk is dropped, not exception-raised; every downstream
+        # consumer of crag_outcome.evidence already handles a shorter (or
+        # empty) tuple gracefully, same as CRAG's own zero-evidence path.
+        pre_guard_evidence_count = len(crag_outcome.evidence)
+        crag_outcome = replace(
+            crag_outcome,
+            evidence=self._context_guard.filter_evidence(
+                crag_outcome.evidence, mode=config.guardrail_mode
+            ),
+        )
+        context_chunks_dropped = pre_guard_evidence_count - len(crag_outcome.evidence)
+
         # Abstention is a deterministic response, never an LLM guess filling
         # an evidence gap - see module docstring's non-negotiable #4 and
         # ``ProductionCorrectiveRetriever.correct``'s internal-policy branch.
@@ -1049,6 +1084,29 @@ class RAGService:
                 },
             )
 
+        # Output guardrail: scans the final answer text before it can be
+        # cached or returned - see app.guardrails.output_pipeline. On
+        # BLOCK, substitute a fixed safe-abstention string rather than
+        # propagate the exception to the HTTP layer (an answer that
+        # already cost an LLM call shouldn't 500, same posture as
+        # _SELF_REFLECTION_FALLBACK_ABSTENTION above) - the substituted
+        # response is excluded from both cache writes via
+        # output_guard_blocked below, same as every other non-accepted
+        # outcome pipeline_fallback already excludes.
+        output_action = "allow"
+        output_guard_blocked = False
+        try:
+            guarded_answer_text = self._output_guard.apply(
+                prompt=question, answer=answer_text, mode=config.guardrail_mode
+            )
+            if guarded_answer_text != answer_text:
+                output_action = "redact"
+                answer_text = guarded_answer_text
+        except GuardrailBlockedError:
+            output_action = "block"
+            output_guard_blocked = True
+            answer_text = _OUTPUT_GUARD_BLOCKED_ABSTENTION
+
         response = ChatResponse(
             answer=answer_text,
             sources=sorted({self._public_source_identifier(item) for item in final_evidence}),
@@ -1112,6 +1170,12 @@ class RAGService:
                 retrieved_chunks=self._build_chunk_previews(chunks, rerank_items),
                 final_evidence=self._build_evidence_previews(final_evidence),
                 flagged_claims=flagged_claims,
+                guardrail=GuardrailMetadata(
+                    mode=config.guardrail_mode,
+                    context_chunks_dropped=context_chunks_dropped,
+                    output_action=output_action,  # type: ignore[arg-type]
+                    policy_version=config.guardrail_policy_version,
+                ),
             ),
         )
 
@@ -1140,6 +1204,11 @@ class RAGService:
             # implementation ever sets accepted=False without them - caching
             # an answer self-reflection didn't actually accept is never safe.
             or not self_reflection_outcome.accepted
+            # A response the output guardrail blocked was replaced with a
+            # fixed safe-abstention string (see
+            # _OUTPUT_GUARD_BLOCKED_ABSTENTION above) - never cache it,
+            # same reasoning as every other non-accepted outcome above.
+            or output_guard_blocked
         )
         if not pipeline_fallback:
             cache_written = self._set_cached(cache_key, response)

@@ -36,6 +36,27 @@ from app.core.redis_client import build_redis_client
 from app.core.security.passwords import BcryptPasswordHasher, PasswordHasher
 from app.core.security.rate_limiter import RateLimiter, UpstashSlidingWindowRateLimiter
 from app.core.security.tokens import JWTTokenIssuer, JWTTokenVerifier, TokenIssuer, TokenVerifier
+from app.guardrails.context_pipeline import ContextGuardPipeline
+from app.guardrails.contracts import OutputScanner, TextScanner
+from app.guardrails.factory import (
+    build_context_guard_pipeline,
+    build_guardrail_policy,
+    build_ingestion_security_scanner,
+    build_input_guard_pipeline,
+    build_output_guard_pipeline,
+    build_tool_guardrail,
+)
+from app.guardrails.ingestion_security import IngestionSecurityScanner
+from app.guardrails.input_pipeline import InputGuardPipeline
+from app.guardrails.llm_guard_adapter import (
+    LLMGuardInputScanner,
+    LLMGuardOutputScanner,
+    build_llm_guard_input_scanner,
+    build_llm_guard_output_scanner,
+)
+from app.guardrails.output_pipeline import OutputGuardPipeline
+from app.guardrails.policy import GuardrailPolicy
+from app.guardrails.tool_guardrail import ToolGuardrail
 from app.query_orchestration.intent_router import IntentRouter, StructuredIntentRouter
 from app.query_orchestration.query_orchestrator import QueryOrchestrator
 from app.rag_services.crag import (
@@ -45,12 +66,17 @@ from app.rag_services.crag import (
     PlannedCorrectiveRetriever,
     RetrievalGrader,
     StaticPlannedCorrectiveRetriever,
+    WebQueryFormulator,
     WebRetriever,
 )
 from app.rag_services.crag.corrective_retriever import ProductionCorrectiveRetriever
 from app.rag_services.crag.crag_refiner import ExtractiveKnowledgeRefiner
 from app.rag_services.crag.crag_retrieval_grader import StructuredLLMRetrievalGrader
 from app.rag_services.crag.dynamic_corrective_retriever import DynamicCorrectiveRetriever
+from app.rag_services.crag.web_query_formulator import (
+    FailOpenWebQueryFormulator,
+    StructuredWebQueryFormulator,
+)
 from app.rag_services.crag.web_retriever import (
     KeywordRegulatoryScopePolicy,
     TavilyRegulatoryWebRetriever,
@@ -91,7 +117,15 @@ from app.repositories.conversation_repository import (
     ConversationRepository,
     PostgresConversationRepository,
 )
+from app.repositories.document_security_repository import (
+    DocumentSecurityRepository,
+    PostgresDocumentSecurityRepository,
+)
 from app.repositories.rag_ops_repository import PostgresRagOpsRepository, RagOpsRepository
+from app.repositories.security_events_repository import (
+    PostgresSecurityEventsRepository,
+    SecurityEventsRepository,
+)
 from app.repositories.semantic_cache_repository import QdrantSemanticQueryCache, SemanticQueryCache
 from app.repositories.sql_example_repository import (
     PostgresSQLExampleRepository,
@@ -117,6 +151,7 @@ from app.services.health_checks import (
     RedisHealthCheck,
     TavilyHealthCheck,
 )
+from app.services.policy_ingestion_security_service import PolicyIngestionSecurityService
 from app.services.policy_ingestion_service import PolicyIngestionService
 from app.services.query_cache_service import QueryCacheService, UpstashCacheBackend
 from app.services.rag_metrics_service import RagMetricsService
@@ -152,6 +187,15 @@ def get_rag_ops_repository() -> RagOpsRepository:
     ``get_semantic_query_cache`` seed their initial mutable state from at
     process start, instead of the frozen ``RAGFeatureSettings`` defaults."""
     return PostgresRagOpsRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_security_events_repository() -> SecurityEventsRepository:
+    """Process-wide handle to the sanitized guardrail-decision audit trail
+    (see ``app.repositories.security_events_repository``) - the app
+    database pool, same reasoning as ``get_rag_ops_repository`` (this is
+    app metadata, not analytics data)."""
+    return PostgresSecurityEventsRepository(get_db_pool())
 
 
 @lru_cache(maxsize=1)
@@ -299,6 +343,25 @@ def get_regulatory_web_retriever() -> WebRetriever | None:
 
 
 @lru_cache(maxsize=1)
+def get_web_query_formulator() -> WebQueryFormulator:
+    """Rewrites a question into a keyword-oriented web-search query ahead
+    of CRAG's regulatory-web correction - see
+    ``app.rag_services.crag.web_query_formulator``. Wrapped fail-open: a
+    formulation failure falls back to searching with the raw question
+    rather than blocking web correction outright."""
+    settings = get_settings().rag
+    return FailOpenWebQueryFormulator(
+        StructuredWebQueryFormulator(
+            llm_client=get_llm_client(),
+            model=settings.crag_web_query_model,
+            prompt_version=settings.crag_web_query_prompt_version,
+            timeout_seconds=settings.crag_web_query_timeout_seconds,
+            max_completion_tokens=settings.crag_web_query_max_completion_tokens,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
 def get_crag_delegate() -> CorrectiveRetriever:
     """Raw CRAG correct/ambiguous/incorrect orchestrator, no rollout/
     emergency state - see ``get_dynamic_crag`` (production) and
@@ -311,6 +374,7 @@ def get_crag_delegate() -> CorrectiveRetriever:
         refiner=get_crag_refiner(),
         scope_policy=KeywordRegulatoryScopePolicy(policy_version=settings.crag_policy_version),
         web_retriever=get_regulatory_web_retriever(),
+        web_query_formulator=get_web_query_formulator(),
         min_evidence_chunks=settings.crag_min_evidence_chunks,
     )
 
@@ -544,8 +608,83 @@ def get_rag_runtime_config_store() -> RagRuntimeConfigStore:
             sql_enabled=config.sql_enabled,
             sql_rollout_percentage=config.sql_rollout_percentage,
             sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
         )
     )
+
+
+@lru_cache(maxsize=1)
+def get_llm_guard_input_scanner() -> LLMGuardInputScanner | None:
+    """Triggers real transformer-model loads (PromptInjection, Anonymize,
+    ...) - ``None`` unless ``SafetySettings.scanner_models_ready`` is
+    explicitly set, the same static-capability-gate pattern
+    ``get_regulatory_web_retriever`` already uses for
+    ``crag_web_guardrails_ready``. Guarded/preloaded at startup - see
+    ``app.main``'s lifespan - so a deployment either confirms this is
+    constructible (and pays the model-load cost once, at boot) or, in
+    production, refuses to start rather than silently falling back to the
+    deterministic-only scanner layer."""
+    settings = get_settings().safety
+    if not settings.scanner_models_ready:
+        return None
+    return build_llm_guard_input_scanner(settings)
+
+
+@lru_cache(maxsize=1)
+def get_llm_guard_output_scanner() -> LLMGuardOutputScanner | None:
+    """Same gate/preload story as ``get_llm_guard_input_scanner`` above -
+    a separate ``Vault`` from the input scanner's ``Anonymize``, since this
+    deployment's default posture never deanonymizes (see
+    ``build_llm_guard_output_scanner``'s docstring)."""
+    settings = get_settings().safety
+    if not settings.scanner_models_ready:
+        return None
+    return build_llm_guard_output_scanner(settings)
+
+
+@lru_cache(maxsize=1)
+def get_guardrail_policy() -> GuardrailPolicy:
+    return build_guardrail_policy()
+
+
+@lru_cache(maxsize=1)
+def get_input_guard_pipeline() -> InputGuardPipeline:
+    ml_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_input_guard_pipeline(
+        ml_scanner=ml_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_context_guard_pipeline() -> ContextGuardPipeline:
+    # Reuses the input scanner's PromptInjection detector for context
+    # (evidence-chunk) scanning too - one model load, two call sites - see
+    # app.guardrails.context_pipeline's module docstring.
+    injection_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_context_guard_pipeline(
+        injection_scanner=injection_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_output_guard_pipeline() -> OutputGuardPipeline:
+    ml_scanner: OutputScanner | None = get_llm_guard_output_scanner()
+    return build_output_guard_pipeline(
+        ml_scanner=ml_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_tool_guardrail() -> ToolGuardrail:
+    return build_tool_guardrail(security_events=get_security_events_repository())
 
 
 @lru_cache(maxsize=1)
@@ -633,6 +772,8 @@ def get_rag_service() -> RAGService:
         config_store=get_rag_runtime_config_store(),
         self_reflection_engine=get_dynamic_self_reflection(),
         reflection_retrieval_top_k=settings.reflection_retrieval_top_k,
+        context_guard=get_context_guard_pipeline(),
+        output_guard=get_output_guard_pipeline(),
     )
 
 
@@ -794,6 +935,8 @@ def get_query_orchestrator() -> QueryOrchestrator:
         router=get_intent_router(),
         sql_service=get_sql_service(),
         config_store=get_rag_runtime_config_store(),
+        input_guard=get_input_guard_pipeline(),
+        tool_guardrail=get_tool_guardrail(),
     )
 
 
@@ -821,6 +964,35 @@ def get_policy_ingestion_service() -> PolicyIngestionService:
         vector_repository=get_vector_repository(),
         policy_dir=_POLICY_DIR,
         max_upload_size_mb=get_settings().ingestion.max_upload_size_mb,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_document_security_repository() -> DocumentSecurityRepository:
+    return PostgresDocumentSecurityRepository(get_db_pool())
+
+
+@lru_cache(maxsize=1)
+def get_ingestion_security_scanner() -> IngestionSecurityScanner:
+    # Reuses the same injection scanner the context guard uses - one model
+    # load, multiple call sites - see app.guardrails.context_pipeline's
+    # module docstring for the same reasoning.
+    injection_scanner: TextScanner | None = get_llm_guard_input_scanner()
+    return build_ingestion_security_scanner(
+        ml_scanner=injection_scanner,
+        policy=get_guardrail_policy(),
+        security_events=get_security_events_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_policy_ingestion_security_service() -> PolicyIngestionSecurityService:
+    return PolicyIngestionSecurityService(
+        ingestion=get_policy_ingestion_service(),
+        security_repository=get_document_security_repository(),
+        scanner=get_ingestion_security_scanner(),
+        vector_repository=get_vector_repository(),
+        config_store=get_rag_runtime_config_store(),
     )
 
 
@@ -929,9 +1101,14 @@ def get_query_cache_service() -> QueryCacheService:
 def get_admin_controller(
     health_check_service: HealthCheckService = Depends(get_health_check_service),
     query_cache: QueryCacheService = Depends(get_query_cache_service),
-    policy_ingestion_service: PolicyIngestionService = Depends(get_policy_ingestion_service),
+    policy_ingestion_service: PolicyIngestionSecurityService = Depends(
+        get_policy_ingestion_security_service
+    ),
     semantic_query_cache: SemanticQueryCache = Depends(get_semantic_query_cache),
     rag_ops_repository: RagOpsRepository = Depends(get_rag_ops_repository),
+    security_events_repository: SecurityEventsRepository = Depends(
+        get_security_events_repository
+    ),
 ) -> AdminController:
     return AdminController(
         health_check_service,
@@ -939,6 +1116,7 @@ def get_admin_controller(
         policy_ingestion_service,
         semantic_query_cache,
         rag_ops_repository,
+        security_events_repository,
     )
 
 

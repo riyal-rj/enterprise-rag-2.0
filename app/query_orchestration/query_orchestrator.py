@@ -15,6 +15,9 @@ from __future__ import annotations
 import logging
 
 from app.core.exceptions import SQLGenerationFailedError
+from app.guardrails.contracts import GuardrailBlockedError, GuardrailDecision
+from app.guardrails.input_pipeline import InputGuardPipeline
+from app.guardrails.tool_guardrail import ToolGuardrail
 from app.models.auth_user import AuthenticatedUser
 from app.query_orchestration.intent_router import IntentRouter
 from app.rag_services.rag_runtime_config import RagRuntimeConfigStore
@@ -23,6 +26,7 @@ from app.rag_services.rollout import sampled_in
 from app.schemas.chat import ChatResponse as ChatResponseSchema
 from app.schemas.chat import (
     CRAGMetadata,
+    GuardrailMetadata,
     HyDEMetadata,
     RerankingMetadata,
     ResponseMetadata,
@@ -48,11 +52,15 @@ class QueryOrchestrator:
         router: IntentRouter,
         sql_service: SQLService,
         config_store: RagRuntimeConfigStore,
+        input_guard: InputGuardPipeline,
+        tool_guardrail: ToolGuardrail,
     ) -> None:
         self._rag_service = rag_service
         self._router = router
         self._sql_service = sql_service
         self._config_store = config_store
+        self._input_guard = input_guard
+        self._tool_guardrail = tool_guardrail
 
     def answer(
         self,
@@ -64,41 +72,73 @@ class QueryOrchestrator:
         retrieval_mode: str | None,
     ) -> ChatResponseSchema:
         config = self._config_store.current
+        # Runs unconditionally, before any routing decision - guardrails
+        # apply to every request regardless of which pipeline (RAG/SQL/
+        # hybrid) ends up handling it, not just the SQL-eligible path. See
+        # app.guardrails.input_pipeline.InputGuardPipeline.
+        try:
+            guarded_question, input_decision = self._guard_input(
+                question, mode=config.guardrail_mode, actor=principal.username
+            )
+        except GuardrailBlockedError:
+            return self._blocked_response(question)
+
         # emergency_disabled is the same global kill switch every other
         # feature (HyDE/CRAG/reranking) already gates on - SQL routing must
         # not be an exception to it. See RagRuntimeConfig's docstring.
         if not config.sql_enabled or config.emergency_disabled:
-            return self._rag_service.answer(question, top_k=top_k, retrieval_mode=retrieval_mode)
+            return self._overlay_input_guardrail(
+                self._rag_service.answer(
+                    guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+                ),
+                input_decision,
+            )
 
-        guarded_question = self._guard_input(question)
         # sql_rollout_percentage gates SQL routing itself, not an
         # enhancement layered on top of it - a question sampled out falls
         # straight back to RAG, the same as sql_enabled=False, rather than
         # reaching the router at all.
         if not sampled_in(guarded_question, config.sql_rollout_percentage, salt="sql"):
-            return self._rag_service.answer(
-                guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+            return self._overlay_input_guardrail(
+                self._rag_service.answer(
+                    guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+                ),
+                input_decision,
             )
 
         decision = self._router.route(guarded_question)
 
         if decision.route is QueryRoute.RAG:
-            return self._rag_service.answer(
-                guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+            return self._overlay_input_guardrail(
+                self._rag_service.answer(
+                    guarded_question, top_k=top_k, retrieval_mode=retrieval_mode
+                ),
+                input_decision,
             )
 
         if decision.route in (QueryRoute.SQL, QueryRoute.HYBRID_RAG_SQL):
-            if not principal.is_admin:
+            try:
+                self._tool_guardrail.authorize_sql(principal=principal, config=config)
+            except GuardrailBlockedError:
+                reason_code = (
+                    "sql_safety_lockdown"
+                    if config.safety_lockdown_enabled
+                    else "sql_admin_only_initial_rollout"
+                )
+                answer = (
+                    "This data operation is not authorized or is temporarily unavailable."
+                    if config.safety_lockdown_enabled
+                    else (
+                        "This question needs structured-data access, which is currently "
+                        "limited to administrators while Text-to-SQL is in early rollout."
+                    )
+                )
                 return self._sql_response(
                     decision,
                     status="rejected",
-                    answer=(
-                        "This question needs structured-data access, which is currently "
-                        "limited to administrators while Text-to-SQL is in early rollout."
-                    ),
-                    sql_metadata=SQLMetadata(
-                        enabled=True, reason_code="sql_admin_only_initial_rollout"
-                    ),
+                    answer=answer,
+                    sql_metadata=SQLMetadata(enabled=True, reason_code=reason_code),
+                    input_decision=input_decision,
                 )
 
             if decision.route is QueryRoute.HYBRID_RAG_SQL:
@@ -109,6 +149,7 @@ class QueryOrchestrator:
                     question=guarded_question,
                     top_k=top_k,
                     retrieval_mode=retrieval_mode,
+                    input_decision=input_decision,
                 )
 
             try:
@@ -130,14 +171,16 @@ class QueryOrchestrator:
                         "Try rephrasing it or ask about a narrower set of data."
                     ),
                     sql_metadata=SQLMetadata(enabled=True, reason_code="sql_generation_failed"),
+                    input_decision=input_decision,
                 )
-            return self._proposal_response(decision, proposal)
+            return self._proposal_response(decision, proposal, input_decision)
 
         return self._sql_response(
             decision,
             status="rejected",
             answer="This question could not be safely routed to either document search or data lookup.",
             sql_metadata=SQLMetadata(enabled=True, reason_code=decision.reason_code),
+            input_decision=input_decision,
         )
 
     def _generate_hybrid_answer(
@@ -149,6 +192,7 @@ class QueryOrchestrator:
         question: str,
         top_k: int,
         retrieval_mode: str | None,
+        input_decision: GuardrailDecision,
     ) -> ChatResponseSchema:
         """Real fan-out for HYBRID_RAG_SQL: a grounded RAG answer (real
         citations, synchronous) plus a real generated-and-policy-validated
@@ -161,8 +205,9 @@ class QueryOrchestrator:
         approve via the existing SQL approval endpoint, rather than
         inventing a number that hasn't actually been computed yet.
         """
-        rag_response = self._rag_service.answer(
-            question, top_k=top_k, retrieval_mode=retrieval_mode
+        rag_response = self._overlay_input_guardrail(
+            self._rag_service.answer(question, top_k=top_k, retrieval_mode=retrieval_mode),
+            input_decision,
         )
         try:
             proposal = self._sql_service.propose(
@@ -215,16 +260,77 @@ class QueryOrchestrator:
             }
         )
 
-    def _guard_input(self, question: str) -> str:
-        """Hook point for the input-guardrail pipeline the architecture
-        blueprint requires before SQL treatment can exceed 0% for real
-        traffic (see its Non-negotiable controls). A pass-through today -
-        SQL stays admin-only and proposal-only regardless, so nothing
-        downstream depends on this doing more yet."""
-        return question
+    def _guard_input(
+        self, question: str, *, mode: str, actor: str | None = None
+    ) -> tuple[str, GuardrailDecision]:
+        """Runs the input guardrail pipeline (canonicalize, deterministic
+        secret/PII scan, ML injection/toxicity/banned-topic scan - see
+        ``app.guardrails.input_pipeline.InputGuardPipeline``) ahead of
+        routing/caching. Raises ``GuardrailBlockedError`` on a BLOCK
+        decision; returns the sanitized (possibly PII-redacted) question
+        plus the decision otherwise - the decision is threaded through
+        every response path below (see ``_overlay_input_guardrail``) so a
+        REDACT is still visible in ``metadata.guardrail`` even though
+        ``RAGService`` (which builds the rest of that metadata) has no
+        knowledge this stage ran at all."""
+        return self._input_guard.check_with_decision(
+            question, mode=mode, actor=actor  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def _apply_input_guardrail_metadata(
+        guardrail: GuardrailMetadata, decision: GuardrailDecision
+    ) -> GuardrailMetadata:
+        if decision.action.value == "allow":
+            return guardrail
+        categories = sorted(
+            {f.category.value for f in decision.findings} | set(guardrail.categories_flagged)
+        )
+        return guardrail.model_copy(
+            update={"input_action": decision.action.value, "categories_flagged": categories}
+        )
+
+    def _overlay_input_guardrail(
+        self, response: ChatResponseSchema, decision: GuardrailDecision
+    ) -> ChatResponseSchema:
+        """Patches a ``RAGService``-built response's ``metadata.guardrail``
+        to reflect the input-stage decision, which ``RAGService`` itself
+        never sees. No-op when the input was a plain ALLOW."""
+        if decision.action.value == "allow":
+            return response
+        updated_guardrail = self._apply_input_guardrail_metadata(
+            response.metadata.guardrail, decision
+        )
+        updated_metadata = response.metadata.model_copy(update={"guardrail": updated_guardrail})
+        return response.model_copy(update={"metadata": updated_metadata})
+
+    def _blocked_response(self, question: str) -> ChatResponseSchema:
+        del question  # never echoed back - see GuardrailBlockedError's own discipline
+        return ChatResponseSchema(
+            status="rejected",
+            answer=(
+                "I can't process that request safely. Please restate the question "
+                "without instructions to reveal or override system behavior."
+            ),
+            sources=[],
+            confidence=0.0,
+            metadata=ResponseMetadata(
+                route="reject",
+                hyde=_DISABLED_HYDE,
+                reranking=_DISABLED_RERANKING,
+                crag=_DISABLED_CRAG,
+                self_reflection=_DISABLED_SELF_REFLECTION,
+                retrieved_chunks=[],
+                sql=SQLMetadata(enabled=False, reason_code="input_guardrail_blocked"),
+                guardrail=GuardrailMetadata(input_action="block"),
+            ),
+        )
 
     def _proposal_response(
-        self, decision: RouteDecision, proposal: SQLProposal
+        self,
+        decision: RouteDecision,
+        proposal: SQLProposal,
+        input_decision: GuardrailDecision,
     ) -> ChatResponseSchema:
         sql_metadata = SQLMetadata(
             enabled=True,
@@ -244,7 +350,7 @@ class QueryOrchestrator:
             ),
             sources=[],
             confidence=decision.confidence,
-            metadata=self._metadata(decision.route.value, sql_metadata),
+            metadata=self._metadata(decision.route.value, sql_metadata, input_decision),
         )
 
     def _sql_response(
@@ -254,17 +360,26 @@ class QueryOrchestrator:
         status: str,
         answer: str,
         sql_metadata: SQLMetadata,
+        input_decision: GuardrailDecision,
     ) -> ChatResponseSchema:
         return ChatResponseSchema(
             status=status,  # type: ignore[arg-type]
             answer=answer,
             sources=[],
             confidence=decision.confidence,
-            metadata=self._metadata(decision.route.value, sql_metadata),
+            metadata=self._metadata(decision.route.value, sql_metadata, input_decision),
         )
 
-    @staticmethod
-    def _metadata(route: str, sql_metadata: SQLMetadata) -> ResponseMetadata:
+    @classmethod
+    def _metadata(
+        cls,
+        route: str,
+        sql_metadata: SQLMetadata,
+        input_decision: GuardrailDecision | None = None,
+    ) -> ResponseMetadata:
+        guardrail = GuardrailMetadata()
+        if input_decision is not None:
+            guardrail = cls._apply_input_guardrail_metadata(guardrail, input_decision)
         return ResponseMetadata(
             route=route,
             hyde=_DISABLED_HYDE,
@@ -273,4 +388,5 @@ class QueryOrchestrator:
             self_reflection=_DISABLED_SELF_REFLECTION,
             retrieved_chunks=[],
             sql=sql_metadata,
+            guardrail=guardrail,
         )

@@ -39,6 +39,47 @@ def test_production_passes_with_real_secrets(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.environment is Environment.PRODUCTION
 
 
+def test_production_rejects_monitor_mode_with_sql_enabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("JWT_SECRET", "a-real-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@prod-host:5432/adv_rag")
+    monkeypatch.setenv("GUARDRAIL_MODE_DEFAULT", "monitor")
+    monkeypatch.setenv("SQL_ENABLED_BY_DEFAULT", "true")
+
+    with pytest.raises(ValueError, match="guardrail mode 'monitor'"):
+        Settings()
+
+
+def test_production_rejects_monitor_mode_with_crag_web_enabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("JWT_SECRET", "a-real-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@prod-host:5432/adv_rag")
+    monkeypatch.setenv("GUARDRAIL_MODE_DEFAULT", "monitor")
+    monkeypatch.setenv("CRAG_WEB_ENABLED_BY_DEFAULT", "true")
+
+    with pytest.raises(ValueError, match="guardrail mode 'monitor'"):
+        Settings()
+
+
+def test_production_allows_monitor_mode_with_sql_and_crag_web_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("JWT_SECRET", "a-real-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@prod-host:5432/adv_rag")
+    monkeypatch.setenv("GUARDRAIL_MODE_DEFAULT", "monitor")
+
+    settings = Settings()
+    assert settings.safety.guardrail_mode_default == "monitor"
+
+
 def test_invalid_database_url_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "mysql://user:pw@localhost/db")
 

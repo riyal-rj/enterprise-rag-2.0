@@ -21,7 +21,14 @@ import uuid
 
 import pytest
 from qdrant_client import QdrantClient
-from qdrant_client.models import SparseVector
+from qdrant_client.models import (
+    Distance,
+    Modifier,
+    PointStruct,
+    SparseVector,
+    SparseVectorParams,
+    VectorParams,
+)
 
 from app.core.ingestion.document_processor import DocumentChunk
 from app.repositories.vector_repository import QdrantVectorRepository
@@ -106,3 +113,111 @@ def test_delete_by_source_removes_only_the_matching_points(
 
     remaining = repository.scroll_all_chunks()
     assert [r["source"] for r in remaining] == ["keep.pdf"]
+
+
+def test_quarantined_points_are_invisible_to_every_search_path(
+    repository: QdrantVectorRepository,
+) -> None:
+    """The whole point of the ingestion-quarantine workflow: a freshly
+    uploaded, unapproved document must not be retrievable by real chat
+    traffic - see app.services.policy_ingestion_security_service."""
+    chunks = [DocumentChunk(text="unapproved content", source="pending.pdf", page_number=1)]
+    dense_embeddings = [[0.3] * 1536]
+    sparse_embeddings = [SparseVector(indices=[30], values=[1.0])]
+
+    repository.upsert_chunks(
+        chunks, dense_embeddings, sparse_embeddings, ingestion_status="quarantined"
+    )
+
+    assert repository.search_dense(dense_embeddings[0], top_k=5) == []
+    assert (
+        repository.search_sparse(SparseVector(indices=[30], values=[1.0]), top_k=5) == []
+    )
+    assert (
+        repository.search_hybrid(
+            query_embedding=dense_embeddings[0],
+            query_sparse=SparseVector(indices=[30], values=[1.0]),
+            top_k=5,
+        )
+        == []
+    )
+    assert repository.scroll_all_chunks() == []  # default active-only listing
+
+
+def test_set_ingestion_status_activates_a_quarantined_document(
+    repository: QdrantVectorRepository,
+) -> None:
+    chunks = [DocumentChunk(text="soon to be approved", source="approve_me.pdf")]
+    dense_embeddings = [[0.4] * 1536]
+    sparse_embeddings = [SparseVector(indices=[40], values=[1.0])]
+    repository.upsert_chunks(
+        chunks, dense_embeddings, sparse_embeddings, ingestion_status="quarantined"
+    )
+    assert repository.search_dense(dense_embeddings[0], top_k=5) == []
+
+    repository.set_ingestion_status("approve_me.pdf", "active")
+
+    results = repository.search_dense(dense_embeddings[0], top_k=5)
+    assert [r.source for r in results] == ["approve_me.pdf"]
+
+
+def test_scroll_all_chunks_with_explicit_status_lists_only_that_status(
+    repository: QdrantVectorRepository,
+) -> None:
+    active_chunk = [DocumentChunk(text="live", source="live.pdf")]
+    quarantined_chunk = [DocumentChunk(text="pending", source="pending.pdf")]
+    repository.upsert_chunks(
+        active_chunk, [[0.5] * 1536], [SparseVector(indices=[50], values=[1.0])]
+    )
+    repository.upsert_chunks(
+        quarantined_chunk,
+        [[0.6] * 1536],
+        [SparseVector(indices=[60], values=[1.0])],
+        ingestion_status="quarantined",
+    )
+
+    active_only = repository.scroll_all_chunks(ingestion_status="active")
+    quarantined_only = repository.scroll_all_chunks(ingestion_status="quarantined")
+    everything = repository.scroll_all_chunks(ingestion_status=None)
+
+    assert [r["source"] for r in active_only] == ["live.pdf"]
+    assert [r["source"] for r in quarantined_only] == ["pending.pdf"]
+    assert sorted(str(r["source"]) for r in everything) == ["live.pdf", "pending.pdf"]
+
+
+def test_preexisting_points_with_no_ingestion_status_are_backfilled_to_active() -> None:
+    """Upgrade safety: a collection populated before ingestion_status
+    existed must not go dark - QdrantVectorRepository's construction must
+    backfill those points to "active" rather than leaving them invisible
+    to the new active-only search filter."""
+    client = QdrantClient(url=_QDRANT_URL, timeout=10)
+    collection_name = f"test_vector_repository_backfill_{uuid.uuid4().hex[:8]}"
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config={"dense": VectorParams(size=1536, distance=Distance.COSINE)},
+        sparse_vectors_config={"bm25": SparseVectorParams(modifier=Modifier.IDF)},
+    )
+    # Simulates a point written before ingestion_status existed - no such
+    # payload key at all, not merely a null value.
+    client.upsert(
+        collection_name=collection_name,
+        points=[
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    "dense": [0.7] * 1536,
+                    "bm25": SparseVector(indices=[70], values=[1.0]),
+                },
+                payload={"text": "pre-migration content", "source": "legacy.pdf"},
+            )
+        ],
+    )
+
+    try:
+        repository = QdrantVectorRepository(client=client, collection_name=collection_name)
+
+        results = repository.search_dense([0.7] * 1536, top_k=5)
+
+        assert [r.source for r in results] == ["legacy.pdf"]
+    finally:
+        client.delete_collection(collection_name)

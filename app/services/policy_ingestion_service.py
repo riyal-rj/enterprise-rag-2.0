@@ -18,7 +18,7 @@ from app.core.exceptions import FileTooLargeError, UnsupportedFileTypeError
 from app.core.ingestion.document_processor import SUPPORTED_SUFFIXES, DocumentProcessor
 from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
-from app.repositories.vector_repository import VectorRepository
+from app.repositories.vector_repository import INGESTION_STATUS_ACTIVE, VectorRepository
 from app.schemas.policy import PolicyListResponse, PolicySummary, PolicyUploadResponse
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,13 @@ class PolicyIngestionService:
         self._max_upload_size_bytes = max_upload_size_mb * 1024 * 1024
         self._max_upload_size_mb = max_upload_size_mb
 
-    def list_policies(self) -> PolicyListResponse:
+    def list_policies(self, status: str | None = INGESTION_STATUS_ACTIVE) -> PolicyListResponse:
+        """``status`` defaults to ``active`` so the admin policy list keeps
+        showing only live documents, unchanged from before the quarantine
+        workflow existed; pass ``None`` for every status or a specific
+        quarantine-state value."""
         counts: dict[str, int] = {}
-        for record in self._vector_repository.scroll_all_chunks():
+        for record in self._vector_repository.scroll_all_chunks(ingestion_status=status):
             source = str(record.get("source") or "")
             if not source:
                 continue
@@ -58,17 +62,29 @@ class PolicyIngestionService:
         ]
         return PolicyListResponse(policies=policies)
 
-    def ingest(self, filename: str, content: bytes) -> PolicyUploadResponse:
+    def ingest(
+        self,
+        filename: str,
+        content: bytes,
+        ingestion_status: str = INGESTION_STATUS_ACTIVE,
+    ) -> PolicyUploadResponse:
         """Chunk, embed, and store ``content`` under ``filename``.
 
         Re-uploading a filename that's already been ingested replaces it:
-        the old chunks for that source are deleted before the new ones are
-        upserted, rather than being rejected or left to accumulate
-        alongside duplicates.
+        the old chunks for that source (regardless of their prior
+        ingestion status) are deleted before the new ones are upserted,
+        rather than being rejected or left to accumulate alongside
+        duplicates. ``ingestion_status`` defaults to ``active`` so every
+        pre-existing caller (``scripts/seed_db.py``, tests) keeps its
+        original always-searchable behavior unchanged; the quarantine
+        upload path (``app.services.policy_ingestion_security_service``)
+        passes ``quarantined`` explicitly.
         """
         self._validate(filename, content)
 
-        existing_sources = {p.source for p in self.list_policies().policies}
+        existing_sources = {
+            p.source for p in self.list_policies(status=None).policies
+        }
         is_replacing = filename in existing_sources
 
         temp_dir = Path(tempfile.mkdtemp(prefix="policy_upload_"))
@@ -92,16 +108,26 @@ class PolicyIngestionService:
 
             if is_replacing:
                 self._vector_repository.delete_by_source(filename)
-            self._vector_repository.upsert_chunks(chunks, dense_embeddings, sparse_embeddings)
+            self._vector_repository.upsert_chunks(
+                chunks, dense_embeddings, sparse_embeddings, ingestion_status=ingestion_status
+            )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         logger.info(
             "policy.ingested",
-            extra={"source": filename, "chunk_count": len(chunks), "replaced": is_replacing},
+            extra={
+                "source": filename,
+                "chunk_count": len(chunks),
+                "replaced": is_replacing,
+                "ingestion_status": ingestion_status,
+            },
         )
         return PolicyUploadResponse(
-            source=filename, chunks_ingested=len(chunks), replaced=is_replacing
+            source=filename,
+            chunks_ingested=len(chunks),
+            replaced=is_replacing,
+            status=ingestion_status,
         )
 
     def _validate(self, filename: str, content: bytes) -> None:

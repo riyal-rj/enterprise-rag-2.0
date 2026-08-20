@@ -19,6 +19,8 @@ from app.schemas.rag_ops import (
     EmergencyEnableRequest,
     RagOpsConfigUpdateRequest,
     RagOpsStatusResponse,
+    SafetyLockdownDisableRequest,
+    SafetyLockdownEnableRequest,
 )
 
 router = APIRouter(prefix="/admin/rag-ops", tags=["admin", "rag-ops"])
@@ -65,6 +67,33 @@ def emergency_enable(
     """Clear the emergency kill switch, restoring the previously configured
     reranking/semantic-cache state. Admin-only."""
     return controller.emergency_enable(user.username, payload)
+
+
+@router.post("/safety-lockdown-enable", response_model=RagOpsStatusResponse)
+def safety_lockdown_enable(
+    payload: SafetyLockdownEnableRequest,
+    user: AuthenticatedUser = Depends(require_admin),
+    controller: RagOpsController = Depends(get_rag_ops_controller),
+) -> RagOpsStatusResponse:
+    """Security-incident kill switch: force the SQL route fully closed
+    (propose and execute both denied - see
+    ``app.guardrails.tool_guardrail.ToolGuardrail.authorize_sql``)
+    regardless of ``sql_enabled``, without touching reranking/HyDE/CRAG/
+    self-reflection. Distinct from ``emergency-disable``. Requires an
+    explicit confirmation and a reason. Admin-only."""
+    return controller.safety_lockdown_enable(user.username, payload)
+
+
+@router.post("/safety-lockdown-disable", response_model=RagOpsStatusResponse)
+def safety_lockdown_disable(
+    payload: SafetyLockdownDisableRequest,
+    user: AuthenticatedUser = Depends(require_admin),
+    controller: RagOpsController = Depends(get_rag_ops_controller),
+) -> RagOpsStatusResponse:
+    """Clear the safety-lockdown kill switch, restoring the SQL route to
+    whatever ``sql_enabled``/``sql_rollout_percentage`` already allow.
+    Admin-only."""
+    return controller.safety_lockdown_disable(user.username, payload)
 
 
 @router.get("/audit", response_model=AuditLogResponse)

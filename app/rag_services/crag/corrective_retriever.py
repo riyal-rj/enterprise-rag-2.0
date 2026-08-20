@@ -14,6 +14,7 @@ from app.rag_services.crag.crag import (
     RetrievalGrade,
     RetrievalGrader,
     SourceScopePolicy,
+    WebQueryFormulator,
     WebRetriever,
 )
 
@@ -86,22 +87,32 @@ class ProductionCorrectiveRetriever:
         refiner: KnowledgeRefiner,
         scope_policy: SourceScopePolicy,
         web_retriever: WebRetriever | None,
+        web_query_formulator: WebQueryFormulator | None = None,
         min_evidence_chunks: int = 1,
     ) -> None:
         self._grader = grader
         self._refiner = refiner
         self._scope = scope_policy
         self._web = web_retriever
+        # None-able independently of web_retriever: a caller with no
+        # formulator just searches with the raw question, same as before
+        # this existed - see web_query_formulator.py's module docstring for
+        # why a formulator is worth having at all.
+        self._query_formulator = web_query_formulator
         self._min_evidence = min_evidence_chunks
 
     @property
     def cache_namespace(self) -> str:
         web = self._web.cache_namespace if self._web is not None else "none"
+        query_formulator = (
+            self._query_formulator.cache_namespace if self._query_formulator is not None else "none"
+        )
         return (
             f"crag:v1:{self._grader.cache_namespace}:"
             f"{self._refiner.cache_namespace}:"
             f"{self._scope.cache_namespace}:"
             f"web={web}:"
+            f"query_formulator={query_formulator}:"
             f"min_evidence={self._min_evidence}"
         )
 
@@ -151,7 +162,15 @@ class ProductionCorrectiveRetriever:
             and self._scope.permits_public_regulatory_web(question)
         )
         if web_allowed and self._web is not None:
-            results = self._web.search(question)
+            search_query = question
+            if self._query_formulator is not None:
+                search_query, formulation_tokens = self._query_formulator.formulate(question)
+                tokens += formulation_tokens
+            results = self._web.search(search_query)
+            # Evidence selection still runs against the original question,
+            # not the abbreviated search query - only the Tavily call itself
+            # benefits from keyword-shaped input (see
+            # web_query_formulator.py's module docstring).
             web_evidence, web_tokens = self._refiner.refine_web(question, results)
             tokens += web_tokens
             if not web_evidence:

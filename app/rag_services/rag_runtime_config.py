@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 RerankerBackendName = Literal["local", "voyage"]
+GuardrailModeName = Literal["enforce", "monitor"]
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,22 @@ class RagRuntimeConfig:
     sql_enabled: bool = False
     sql_rollout_percentage: int = 0
     sql_proposal_only: bool = True
+    # Guardrails layer (app.guardrails) - see
+    # app/seed/migrations/013_add_guardrails_config.sql. guardrail_mode
+    # gates whether a BLOCK/REDACT-worthy decision is actually applied
+    # ("enforce") or only recorded ("monitor" - see GuardrailPolicy.decide);
+    # production startup refuses "monitor" while SQL/CRAG-web is enabled
+    # (see app.core.config.settings). safety_lockdown_enabled is a
+    # security-incident kill switch distinct from emergency_disabled: the
+    # latter degrades rollout-gated quality features (reranking/HyDE/CRAG/
+    # self-reflection), while safety_lockdown_enabled additionally forces
+    # the SQL route fully closed regardless of sql_enabled (see
+    # app.guardrails.tool_guardrail.ToolGuardrail.authorize_sql).
+    # Defaulted so every pre-existing construction site keeps working
+    # unchanged, same reasoning as crag_shadow_enabled/sql_enabled above.
+    guardrail_mode: GuardrailModeName = "enforce"
+    guardrail_policy_version: str = "guardrails-policy-v1"
+    safety_lockdown_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.reranker_rollout_percentage <= 100:
@@ -117,6 +134,11 @@ class RagRuntimeConfig:
                 "sql_proposal_only cannot be disabled - this release has no "
                 "automatic SQL execution path"
             )
+        if self.guardrail_mode not in ("enforce", "monitor"):
+            # Defensive - the DB CHECK constraint (migration 013) is the
+            # real backstop; this just fails loudly on a construction site
+            # that somehow bypasses it (e.g. a future test/eval fixture).
+            raise ValueError("guardrail_mode must be 'enforce' or 'monitor'")
 
 
 _DEFAULT_CONFIG = RagRuntimeConfig(

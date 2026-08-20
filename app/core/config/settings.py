@@ -73,6 +73,22 @@ class Settings(BaseModel):
                 "Refusing to start in production with insecure/missing "
                 f"configuration: {', '.join(missing)}"
             )
+
+        # Guardrails: "monitor" mode observes findings but never applies a
+        # BLOCK/REDACT decision (see app.guardrails.policy.GuardrailPolicy.decide)
+        # - an acceptable posture for evaluating false-positive rates in
+        # non-production, but never while a route that can execute SQL or
+        # fetch external web content is enabled, since those routes have no
+        # enforcement backstop of their own if guardrails are only watching.
+        if self.safety.guardrail_mode_default == "monitor" and (
+            self.sql.sql_enabled_by_default or self.rag.crag_web_enabled_by_default
+        ):
+            raise ValueError(
+                "Refusing to start in production with guardrail mode 'monitor' "
+                "while Text-to-SQL or CRAG web correction is enabled by default - "
+                "monitor mode observes but does not block, which is not an "
+                "acceptable posture for either feature at rollout time."
+            )
         return self
 
 

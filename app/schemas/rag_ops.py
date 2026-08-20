@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 RerankerBackend = Literal["local", "voyage"]
+GuardrailMode = Literal["enforce", "monitor"]
 
 
 class RerankMetrics(BaseModel):
@@ -166,6 +167,15 @@ class RagOpsStatusResponse(BaseModel):
     sql_rollout_percentage: int
     sql_proposal_only: bool
 
+    # Guardrails layer (app.guardrails) - see
+    # app/seed/migrations/013_add_guardrails_config.sql.
+    guardrail_mode: GuardrailMode
+    guardrail_policy_version: str
+    safety_lockdown_enabled: bool
+    safety_lockdown_reason: str | None
+    safety_lockdown_at: datetime | None
+    safety_lockdown_by: str | None
+
     emergency_disabled: bool
     emergency_disabled_reason: str | None
     emergency_disabled_at: datetime | None
@@ -203,6 +213,8 @@ class RagOpsConfigUpdateRequest(BaseModel):
     # ever need to change it.
     sql_enabled: bool | None = None
     sql_rollout_percentage: int | None = Field(default=None, ge=0, le=100)
+    guardrail_mode: GuardrailMode | None = None
+    guardrail_policy_version: str | None = Field(default=None, min_length=1, max_length=64)
     reason: str | None = Field(default=None, max_length=500)
 
 
@@ -219,6 +231,21 @@ class EmergencyDisableRequest(BaseModel):
 
 
 class EmergencyEnableRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class SafetyLockdownEnableRequest(BaseModel):
+    """Body for ``POST /admin/rag-ops/safety-lockdown-enable``.
+
+    ``confirm`` is a server-side backstop, same reasoning as
+    ``EmergencyDisableRequest.confirm``.
+    """
+
+    reason: str = Field(min_length=1, max_length=500)
+    confirm: Literal[True]
+
+
+class SafetyLockdownDisableRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 

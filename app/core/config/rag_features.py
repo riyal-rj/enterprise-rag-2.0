@@ -66,6 +66,13 @@ class RAGFeatureSettings(EnvBaseSettings):
     semantic_cache_collection: str = Field(default="rag_query_cache")
 
     crag_enabled_by_default: bool = Field(default=False)
+    # No corresponding DB "by default" seed field exists for crag_web_enabled
+    # itself (it defaults FALSE directly in migration 008's column DEFAULT,
+    # with no settings-level seed the way most other flags have) - this
+    # field exists purely so app.core.config.settings's production-hardening
+    # check has a frozen deploy-time value to read alongside
+    # sql.sql_enabled_by_default, not to seed a new column.
+    crag_web_enabled_by_default: bool = Field(default=False)
     crag_grader_model: str = Field(default="gpt-4o-mini", min_length=1)
     # v2: grader system prompt tightened to stop conflating "wrong_policy"
     # with "on-topic chunk that doesn't restate the question's exact
@@ -84,6 +91,15 @@ class RAGFeatureSettings(EnvBaseSettings):
     crag_max_attempts: int = Field(default=2, ge=1, le=2)
     crag_min_evidence_chunks: int = Field(default=1, ge=1, le=5)
     crag_policy_version: str = Field(default="crag-policy-v1", min_length=1)
+    # Rewrites a conversational question into a short, keyword-oriented
+    # query before it hits the domain-restricted regulatory web search - see
+    # app.rag_services.crag.web_query_formulator's module docstring for why
+    # this exists at all. Short max-tokens: the output is a few keywords,
+    # not prose.
+    crag_web_query_model: str = Field(default="gpt-4o-mini", min_length=1)
+    crag_web_query_prompt_version: str = Field(default="web-query-v1", min_length=1)
+    crag_web_query_timeout_seconds: float = Field(default=5.0, gt=0.0, le=15.0)
+    crag_web_query_max_completion_tokens: int = Field(default=100, ge=16, le=300)
 
     self_reflective_enabled_by_default: bool = Field(default=False)
     reflection_critic_model: str = Field(default="gpt-4o-mini", min_length=1)

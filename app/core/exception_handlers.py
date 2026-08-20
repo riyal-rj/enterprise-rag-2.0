@@ -29,6 +29,7 @@ from app.core.exceptions import (
     UnsupportedFileTypeError,
     UserAlreadyExistsError,
 )
+from app.guardrails.contracts import GuardrailBlockedError
 
 _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     UserAlreadyExistsError: status.HTTP_409_CONFLICT,
@@ -45,6 +46,11 @@ _STATUS_BY_EXCEPTION: dict[type[AppError], int] = {
     SQLProposalStateError: status.HTTP_409_CONFLICT,
     SQLGenerationFailedError: status.HTTP_422_UNPROCESSABLE_ENTITY,
     SQLFeatureDisabledError: status.HTTP_400_BAD_REQUEST,
+    # Safe by construction: GuardrailBlockedError never carries a raw-
+    # findings message (see its docstring), so the generic
+    # {"detail": str(exc)} handler below can never leak which
+    # scanner/category fired or what the offending text was.
+    GuardrailBlockedError: status.HTTP_400_BAD_REQUEST,
 }
 
 

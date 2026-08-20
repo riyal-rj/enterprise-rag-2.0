@@ -203,6 +203,24 @@ class SQLMetadata(BaseModel):
     reason_code: str | None = None
 
 
+class GuardrailMetadata(BaseModel):
+    """Diagnostic detail about the guardrails layer (``app.guardrails``).
+
+    Categories only, never raw scanned text or matched content - same
+    discipline ``CRAGMetadata``/``SelfReflectionMetadata`` apply to their
+    own internals. ``mode="enforce"``/``input_action="allow"`` is the
+    default so every pre-existing construction site (tests, the eval
+    harness) keeps working unchanged.
+    """
+
+    mode: Literal["enforce", "monitor"] = "enforce"
+    input_action: Literal["allow", "redact", "block"] = "allow"
+    context_chunks_dropped: int = 0
+    output_action: Literal["allow", "redact", "block"] = "allow"
+    categories_flagged: list[str] = Field(default_factory=list)
+    policy_version: str = ""
+
+
 class ResponseMetadata(BaseModel):
     """Diagnostic detail about how an answer was produced.
 
@@ -228,6 +246,10 @@ class ResponseMetadata(BaseModel):
     # (RAGService.answer, tests) keeps working unchanged - same reasoning as
     # RagRuntimeConfig's crag_shadow_enabled/self_reflective_enabled fields.
     sql: SQLMetadata = Field(default_factory=lambda: SQLMetadata(enabled=False))
+    # Guardrails layer - see app.guardrails. Defaulted (allow/enforce) so
+    # every pre-existing construction site keeps working unchanged, same
+    # reasoning as sql above.
+    guardrail: GuardrailMetadata = Field(default_factory=GuardrailMetadata)
 
 
 class ChatResponse(BaseModel):

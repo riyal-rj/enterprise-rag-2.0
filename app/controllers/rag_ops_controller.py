@@ -27,7 +27,12 @@ interval instead of only the worker an admin happened to hit.
 from __future__ import annotations
 
 from app.core.exceptions import InvalidRagOpsConfigError
-from app.models.rag_ops import RagOpsConfig, validate_crag_state, validate_self_reflective_state
+from app.models.rag_ops import (
+    RagOpsConfig,
+    validate_crag_state,
+    validate_guardrail_mode,
+    validate_self_reflective_state,
+)
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.reranker.dynamic_reranker import DynamicReranker
 from app.repositories.rag_ops_repository import RagOpsRepository
@@ -42,6 +47,8 @@ from app.schemas.rag_ops import (
     RagOpsConfigUpdateRequest,
     RagOpsStatusResponse,
     RerankMetrics,
+    SafetyLockdownDisableRequest,
+    SafetyLockdownEnableRequest,
     SelfReflectionMetrics,
     SelfReflectionShadowMetrics,
     SemanticCacheMetrics,
@@ -87,6 +94,9 @@ def apply_rag_ops_config(config: RagOpsConfig, *, config_store: RagRuntimeConfig
             sql_enabled=config.sql_enabled,
             sql_rollout_percentage=config.sql_rollout_percentage,
             sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
         )
     )
 
@@ -128,6 +138,11 @@ class RagOpsController:
                 "Cannot switch to the Voyage reranker backend: no VOYAGE_API_KEY is "
                 "configured for this deployment."
             )
+        if payload.guardrail_mode is not None:
+            try:
+                validate_guardrail_mode(payload.guardrail_mode)
+            except ValueError as exc:
+                raise InvalidRagOpsConfigError(str(exc)) from exc
         # Validate the *effective* post-update state, not just the fields
         # this payload happens to touch - a partial update (e.g. only
         # crag_enabled=False in a request) must be rejected if it would
@@ -211,6 +226,8 @@ class RagOpsController:
             self_reflective_retrieval_enabled=payload.self_reflective_retrieval_enabled,
             sql_enabled=payload.sql_enabled,
             sql_rollout_percentage=payload.sql_rollout_percentage,
+            guardrail_mode=payload.guardrail_mode,
+            guardrail_policy_version=payload.guardrail_policy_version,
         )
         self._apply(config)
         return self._to_status(config)
@@ -227,6 +244,29 @@ class RagOpsController:
     def emergency_enable(self, actor: str, payload: EmergencyEnableRequest) -> RagOpsStatusResponse:
         config = self._repository.set_emergency_disabled(
             actor=actor, disabled=False, reason=payload.reason
+        )
+        self._apply(config)
+        return self._to_status(config)
+
+    def safety_lockdown_enable(
+        self, actor: str, payload: SafetyLockdownEnableRequest
+    ) -> RagOpsStatusResponse:
+        """Security-incident kill switch, distinct from
+        ``emergency_disable`` - forces the SQL route fully closed (see
+        ``app.guardrails.tool_guardrail.ToolGuardrail.authorize_sql``)
+        regardless of ``sql_enabled``, without touching reranking/HyDE/
+        CRAG/self-reflection at all."""
+        config = self._repository.set_safety_lockdown(
+            actor=actor, enabled=True, reason=payload.reason
+        )
+        self._apply(config)
+        return self._to_status(config)
+
+    def safety_lockdown_disable(
+        self, actor: str, payload: SafetyLockdownDisableRequest
+    ) -> RagOpsStatusResponse:
+        config = self._repository.set_safety_lockdown(
+            actor=actor, enabled=False, reason=payload.reason
         )
         self._apply(config)
         return self._to_status(config)
@@ -354,6 +394,12 @@ class RagOpsController:
             sql_enabled=config.sql_enabled,
             sql_rollout_percentage=config.sql_rollout_percentage,
             sql_proposal_only=config.sql_proposal_only,
+            guardrail_mode=config.guardrail_mode,  # type: ignore[arg-type]
+            guardrail_policy_version=config.guardrail_policy_version,
+            safety_lockdown_enabled=config.safety_lockdown_enabled,
+            safety_lockdown_reason=config.safety_lockdown_reason,
+            safety_lockdown_at=config.safety_lockdown_at,
+            safety_lockdown_by=config.safety_lockdown_by,
             emergency_disabled=config.emergency_disabled,
             emergency_disabled_reason=config.emergency_disabled_reason,
             emergency_disabled_at=config.emergency_disabled_at,

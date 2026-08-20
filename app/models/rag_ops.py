@@ -65,6 +65,25 @@ class RagOpsConfig:
     sql_enabled: bool = False
     sql_rollout_percentage: int = 0
     sql_proposal_only: bool = True
+    # Guardrails layer - see app/seed/migrations/013_add_guardrails_config.sql
+    # and app.guardrails.factory. safety_lockdown_reason/_at/_by mirror
+    # emergency_disabled_reason/_at/_by's shape above. Defaulted for the
+    # same reason as crag_shadow_enabled above.
+    guardrail_mode: str = "enforce"
+    guardrail_policy_version: str = "guardrails-policy-v1"
+    safety_lockdown_enabled: bool = False
+    safety_lockdown_reason: str | None = None
+    safety_lockdown_at: datetime | None = None
+    safety_lockdown_by: str | None = None
+
+
+def validate_guardrail_mode(mode: str) -> None:
+    """Invariant shared by every write path that can change this field -
+    mirrors ``validate_crag_state``'s role for CRAG's dependent sub-flags,
+    though this one has no dependent flag, just an allowed-value check (the
+    DB CHECK constraint from migration 013 is the real backstop)."""
+    if mode not in ("enforce", "monitor"):
+        raise ValueError("guardrail_mode must be 'enforce' or 'monitor'")
 
 
 def validate_crag_state(

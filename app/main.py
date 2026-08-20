@@ -8,7 +8,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.deps import get_db_pool, get_sql_pool
+from app.api.deps import (
+    get_db_pool,
+    get_llm_guard_input_scanner,
+    get_llm_guard_output_scanner,
+    get_sql_pool,
+)
 from app.api.rag_ops_sync import RagOpsConfigPoller
 from app.api.routes.admin_routes import router as admin_router
 from app.api.routes.auth_routes import router as auth_router
@@ -16,13 +21,32 @@ from app.api.routes.chat_routes import router as chat_router
 from app.api.routes.rag_ops_routes import router as rag_ops_router
 from app.api.routes.sql_routes import router as sql_router
 from app.api.sql_proposal_recovery import StaleSQLProposalReclaimer
-from app.core.config import get_settings
+from app.core.config import Environment, get_settings
 from app.core.exception_handlers import register_exception_handlers
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    get_settings()  # fail fast on invalid/missing config at startup
+    settings = get_settings()  # fail fast on invalid/missing config at startup
+
+    # Guardrail ML scanners (PromptInjection, Anonymize, ...) are expensive
+    # to construct (transformer model loads) - preload them once here so
+    # the first real request never pays that cold-load latency, mirroring
+    # the local-cross-encoder-reranker preload precedent. In production,
+    # refuse to start rather than silently degrade to the deterministic-
+    # only scanner layer if the operator hasn't confirmed models are
+    # loadable in this deployment (SafetySettings.scanner_models_ready) -
+    # see app.guardrails and app.core.config.safety.
+    if settings.safety.scanner_models_ready:
+        get_llm_guard_input_scanner()
+        get_llm_guard_output_scanner()
+    elif settings.environment is Environment.PRODUCTION:
+        raise RuntimeError(
+            "Refusing to start in production with SCANNER_MODELS_READY=false - "
+            "the ML guardrail layer would silently run deterministic-only scanning. "
+            "Set it once LLM Guard models are confirmed loadable in this deployment."
+        )
+
     # Keeps this worker's RAG ops config in sync with config changes made
     # via another worker - see app.api.rag_ops_sync.
     poller = RagOpsConfigPoller()

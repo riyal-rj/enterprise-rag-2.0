@@ -5,6 +5,12 @@
       "name": "frontend",
       "url": "http://localhost:3000",
       "port": 3000
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"],
+      "port": 8001
     }
   ]
 }

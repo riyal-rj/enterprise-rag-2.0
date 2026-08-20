@@ -12,8 +12,12 @@ from app.core.ingestion.document_processor import DocumentChunk
 from app.core.llm.chat_client import LLMClient, LLMResponse, TokenUsage
 from app.core.llm.embedding_client import EmbeddingClient
 from app.core.llm.sparse_embedding_client import SparseEmbeddingClient
+from app.guardrails.context_pipeline import NoOpContextGuardPipeline
+from app.guardrails.contracts import GuardrailBlockedError, GuardrailStage
+from app.guardrails.output_pipeline import NoOpOutputGuardPipeline
 from app.models.retrieved_chunk import RetrievedChunk
 from app.rag_services.confidence_scorer import compute_confidence_breakdown
+from app.rag_services.crag.crag import EvidenceChunk
 from app.rag_services.rag_runtime_config import RagRuntimeConfig, RagRuntimeConfigStore
 from app.rag_services.rag_service import RAGService
 from app.rag_services.reranker.dynamic_reranker import DynamicReranker
@@ -300,6 +304,76 @@ def test_initial_answer_citing_real_retrieved_sources_is_untouched() -> None:
     response = service.answer("refund policy?")
 
     assert response.answer == "Refunds apply per policy. [a.pdf]"
+
+
+def test_output_guard_blocked_response_is_not_cached() -> None:
+    """Mirrors test_fallback_reranking_response_is_not_cached_exact_match's
+    shape for the new output-guardrail insertion point: a BLOCK decision
+    must replace the answer with a fixed safe-abstention string and must
+    never be cached, exact-match or semantic - the same
+    pipeline_fallback-style exclusion every other non-accepted outcome
+    already gets."""
+
+    class _BlockingOutputGuard(NoOpOutputGuardPipeline):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def apply(self, *, prompt: str, answer: str, mode: str = "enforce") -> str:
+            self.calls.append(answer)
+            raise GuardrailBlockedError(stage=GuardrailStage.OUTPUT)
+
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
+    vector_repository = _FakeVectorRepository(chunks)
+    dense_strategy = DenseRetrievalStrategy(
+        vector_repository=cast(VectorRepository, vector_repository)
+    )
+    guard = _BlockingOutputGuard()
+    service = RAGService(
+        embedding_client=cast(EmbeddingClient, _FakeEmbeddingClient()),
+        retrieval_strategies={dense_strategy.name: dense_strategy},
+        llm_client=cast(LLMClient, _FakeLLMClient("Refunds apply per policy. [a.pdf]")),
+        cache=QueryCacheService(_InMemoryCacheBackend(), CacheSettings()),
+        default_retrieval_mode=dense_strategy.name,
+        output_guard=guard,
+    )
+
+    first = service.answer("refund policy?")
+    second = service.answer("refund policy?")
+
+    assert guard.calls == ["Refunds apply per policy. [a.pdf]"] * 2
+    assert "could not produce a response" in first.answer.lower()
+    assert first.metadata.guardrail.output_action == "block"
+    assert first.cache_hit is False
+    assert second.cache_hit is False  # never cached - not written the first time either
+
+
+def test_context_guard_dropped_chunk_reduces_evidence_but_still_generates() -> None:
+    """Mirrors CRAG's own zero-local-evidence handling for the new
+    context-guardrail insertion point: a dropped (injection-flagged) chunk
+    must degrade to "less evidence," never crash, and the drop count must
+    be visible in response metadata."""
+
+    class _DroppingContextGuard(NoOpContextGuardPipeline):
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def filter_evidence(
+            self, evidence: tuple[EvidenceChunk, ...], *, mode: str = "enforce"
+        ) -> tuple[EvidenceChunk, ...]:
+            self.calls.append(len(evidence))
+            return ()
+
+    chunks = [RetrievedChunk(text="refunds within 30 days", source="a.pdf", score=0.9)]
+    service, *_ = _service(results=chunks, answer="I don't know.")
+    service._context_guard = _DroppingContextGuard()  # type: ignore[attr-defined]
+
+    response = service.answer("refund policy?")
+
+    guard = cast(_DroppingContextGuard, service._context_guard)  # type: ignore[attr-defined]
+    assert guard.calls == [1]
+    assert response.metadata.guardrail.context_chunks_dropped == 1
+    assert response.metadata.final_evidence == []
+    assert response.answer  # still generated an answer, didn't crash
 
 
 def test_answer_confidence_is_computed_not_a_fixed_constant() -> None:
